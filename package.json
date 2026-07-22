@@ -1,0 +1,26 @@
+{
+  "name": "lune",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Lune - an on-screen AI companion you talk or type to (Electron/React rebuild).",
+  "packageManager": "pnpm@10.13.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @lune/desktop dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild",
+      "@tailwindcss/oxide"
+    ]
+  }
+}

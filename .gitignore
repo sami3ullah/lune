@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+.env.*
+
+# v1 code kept locally only as a porting reference (DECISIONS.md #10); never tracked
+_legacy/
+
+# Local planning scratchpad (issues/tickets, session docs)
+.scratch/
+
+# Claude Code harness
+.claude/
