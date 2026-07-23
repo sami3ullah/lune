@@ -423,7 +423,17 @@ function ScreenPermissionCard({
         state === "granted" ? undefined : state === "granted-needs-relaunch" ? (
           <PermissionButton label="Relaunch Lune" onClick={onRelaunch} />
         ) : state === "denied" ? (
-          <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+          // macOS never re-prompts after a denial, so offer both: attempt a capture
+          // (which pops the OS prompt on the very first try in a signed build) and a
+          // direct jump to the Settings pane for when the toggle just needs flipping.
+          <div className="space-y-1.5">
+            <PermissionButton
+              label={requesting ? "Checking…" : "Grant screen access"}
+              onClick={onRequest}
+              disabled={requesting}
+            />
+            <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+          </div>
         ) : (
           <PermissionButton
             label={requesting ? "Checking…" : "Grant screen access"}
@@ -469,7 +479,14 @@ function MicPermissionCard({
       }
       action={
         state === "granted" ? undefined : state === "denied" ? (
-          <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+          <div className="space-y-1.5">
+            <PermissionButton
+              label={requesting ? "Checking…" : "Grant mic access"}
+              onClick={onRequest}
+              disabled={requesting}
+            />
+            <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+          </div>
         ) : (
           <PermissionButton
             label={requesting ? "Checking…" : "Grant mic access"}
