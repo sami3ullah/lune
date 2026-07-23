@@ -6,3 +6,24 @@ body,
   height: 100%;
   margin: 0;
 }
+
+/* The pill lives in a frameless, transparent window - the page itself must be
+   see-through so only the pill's own shapes are visible over the desktop. */
+html,
+body {
+  background: transparent;
+  overflow: hidden;
+  /* No text selection or native drag-image on a HUD surface. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* macOS window dragging is driven by CSS app-regions: the pill bar is a drag
+   handle, while the interactive menu rows opt back out so their clicks register. */
+.app-drag {
+  -webkit-app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}

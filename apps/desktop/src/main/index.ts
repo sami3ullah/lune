@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { readFileSync, watch } from "node:fs";
 import { app, BrowserWindow, ipcMain, type WebContents } from "electron";
 import {
@@ -17,6 +16,8 @@ import {
   LUNE_IPC_VERSION,
   type ChatStreamEvent,
 } from "@lune/shared";
+import { APP_QUIT_CHANNEL } from "../ipc/pillControl";
+import { createPillWindow } from "./pillWindow";
 
 // The Electron main process is the only place the in-process Core is imported; it
 // bridges the Core's plain typed functions/streams to the renderer over typed IPC
@@ -133,46 +134,32 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
   })();
 });
 
-function createPlaceholderWindow(): BrowserWindow {
-  // A plain window stands in for the Pill during the skeleton. The real
-  // always-on-top, draggable, hover-expanding Pill is built in a later ticket.
-  const placeholderWindow = new BrowserWindow({
-    width: 460,
-    height: 420,
-    show: false,
-    webPreferences: {
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
-  });
-
-  placeholderWindow.on("ready-to-show", () => placeholderWindow.show());
-
-  // In development electron-vite serves the renderer and exposes its URL here;
-  // in a packaged build we load the built HTML from disk instead.
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void placeholderWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
-  } else {
-    void placeholderWindow.loadFile(join(__dirname, "../renderer/index.html"));
-  }
-
-  return placeholderWindow;
-}
+// Quit from the pill menu tears the whole app down (developer story 41). Registered
+// at app scope because quitting is not tied to any one window; the whisper child
+// process teardown will hook into this same path when that Capability lands.
+ipcMain.on(APP_QUIT_CHANNEL, () => app.quit());
 
 void app.whenReady().then(() => {
   console.log(`[lune] main process ready with ${describeCore()}`);
-  createPlaceholderWindow();
+
+  // Lune is a background companion: no dock icon, no app-switcher entry (developer
+  // story 40). Hiding the dock also makes the app an accessory, so its always-on-top
+  // pill can float over full-screen apps without stealing the active Space.
+  app.dock?.hide();
+
+  createPillWindow();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createPlaceholderWindow();
+      createPillWindow();
     }
   });
 });
 
 app.on("window-all-closed", () => {
-  // On macOS apps usually stay alive without windows; Lune ultimately runs as a
-  // background companion, but for the skeleton we quit on all-closed off-macOS.
+  // Lune runs as a background companion and is quit deliberately from the pill menu,
+  // not by closing a window. The frameless pill has no close affordance, so this
+  // path is only reached off-macOS (or in teardown), where quitting is correct.
   if (process.platform !== "darwin") {
     app.quit();
   }

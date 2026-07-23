@@ -6,6 +6,12 @@ import {
   type ChatStreamEvent,
   type ChatTurnRequest,
 } from "@lune/shared";
+import {
+  APP_QUIT_CHANNEL,
+  PILL_RESIZE_CHANNEL,
+  PillContentSizeSchema,
+  type PillContentSize,
+} from "../ipc/pillControl";
 
 // The typed bridge the renderer uses to reach the Core through the main process.
 // It is deliberately tiny: the shared zod contract in @lune/shared is the single
@@ -34,6 +40,21 @@ const luneBridge = {
       };
       ipcRenderer.on(CHAT_EVENT_CHANNEL, forwardValidatedEvent);
       return () => ipcRenderer.removeListener(CHAT_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+  },
+  pill: {
+    /**
+     * Reports the pill's current rendered content size so the main process can
+     * resize the frameless window to match exactly (no dead click-catching region
+     * around the pill). Validated against the shared codec before it leaves the
+     * renderer so a bad measurement never crosses the boundary.
+     */
+    reportContentSize(contentSize: PillContentSize): void {
+      ipcRenderer.send(PILL_RESIZE_CHANNEL, PillContentSizeSchema.parse(contentSize));
+    },
+    /** Quits Lune from the pill menu; the main process tears everything down cleanly. */
+    quit(): void {
+      ipcRenderer.send(APP_QUIT_CHANNEL);
     },
   },
 };
