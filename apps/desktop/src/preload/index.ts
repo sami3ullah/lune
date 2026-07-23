@@ -12,6 +12,13 @@ import {
   PillContentSizeSchema,
   type PillContentSize,
 } from "../ipc/pillControl";
+import {
+  SCREEN_PERMISSION_REQUEST_CHANNEL,
+  SCREEN_PERMISSION_STATUS_CHANNEL,
+  SCREEN_RELAUNCH_CHANNEL,
+  ScreenPermissionStateSchema,
+  type ScreenPermissionStateValue,
+} from "../ipc/screenPermission";
 
 // The typed bridge the renderer uses to reach the Core through the main process.
 // It is deliberately tiny: the shared zod contract in @lune/shared is the single
@@ -55,6 +62,32 @@ const luneBridge = {
     /** Quits Lune from the pill menu; the main process tears everything down cleanly. */
     quit(): void {
       ipcRenderer.send(APP_QUIT_CHANNEL);
+    },
+  },
+  screen: {
+    /**
+     * Reads the current screen-recording permission state without prompting, so the
+     * renderer can poll it for live status. Each result is validated against the
+     * shared codec before the renderer sees it.
+     */
+    async getPermissionStatus(): Promise<ScreenPermissionStateValue> {
+      return ScreenPermissionStateSchema.parse(
+        await ipcRenderer.invoke(SCREEN_PERMISSION_STATUS_CHANNEL),
+      );
+    },
+    /**
+     * Requests screen-recording access by attempting a capture - this is what pops
+     * the macOS permission prompt on the first attempt. Resolves to the resulting
+     * validated state (granted / denied / needs-relaunch).
+     */
+    async requestPermission(): Promise<ScreenPermissionStateValue> {
+      return ScreenPermissionStateSchema.parse(
+        await ipcRenderer.invoke(SCREEN_PERMISSION_REQUEST_CHANNEL),
+      );
+    },
+    /** Relaunches Lune so a freshly-granted permission takes effect (macOS quirk). */
+    relaunch(): void {
+      ipcRenderer.send(SCREEN_RELAUNCH_CHANNEL);
     },
   },
 };

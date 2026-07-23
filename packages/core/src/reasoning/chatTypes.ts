@@ -97,3 +97,62 @@ export type CoreChatStreamEvent =
 export function textOnlyChatRequest(prompt: string): CoreChatRequest {
   return { messages: [{ role: "user", content: prompt }] };
 }
+
+/**
+ * One captured display the Shell attaches to a chat turn: its screenshot bytes plus
+ * a semantic label ("screen 1 of 2 - cursor is on this screen (primary focus)") and
+ * the captured pixel dimensions. The Shell owns the OS-and-pixels work of producing
+ * these; the Core owns how they become a request. Dimensions are the *captured*
+ * pixels (pre-downscale) - the pipeline's downscale later rewrites them to the size
+ * the model actually receives, so the model's coordinate space matches its image.
+ */
+export interface ScreenCaptureInput {
+  /** Base64-encoded image bytes (no `data:` prefix). */
+  base64Data: string;
+  /** The image's MIME type, e.g. `image/jpeg`. */
+  mediaType: string;
+  /** The screenshot's width in captured pixels (before any downscale). */
+  widthInPixels: number;
+  /** The screenshot's height in captured pixels (before any downscale). */
+  heightInPixels: number;
+  /**
+   * The Shell's semantic label for this display - which screen it is, whether the
+   * cursor is on it (primary focus). Carries no dimensions; the builder appends them.
+   */
+  label: string;
+}
+
+/**
+ * Builds a screen-aware chat request (one user turn) from a prompt and the displays
+ * the Shell captured. Each screenshot is paired with its own text label so the model
+ * reads the two together, and the prompt closes the turn:
+ *
+ *   [image screen 1] [label screen 1] [image screen 2] [label screen 2] ... [prompt]
+ *
+ * Each label states the screenshot's captured dimensions in the exact
+ * `<width>x<height> pixels` form the pipeline's downscale rewrite matches, so the
+ * Point Tag coordinate space the model is told about tracks the (possibly
+ * downscaled) image it actually sees. With no captures this is exactly
+ * {@link textOnlyChatRequest} - a screen-aware turn with nothing to show is a
+ * text-only turn.
+ */
+export function screenAwareChatRequest(
+  prompt: string,
+  screens: ScreenCaptureInput[],
+): CoreChatRequest {
+  if (screens.length === 0) {
+    return textOnlyChatRequest(prompt);
+  }
+
+  const content: CoreContentBlock[] = [];
+  for (const screen of screens) {
+    content.push({ type: "image", base64Data: screen.base64Data, mediaType: screen.mediaType });
+    content.push({
+      type: "text",
+      text: `${screen.label} (image dimensions: ${screen.widthInPixels}x${screen.heightInPixels} pixels)`,
+    });
+  }
+  content.push({ type: "text", text: prompt });
+
+  return { messages: [{ role: "user", content }] };
+}

@@ -18,6 +18,8 @@ export {
 } from "./reasoning/reasoningCapability.js";
 export {
   textOnlyChatRequest,
+  screenAwareChatRequest,
+  type ScreenCaptureInput,
   type CoreChatRequest,
   type CoreChatMessage,
   type CoreContentBlock,

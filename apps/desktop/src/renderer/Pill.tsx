@@ -2,6 +2,8 @@ import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { StateIndicator, labelForState } from "./StateIndicator";
 import { PILL_INDICATOR_STATES, usePillStore, type PillIndicatorState } from "./pillStore";
+import { ScreenAccessSection } from "./ScreenAccessSection";
+import { ScreenAwareChatTester } from "./ScreenAwareChatTester";
 
 // The Pill: Lune's home surface (ticket 04). A thin always-on-top bar that expands
 // into its menu on hover. The window is frameless and transparent and sized to this
@@ -62,6 +64,8 @@ export function Pill() {
             <PlaceholderMenuItem label="Chat Panel" />
             <PlaceholderMenuItem label="Settings" />
             <MenuButton label="Quit Lune" onClick={() => window.lune.pill.quit()} />
+            <ScreenAccessSection />
+            {IS_DEV && <ScreenAwareChatTester />}
             {IS_DEV && <DevStateSwitcher current={indicatorState} />}
           </motion.div>
         )}

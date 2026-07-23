@@ -5,9 +5,10 @@ import { z } from "zod";
  * the Core both stamp/assert this so a version mismatch surfaces immediately
  * rather than as a confusing runtime shape error. The walking skeleton (ticket 02)
  * replaced the placeholder ping round-trip with the streamed chat contract below,
- * so the version advanced to 2.
+ * so the version advanced to 2. Ticket 05 added the `includeScreen` flag so a turn
+ * can ask the Shell to attach screen context, advancing it to 3.
  */
-export const LUNE_IPC_VERSION = 2;
+export const LUNE_IPC_VERSION = 3;
 
 /**
  * Fire-and-forget channel the renderer uses to start one chat turn. The reply is
@@ -31,6 +32,15 @@ export const ChatTurnRequestSchema = z.object({
   turnId: z.string().min(1),
   /** The user's question, typed into the panel. */
   prompt: z.string().min(1),
+  /**
+   * Whether the Shell should capture the screen(s) and attach them to this turn so
+   * the answer is screen-aware (ticket 05). The screenshots themselves never cross
+   * this contract - the Shell captures in the main process and hands them to the
+   * Core in-process, so sensitive pixels never reach the renderer and are never
+   * persisted. Defaults to `true`: a turn is screen-aware unless it opts out (a
+   * fully-silent text conversation, or when screen access is not granted).
+   */
+  includeScreen: z.boolean().default(true),
 });
 export type ChatTurnRequest = z.infer<typeof ChatTurnRequestSchema>;
 
