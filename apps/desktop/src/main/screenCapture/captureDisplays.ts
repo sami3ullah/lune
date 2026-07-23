@@ -1,5 +1,6 @@
 import { desktopCapturer, nativeImage, screen } from "electron";
 import { planScreenCaptures, type DisplayForCapture } from "./screenLabeling";
+import type { DisplayCaptureGeometry } from "../overlay/overlayGeometry";
 import type { DownscaleScreenshot, ScreenCaptureInput } from "@lune/core";
 
 // The thin OS-and-pixels edge of screen capture (ticket 05): it turns the connected
@@ -78,17 +79,32 @@ function buildSourceResolver(
 }
 
 /**
- * Captures every connected display as a labeled, JPEG-encoded screenshot in the order
- * the model should read them (cursor's display first). Returns an empty array if
- * nothing could be captured - the caller then simply runs a text-only turn. Never
- * writes to disk; the bytes live only in the returned base64.
+ * One capture: the labeled screenshots the Core attaches to a turn, paired with the
+ * per-display geometry the Overlay needs to point (ticket 07). The two travel together
+ * because they come from the same capture pass and share the same `screenNumber`ing:
+ * the model is told `screenN` via {@link ScreenCaptureInput.label}, and the Overlay
+ * maps a Point Tag's `screenN` back to a real monitor via {@link geometry}. The
+ * geometry never crosses to the renderer - only the derived global point does.
  */
-export async function captureConnectedDisplays(): Promise<ScreenCaptureInput[]> {
+export interface DisplayCaptureResult {
+  screens: ScreenCaptureInput[];
+  geometry: DisplayCaptureGeometry[];
+}
+
+/**
+ * Captures every connected display as a labeled, JPEG-encoded screenshot in the order
+ * the model should read them (cursor's display first), plus the geometry mapping each
+ * screen number back to its display bounds + captured pixel size. Returns empty arrays
+ * if nothing could be captured - the caller then simply runs a text-only turn with no
+ * pointing. Never writes to disk; the bytes live only in the returned base64.
+ */
+export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> {
   const displays = screen.getAllDisplays();
   if (displays.length === 0) {
-    return [];
+    return { screens: [], geometry: [] };
   }
 
+  const displayById = new Map(displays.map((display) => [display.id, display]));
   const cursorDisplayId = resolveCursorDisplayId(displays);
   const capturePlans = planScreenCaptures(
     displays.map<DisplayForCapture>((display) => ({ id: display.id })),
@@ -101,25 +117,46 @@ export async function captureConnectedDisplays(): Promise<ScreenCaptureInput[]> 
   });
   const resolveSource = buildSourceResolver(displays, sources);
 
-  const captures: ScreenCaptureInput[] = [];
+  const screens: ScreenCaptureInput[] = [];
+  const geometry: DisplayCaptureGeometry[] = [];
   for (const plan of capturePlans) {
     const source = resolveSource(plan.displayId);
     if (!source || source.thumbnail.isEmpty()) {
       // A missing or empty thumbnail (permission not truly granted for this process,
-      // or an unmatched display) is skipped rather than sent as a black image.
+      // or an unmatched display) is skipped rather than sent as a black image. It gets
+      // no geometry either, so the model never sees a screenN the Overlay can't map.
       continue;
     }
     const { width, height } = source.thumbnail.getSize();
-    captures.push({
+    screens.push({
       base64Data: source.thumbnail.toJPEG(JPEG_QUALITY).toString("base64"),
       mediaType: "image/jpeg",
       widthInPixels: width,
       heightInPixels: height,
       label: plan.label,
     });
+
+    // The same screen number the label carried to the model, paired with the display's
+    // logical bounds and this capture's pixel size, so the Overlay can scale a Point
+    // Tag coordinate back onto the real monitor.
+    const display = displayById.get(plan.displayId);
+    if (display) {
+      geometry.push({
+        screenNumber: plan.screenNumber,
+        displayId: plan.displayId,
+        bounds: {
+          x: display.bounds.x,
+          y: display.bounds.y,
+          width: display.bounds.width,
+          height: display.bounds.height,
+        },
+        capturedWidth: width,
+        capturedHeight: height,
+      });
+    }
   }
 
-  return captures;
+  return { screens, geometry };
 }
 
 /**

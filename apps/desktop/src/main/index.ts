@@ -1,13 +1,13 @@
 import { readFileSync, watch } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { app, BrowserWindow, ipcMain, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, screen, systemPreferences, type WebContents } from "electron";
 import {
   createConversationManager,
   createReasoningCapability,
   describeCore,
+  parseAnswerPointTag,
   RoutingConfigStore,
   type ReasoningVendorId,
-  type ScreenCaptureInput,
 } from "@lune/core";
 import {
   CHAT_EVENT_CHANNEL,
@@ -25,7 +25,14 @@ import {
   SCREEN_PERMISSION_STATUS_CHANNEL,
   SCREEN_RELAUNCH_CHANNEL,
 } from "../ipc/screenPermission";
-import { captureConnectedDisplays, nativeImageDownscale, screenCaptureProducesContent } from "./screenCapture/captureDisplays";
+import {
+  captureConnectedDisplays,
+  nativeImageDownscale,
+  screenCaptureProducesContent,
+  type DisplayCaptureResult,
+} from "./screenCapture/captureDisplays";
+import { OverlayWindowManager } from "./overlay/overlayWindows";
+import { planCompletionMessages } from "./overlay/overlayPointing";
 import {
   deriveScreenPermissionState,
   type ScreenRecordingAccessStatus,
@@ -105,6 +112,11 @@ function getScreenMediaAccessStatus(): ScreenRecordingAccessStatus {
 // genuinely-working grant (macOS withholds frames from a pre-grant process).
 let lastCaptureProducedContent: boolean | null = null;
 
+// The Overlay windows (ticket 07): the playful cursor + response bubble surface, one
+// click-through window per display. Assigned once the app is ready (it creates
+// windows); a chat turn only runs after the UI is up, so it is always set by then.
+let overlayManager: OverlayWindowManager | null = null;
+
 /**
  * Captures the screen(s) for one turn, or returns nothing so the turn falls back to
  * text-only. Capture is attempted only when the turn opted in AND access is granted;
@@ -112,15 +124,15 @@ let lastCaptureProducedContent: boolean | null = null;
  * screen context). The screenshots stay in the main process - handed straight to the
  * in-process Core, never sent to the renderer, never written to disk (ticket 05).
  */
-async function captureScreensForTurn(includeScreen: boolean): Promise<ScreenCaptureInput[]> {
+async function captureScreensForTurn(includeScreen: boolean): Promise<DisplayCaptureResult> {
   if (!includeScreen || getScreenMediaAccessStatus() !== "granted") {
-    return [];
+    return { screens: [], geometry: [] };
   }
   try {
     return await captureConnectedDisplays();
   } catch (error) {
     console.error("[lune] screen capture failed; answering text-only:", error);
-    return [];
+    return { screens: [], geometry: [] };
   }
 }
 
@@ -167,10 +179,34 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
 
   void (async () => {
     sendConversationEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
+
+    // Hide any lingering Overlay before capturing so it can never photograph its own
+    // cursor/bubble into this turn's screen context.
+    overlayManager?.hideAll();
+
+    // Overlay driving state for this turn (ticket 07): the answer bubble + cursor run on
+    // the display holding the user's cursor (screen 1, the model's primary focus). We
+    // stream the answer with its trailing Point Tag stripped, then point once the tag is
+    // complete. `sentCleanLength` tracks how much clean text the Overlay already has.
+    let overlayActive = false;
+    let accumulatedAnswer = "";
+    let sentCleanLength = 0;
+    // The Overlay display for this turn - hoisted so the catch below can end the
+    // interaction it may have started. Resolved once the screens are captured.
+    let cursorDisplayId: number | undefined;
+
     try {
       // Capture the screen(s) first (when opted in and permitted) so the answer is
-      // screen-aware; with no captures this is exactly a text-only turn.
-      const screens = await captureScreensForTurn(includeScreen);
+      // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
+      const { screens, geometry } = await captureScreensForTurn(includeScreen);
+
+      // Where the Overlay bubble/cursor lives: the cursor's display (screen 1 in the
+      // capture geometry), falling back to whatever display the cursor is on now for a
+      // text-only turn that captured nothing.
+      cursorDisplayId =
+        geometry.find((display) => display.screenNumber === 1)?.displayId ??
+        overlayManager?.displayIdAt(screen.getCursorScreenPoint());
+
       for await (const coreEvent of conversationManager.submitUserTurn({
         text: prompt,
         inputMethod,
@@ -192,6 +228,11 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
               turnId,
               messageId: coreEvent.messageId,
             });
+            // Fade the Overlay in for this interaction on the cursor's display.
+            if (overlayManager && cursorDisplayId !== undefined) {
+              overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
+              overlayActive = true;
+            }
             break;
           case "assistant-delta":
             sendConversationEvent(webContents, {
@@ -200,18 +241,48 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
               messageId: coreEvent.messageId,
               text: coreEvent.text,
             });
+            // Stream the answer into the Overlay bubble, but only the clean human text:
+            // parse the accumulated answer and emit just the newly-revealed display
+            // characters, so the trailing `[POINT:...]` tag never appears in the bubble.
+            if (overlayManager && cursorDisplayId !== undefined) {
+              accumulatedAnswer += coreEvent.text;
+              const { displayText } = parseAnswerPointTag(accumulatedAnswer);
+              if (displayText.length > sentCleanLength) {
+                overlayManager.sendToDisplay(cursorDisplayId, {
+                  type: "answer-delta",
+                  text: displayText.slice(sentCleanLength),
+                });
+                sentCleanLength = displayText.length;
+              }
+            }
             break;
-          case "assistant-completed":
+          case "assistant-completed": {
             sendConversationEvent(webContents, {
               type: "assistant-completed",
               turnId,
               messageId: coreEvent.messageId,
             });
+            if (overlayManager && cursorDisplayId !== undefined) {
+              // The full answer has streamed, so its trailing Point Tag (if any) is now
+              // complete. The planner turns the parsed directive + capture geometry into
+              // the exact messages to send (fly to the target on the correct monitor,
+              // then close out), keeping the multi-monitor sequencing in one tested place.
+              const { directive } = parseAnswerPointTag(accumulatedAnswer);
+              for (const message of planCompletionMessages(directive, geometry, cursorDisplayId)) {
+                overlayManager.sendToDisplay(message.displayId, message.event);
+              }
+            }
             break;
+          }
         }
       }
     } catch (error) {
       sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
+      // End any Overlay interaction this turn opened so the cursor fades out rather
+      // than hanging on screen after a failed answer.
+      if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
+        overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
+      }
     }
   })();
 });
@@ -262,6 +333,12 @@ void app.whenReady().then(() => {
   app.dock?.hide();
 
   createPillWindow();
+
+  // The Overlay (ticket 07): one click-through, focus-less window per display, hosting
+  // the playful cursor + response bubble. Created hidden and shown only during a chat
+  // turn (driven above); it rebuilds itself when displays are added/removed/rearranged.
+  overlayManager = new OverlayWindowManager();
+  overlayManager.start();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {

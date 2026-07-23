@@ -48,6 +48,16 @@ export {
   type ReasoningSelection,
 } from "./reasoning/routingConfig.js";
 
+// The answer Point Tag parser: splits a finished answer into the clean display text
+// the Overlay's bubble shows and the pointing directive it acts on (ticket 07). The
+// canonicalizer above repairs the tag into the canonical grammar; this reads it back.
+export {
+  parseAnswerPointTag,
+  type ParsedAnswer,
+  type ParsedPoint,
+  type PointDirective,
+} from "./reasoning/pointTagParser.js";
+
 export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
 

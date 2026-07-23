@@ -14,6 +14,12 @@ import {
 } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
 import {
+  OVERLAY_EVENT_CHANNEL,
+  OVERLAY_IDLE_CHANNEL,
+  OverlayEventSchema,
+  type OverlayEvent,
+} from "../ipc/overlayControl";
+import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
   SCREEN_RELAUNCH_CHANNEL,
@@ -54,6 +60,30 @@ const luneBridge = {
     /** Opens the Chat Panel window, or hides it if already open. */
     toggle(): void {
       ipcRenderer.send(CHAT_PANEL_TOGGLE_CHANNEL);
+    },
+  },
+  overlay: {
+    /**
+     * Subscribes to the Overlay events for this window (activity, streamed answer
+     * text, a pointing target), validating each against the shared codec before it
+     * drives the cursor. Returns an unsubscribe function. Used only by the Overlay
+     * surface; the Pill window never subscribes.
+     */
+    onOverlayEvent(listener: (event: OverlayEvent) => void): () => void {
+      const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
+        const parsedEvent = OverlayEventSchema.safeParse(rawEvent);
+        if (parsedEvent.success) {
+          listener(parsedEvent.data);
+        } else {
+          console.error("[lune] dropping malformed overlay event:", parsedEvent.error.message);
+        }
+      };
+      ipcRenderer.on(OVERLAY_EVENT_CHANNEL, forwardValidatedEvent);
+      return () => ipcRenderer.removeListener(OVERLAY_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+    /** Tells the main process this Overlay has faded out and its window can be hidden. */
+    signalIdle(): void {
+      ipcRenderer.send(OVERLAY_IDLE_CHANNEL);
     },
   },
   pill: {
