@@ -8,6 +8,7 @@ import {
   parseAnswerPointTag,
   RoutingConfigStore,
   type ReasoningVendorId,
+  type SpeechCapability,
 } from "@lune/core";
 import {
   CHAT_EVENT_CHANNEL,
@@ -38,6 +39,16 @@ import {
   type ScreenRecordingAccessStatus,
 } from "./screenCapture/screenPermissionState";
 import { createPillWindow } from "./pillWindow";
+import { createDesktopProvisioning, runProvisioningDevTrigger } from "./provisioning/provisioningService";
+import { resolveModelsDirectory } from "./provisioning/nodeGateways";
+import {
+  createDesktopTranscription,
+  runTranscriptionDevTrigger,
+  type DesktopTranscription,
+} from "./transcription/transcriptionService";
+import { createDesktopSpeech, runSpeechDevTrigger } from "./speech/speechService";
+import { createSpeechTurnPlayer, type SpeechTurnPlayer } from "./speech/speechTurnPlayer";
+import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ipc/speechPlayback";
 
 // The Electron main process is the only place the in-process Core is imported; it
 // bridges the Core's plain typed functions/streams to the renderer over typed IPC
@@ -117,6 +128,35 @@ let lastCaptureProducedContent: boolean | null = null;
 // windows); a chat turn only runs after the UI is up, so it is always set by then.
 let overlayManager: OverlayWindowManager | null = null;
 
+// The Transcription lifecycle (ticket 10): the supervised whisper.cpp child + its Core
+// Capability. Held at module scope so app-quit and abrupt-exit teardown can reach it to
+// stop the child (developer story 41 - quitting orphans nothing). Assigned once the app
+// is ready and Provisioning readiness is known.
+let transcription: DesktopTranscription | null = null;
+
+// The Speech Capability (ticket 09): on-device Kokoro synthesis, gated on the Kokoro
+// weights being provisioned. Assigned once the app is ready (it needs the Provisioning
+// readiness + models directory). A chat turn only runs after the UI is up, so it is set
+// by then; when Kokoro isn't ready the turn simply answers in text without speaking.
+let speechCapability: SpeechCapability | null = null;
+
+// The Pill window: Lune's always-present home surface, and the one renderer that owns
+// audio output, so synthesized speech clips are streamed to it. Assigned when the app
+// creates the Pill.
+let pillWindow: BrowserWindow | null = null;
+
+/**
+ * Sends one Kokoro speech-playback event to the Pill renderer (which owns audio
+ * output), validating it against the shared codec on the way out so no untyped shape
+ * crosses the boundary (developer story 46). A no-op if the Pill is gone.
+ */
+function sendSpeechEvent(event: SpeechEvent): void {
+  if (pillWindow === null || pillWindow.isDestroyed()) {
+    return;
+  }
+  pillWindow.webContents.send(SPEECH_EVENT_CHANNEL, SpeechEventSchema.parse(event));
+}
+
 /**
  * Captures the screen(s) for one turn, or returns nothing so the turn falls back to
  * text-only. Capture is attempted only when the turn opted in AND access is granted;
@@ -194,6 +234,10 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
     // The Overlay display for this turn - hoisted so the catch below can end the
     // interaction it may have started. Resolved once the screens are captured.
     let cursorDisplayId: number | undefined;
+    // Kokoro speech for this turn (ticket 09): created only when Speech is ready, so a
+    // not-ready Kokoro answers in text without speaking (and without hanging). It
+    // sentence-streams the answer to the Pill's audio output as the reply arrives.
+    let speechTurn: SpeechTurnPlayer | null = null;
 
     try {
       // Capture the screen(s) first (when opted in and permitted) so the answer is
@@ -233,6 +277,16 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
               overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
               overlayActive = true;
             }
+            // Begin sentence-streamed speech only when Kokoro is provisioned; otherwise
+            // the turn answers in text without speaking (never a hang).
+            if (speechCapability?.isReady()) {
+              speechTurn = createSpeechTurnPlayer({
+                speech: speechCapability,
+                turnId,
+                sendEvent: sendSpeechEvent,
+                encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+              });
+            }
             break;
           case "assistant-delta":
             sendConversationEvent(webContents, {
@@ -241,11 +295,14 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
               messageId: coreEvent.messageId,
               text: coreEvent.text,
             });
+            accumulatedAnswer += coreEvent.text;
+            // Sentence-stream the growing answer to Kokoro: each completed sentence is
+            // synthesized and played while the next is still arriving (first audio fast).
+            speechTurn?.pushAnswerText(accumulatedAnswer);
             // Stream the answer into the Overlay bubble, but only the clean human text:
             // parse the accumulated answer and emit just the newly-revealed display
             // characters, so the trailing `[POINT:...]` tag never appears in the bubble.
             if (overlayManager && cursorDisplayId !== undefined) {
-              accumulatedAnswer += coreEvent.text;
               const { displayText } = parseAnswerPointTag(accumulatedAnswer);
               if (displayText.length > sentCleanLength) {
                 overlayManager.sendToDisplay(cursorDisplayId, {
@@ -272,6 +329,10 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
                 overlayManager.sendToDisplay(message.displayId, message.event);
               }
             }
+            // Flush the final (unterminated) sentence and let speech drain. The first
+            // audio already started mid-stream; a not-ready turn has no speechTurn and
+            // simply stayed silent.
+            await speechTurn?.finish(accumulatedAnswer);
             break;
           }
         }
@@ -283,6 +344,11 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
       if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
         overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
       }
+      // Stop any speech this turn had queued or was playing so a failed answer doesn't
+      // keep talking (and the Pill returns to idle).
+      if (speechTurn !== null) {
+        sendSpeechEvent({ type: "stop" });
+      }
     }
   })();
 });
@@ -292,9 +358,23 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
 ipcMain.on(CHAT_PANEL_TOGGLE_CHANNEL, () => toggleChatPanelWindow());
 
 // Quit from the pill menu tears the whole app down (developer story 41). Registered
-// at app scope because quitting is not tied to any one window; the whisper child
-// process teardown will hook into this same path when that Capability lands.
+// at app scope because quitting is not tied to any one window. The whisper child
+// process is torn down via the `before-quit`/`exit` handlers below, so quitting
+// leaves nothing orphaned (ticket 10 acceptance).
 ipcMain.on(APP_QUIT_CHANNEL, () => app.quit());
+
+// Whisper child-process teardown (ticket 10, developer story 41). `before-quit` runs
+// on the normal quit path (pill menu, relaunch) and issues a SIGTERM via the
+// supervisor. `exit` is the abrupt-exit net (uncaught error, hard exit) where only
+// synchronous work runs, so it SIGKILLs the child directly - between them, a quit or
+// crash never leaves a whisper-server process behind. (A parent SIGKILL can't be
+// intercepted by anyone, but there is no owning watchdog process to route around it.)
+app.on("before-quit", () => {
+  void transcription?.shutdown();
+});
+process.on("exit", () => {
+  transcription?.killSync();
+});
 
 // Screen-recording permission (ticket 05). The status channel reports the current
 // state for live polling and never prompts when access is undetermined; when access
@@ -332,7 +412,8 @@ void app.whenReady().then(() => {
   // pill can float over full-screen apps without stealing the active Space.
   app.dock?.hide();
 
-  createPillWindow();
+  // Keep the Pill handle: it is the renderer that plays Kokoro speech clips (ticket 09).
+  pillWindow = createPillWindow();
 
   // The Overlay (ticket 07): one click-through, focus-less window per display, hosting
   // the playful cursor + response bubble. Created hidden and shown only during a chat
@@ -344,6 +425,48 @@ void app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createPillWindow();
     }
+  });
+
+  // Provisioning (ticket 08): the background model-download subsystem, wired to the
+  // real Node gateways and rooted at the one Lune-managed models directory under the
+  // app's userData. `refreshReadiness` runs at boot so already-downloaded weights
+  // report ready immediately; the env-gated dev trigger (LUNE_PROVISION_ON_START)
+  // downloads the real weights with visible console progress before the onboarding UI
+  // exists (ticket 14). A normal launch never starts a download.
+  const provisioning = createDesktopProvisioning(resolveModelsDirectory(app.getPath("userData")));
+
+  // Transcription (ticket 10): on-device whisper.cpp batch STT. The Core owns the
+  // supervision + readiness + transcribe logic; this injects the whisper-server edge
+  // and drives the lifecycle. Whisper is ready only when its weights are provisioned
+  // AND its child Runtime is healthy; the binary comes from a pinned-source build
+  // pointed at by LUNE_WHISPER_SERVER_PATH (absent in dev → whisper reports not-ready).
+  transcription = createDesktopTranscription({
+    modelsDirectoryPath: provisioning.modelsDirectoryPath,
+    isWhisperProvisioned: () => provisioning.capability.isRuntimeReady("whisper"),
+  });
+
+  // Speech (ticket 09): the in-process Kokoro engine, gated on the Kokoro weights being
+  // provisioned + verified (read live, so readiness flips automatically when a download
+  // completes - no rebuild). The Voice comes from the routing config.
+  speechCapability = createDesktopSpeech({
+    modelsDirectoryPath: provisioning.modelsDirectoryPath,
+    getRoutingConfig: () => routingConfigStore.getConfig(),
+    isKokoroReady: () => provisioning.capability.isRuntimeReady("kokoro"),
+  });
+
+  // Refresh Provisioning readiness (and optionally run the ~2 GB dev download), then
+  // start the whisper child if it can run, and finally exercise the Core transcribe
+  // API on the env-gated dev WAV (ticket 10 acceptance #1). Each step is a no-op on a
+  // normal launch, so this is safe to run unconditionally at boot.
+  void (async () => {
+    await runProvisioningDevTrigger(provisioning);
+    await transcription!.reconcile();
+    await runTranscriptionDevTrigger(transcription!);
+    // Exercise the Kokoro native edges (onnxruntime-node + espeak) in dev once the
+    // weights are provisioned (ticket 09 acceptance #3); a no-op on a normal launch.
+    await runSpeechDevTrigger(speechCapability!);
+  })().catch((error) => {
+    console.error("[lune] provisioning/transcription/speech boot failed:", error);
   });
 });
 

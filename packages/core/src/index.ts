@@ -46,7 +46,40 @@ export {
   RoutingConfigStore,
   type RoutingConfig,
   type ReasoningSelection,
+  type SpeechSelection,
 } from "./reasoning/routingConfig.js";
+
+// The Speech Capability: on-device Kokoro synthesis (ticket 09), gated on the Kokoro
+// weights being provisioned. The Core owns the seam, the 54-Voice list, and the pure
+// tokenize/style/WAV transforms; the Electron main process injects the real
+// in-process onnxruntime-node engine and sentence-streams answers through it.
+export {
+  createSpeechCapability,
+  type SpeechCapability,
+  type SpeechCapabilityDependencies,
+} from "./speech/speechCapability.js";
+export {
+  SpeechEngineNotReadyError,
+  createDeferredKokoroSpeechEngine,
+  type KokoroSpeechEngine,
+  type SpeechSynthesisRequest,
+  type SpeechSynthesisResult,
+} from "./speech/speechEngine.js";
+export {
+  KOKORO_VOICES,
+  DEFAULT_KOKORO_VOICE,
+  isKnownKokoroVoice,
+} from "./speech/kokoroVoices.js";
+export {
+  KOKORO_SAMPLE_RATE_HZ,
+  KOKORO_STYLE_DIMENSION,
+  KOKORO_MAX_TOKENS,
+  KOKORO_TOKEN_VOCAB,
+  phonemesToTokenIds,
+  buildInputIds,
+  selectStyleVector,
+  encodeWavFromFloatPcm,
+} from "./speech/kokoroSynthesis.js";
 
 // The answer Point Tag parser: splits a finished answer into the clean display text
 // the Overlay's bubble shows and the pointing directive it acts on (ticket 07). The
@@ -60,6 +93,81 @@ export {
 
 export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
+
+// The Provisioning Capability: the background model-download subsystem (pinned
+// manifest, resumable checksum-verified downloads, preflight, live progress, cancel,
+// per-Runtime readiness), ported from v1 minus LM Studio (Lune has no local
+// Reasoning). Its gateway interfaces are the injected network/fs/disk boundaries the
+// Electron main process fills with Node-backed impls and tests fill with fakes.
+export {
+  createProvisioningCapability,
+  type ProvisioningCapability,
+  type ProvisioningCapabilityDependencies,
+} from "./provisioning/provisioningCapability.js";
+export {
+  PROVISIONING_MANIFEST,
+  allArtifacts,
+  findRuntime,
+  resolveRuntimes,
+  runtimeDownloadBytes,
+  totalDownloadBytes,
+  type PinnedArtifact,
+  type ProvisionableRuntime,
+  type ProvisionableRuntimeId,
+} from "./provisioning/manifest.js";
+export type {
+  ProvisioningGateways,
+  RangeDownloadGateway,
+  DownloadStream,
+  ResumeFrom,
+  FileSystemGateway,
+  DiskSpaceProbe,
+  NetworkProbe,
+} from "./provisioning/gateways.js";
+export type {
+  ProvisioningStatus,
+  ProvisioningPhase,
+} from "./provisioning/controller.js";
+export type {
+  ProvisioningProgress,
+  RuntimeResult,
+  ArtifactResult,
+  ArtifactOutcome,
+} from "./provisioning/orchestrator.js";
+export type {
+  PreflightResult,
+  PreflightFailureReason,
+} from "./provisioning/preflight.js";
+export {
+  ChecksumMismatchError,
+  ProvisioningCancelledError,
+  type DownloadProgress,
+} from "./provisioning/download.js";
+
+// The Transcription Capability: on-device batch speech-to-text via the supervised
+// whisper.cpp child Runtime (ADR-0003, ADR-0006), ported from v1 scoped to whisper.
+// A recorded WAV clip in, one transcript out; gated on the weights being provisioned
+// AND the child Runtime healthy. The Core owns the supervision + readiness logic and
+// the Provider->Runtime seam; the Electron main process fills the gateway/transcribe
+// seam with the real whisper-server spawn/health/HTTP edge, and a test fills it with
+// stubs.
+export {
+  createTranscriptionCapability,
+  TranscriptionNotReadyError,
+  EmptyTranscriptionAudioError,
+  type TranscriptionCapability,
+  type TranscriptionCapabilityDependencies,
+} from "./transcription/transcriptionCapability.js";
+export type {
+  TranscribeAudio,
+  TranscriptionResult,
+} from "./transcription/whisperTranscription.js";
+export {
+  ChildRuntimeSupervisor,
+  type ChildRuntimeGateway,
+  type ChildRuntimeId,
+  type ChildRuntimeState,
+} from "./transcription/childRuntimeSupervisor.js";
 
 // The conversation model: the Core-owned multi-turn history the Chat Panel renders,
 // and the manager that advances it one turn at a time through the Reasoning Capability.
