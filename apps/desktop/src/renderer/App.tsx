@@ -1,9 +1,11 @@
 import { Pill } from "./Pill";
+import { ChatPanel } from "./ChatPanel";
 
-// The renderer's single window in M1 is the Pill - Lune's always-on-top home
-// surface (ticket 04). The walking-skeleton chat plumbing (the store and the chat
-// bridge over typed IPC) stays in place for the Chat Panel ticket to build on; the
-// Pill's "Chat Panel" menu item is a placeholder until that surface exists.
+// The renderer bundle backs two windows (ticket 06): the always-on-top Pill and the
+// Chat Panel opened from it. The main process loads the Chat Panel window with the
+// `#chat` hash, so the entry branches on it to mount the right surface. Both windows
+// run this same bundle; each renders only its own surface.
 export function App() {
-  return <Pill />;
+  const isChatPanelSurface = window.location.hash === "#chat";
+  return isChatPanelSurface ? <ChatPanel /> : <Pill />;
 }

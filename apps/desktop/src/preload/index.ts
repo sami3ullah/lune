@@ -2,8 +2,8 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 import {
   CHAT_EVENT_CHANNEL,
   CHAT_START_CHANNEL,
-  ChatStreamEventSchema,
-  type ChatStreamEvent,
+  ConversationStreamEventSchema,
+  type ConversationStreamEvent,
   type ChatTurnRequest,
 } from "@lune/shared";
 import {
@@ -12,6 +12,7 @@ import {
   PillContentSizeSchema,
   type PillContentSize,
 } from "../ipc/pillControl";
+import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
 import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
@@ -27,18 +28,18 @@ import {
 // turn and subscribes to its events rather than awaiting a single value.
 const luneBridge = {
   chat: {
-    /** Starts one chat turn; its streamed events arrive via {@link onChatEvent}. */
+    /** Starts one conversation turn; its streamed events arrive via {@link onChatEvent}. */
     start(chatTurnRequest: ChatTurnRequest): void {
       ipcRenderer.send(CHAT_START_CHANNEL, chatTurnRequest);
     },
     /**
-     * Subscribes to every streamed chat event, validating each against the shared
-     * contract before handing it to the renderer (no untyped shape crosses in).
+     * Subscribes to every streamed conversation event, validating each against the
+     * shared contract before handing it to the renderer (no untyped shape crosses in).
      * Returns an unsubscribe function.
      */
-    onChatEvent(listener: (event: ChatStreamEvent) => void): () => void {
+    onChatEvent(listener: (event: ConversationStreamEvent) => void): () => void {
       const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
-        const parsedEvent = ChatStreamEventSchema.safeParse(rawEvent);
+        const parsedEvent = ConversationStreamEventSchema.safeParse(rawEvent);
         if (parsedEvent.success) {
           listener(parsedEvent.data);
         } else {
@@ -47,6 +48,12 @@ const luneBridge = {
       };
       ipcRenderer.on(CHAT_EVENT_CHANNEL, forwardValidatedEvent);
       return () => ipcRenderer.removeListener(CHAT_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+  },
+  chatPanel: {
+    /** Opens the Chat Panel window, or hides it if already open. */
+    toggle(): void {
+      ipcRenderer.send(CHAT_PANEL_TOGGLE_CHANNEL);
     },
   },
   pill: {

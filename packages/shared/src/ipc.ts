@@ -3,12 +3,12 @@ import { z } from "zod";
 /**
  * Bumped whenever the Shell<->Core IPC contract changes shape. The renderer and
  * the Core both stamp/assert this so a version mismatch surfaces immediately
- * rather than as a confusing runtime shape error. The walking skeleton (ticket 02)
- * replaced the placeholder ping round-trip with the streamed chat contract below,
- * so the version advanced to 2. Ticket 05 added the `includeScreen` flag so a turn
- * can ask the Shell to attach screen context, advancing it to 3.
+ * rather than as a confusing runtime shape error. Ticket 02 replaced the placeholder
+ * ping with the streamed chat contract (v2); ticket 05 added the `includeScreen` flag
+ * (v3); ticket 06 turned the single-answer stream into a conversation event stream and
+ * added the per-turn input method (v4).
  */
-export const LUNE_IPC_VERSION = 3;
+export const LUNE_IPC_VERSION = 4;
 
 /**
  * Fire-and-forget channel the renderer uses to start one chat turn. The reply is
@@ -22,50 +22,70 @@ export const CHAT_START_CHANNEL = "lune:chat:start";
 export const CHAT_EVENT_CHANNEL = "lune:chat:event";
 
 /**
+ * How the user provided a turn's input. Text is the only method in M1; voice arrives
+ * with the push-to-talk loop (ticket 11) and lands in the same conversation history,
+ * so the field exists now to keep that a value change, not a schema change.
+ */
+export const ChatInputMethodSchema = z.enum(["text", "voice"]);
+export type ChatInputMethod = z.infer<typeof ChatInputMethodSchema>;
+
+/**
  * One chat turn the renderer sends the Core: an opaque id it mints so it can
- * correlate the streamed events that come back, plus the user's question. The
- * walking skeleton carries text only; screenshots and conversation history join
- * this contract in later tickets.
+ * correlate the streamed events that come back, the user's question, how it was
+ * entered, and whether to attach screen context (ticket 05). The screenshots
+ * themselves never cross this contract - the Shell captures them in the main process.
  */
 export const ChatTurnRequestSchema = z.object({
-  /** Correlates this request with the {@link ChatStreamEvent}s it produces. */
+  /** Correlates this request with the {@link ConversationStreamEvent}s it produces. */
   turnId: z.string().min(1),
-  /** The user's question, typed into the panel. */
+  /** The user's question. */
   prompt: z.string().min(1),
-  /**
-   * Whether the Shell should capture the screen(s) and attach them to this turn so
-   * the answer is screen-aware (ticket 05). The screenshots themselves never cross
-   * this contract - the Shell captures in the main process and hands them to the
-   * Core in-process, so sensitive pixels never reach the renderer and are never
-   * persisted. Defaults to `true`: a turn is screen-aware unless it opts out (a
-   * fully-silent text conversation, or when screen access is not granted).
-   */
+  /** How the user entered this turn; defaults to text (voice arrives in ticket 11). */
+  inputMethod: ChatInputMethodSchema.default("text"),
+  /** Whether the Shell should attach the screen(s) to this turn. Defaults to on. */
   includeScreen: z.boolean().default(true),
 });
 export type ChatTurnRequest = z.infer<typeof ChatTurnRequestSchema>;
 
 /**
- * A streamed event of one chat turn, flowing Core -> main -> renderer. The turn
- * opens with exactly one `started` (stamping the contract version so a mismatch
- * surfaces here), then zero or more `delta`s carrying answer text token-by-token,
- * and closes with exactly one terminal event - either `done` on success or `error`
- * if the Core could not produce (or finish) the answer. Every event carries the
- * originating `turnId` so a renderer can ignore events from an abandoned turn.
+ * A streamed event of one conversation turn, flowing Core -> main -> renderer. The
+ * turn opens with exactly one `started` (stamping the contract version so a mismatch
+ * surfaces here), then one `user-message` (the Core appended the user's turn - this is
+ * what the panel renders, so voice and text turns render identically), then one
+ * `assistant-started`, then zero or more `assistant-delta`s carrying the reply
+ * token-by-token, and closes with either `assistant-completed` on success or `error`
+ * if the turn could not be produced (or finished). Every event carries the originating
+ * `turnId` so a renderer can ignore events from an abandoned turn, and the assistant
+ * events carry the `messageId` of the reply they build.
  */
-export const ChatStreamEventSchema = z.discriminatedUnion("type", [
+export const ConversationStreamEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("started"),
     turnId: z.string().min(1),
     ipcVersion: z.literal(LUNE_IPC_VERSION),
   }),
   z.object({
-    type: z.literal("delta"),
+    type: z.literal("user-message"),
     turnId: z.string().min(1),
+    messageId: z.string().min(1),
+    text: z.string(),
+    inputMethod: ChatInputMethodSchema,
+  }),
+  z.object({
+    type: z.literal("assistant-started"),
+    turnId: z.string().min(1),
+    messageId: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("assistant-delta"),
+    turnId: z.string().min(1),
+    messageId: z.string().min(1),
     text: z.string(),
   }),
   z.object({
-    type: z.literal("done"),
+    type: z.literal("assistant-completed"),
     turnId: z.string().min(1),
+    messageId: z.string().min(1),
   }),
   z.object({
     type: z.literal("error"),
@@ -73,4 +93,4 @@ export const ChatStreamEventSchema = z.discriminatedUnion("type", [
     message: z.string().min(1),
   }),
 ]);
-export type ChatStreamEvent = z.infer<typeof ChatStreamEventSchema>;
+export type ConversationStreamEvent = z.infer<typeof ConversationStreamEventSchema>;

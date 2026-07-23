@@ -51,6 +51,23 @@ export {
 export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
 
+// The conversation model: the Core-owned multi-turn history the Chat Panel renders,
+// and the manager that advances it one turn at a time through the Reasoning Capability.
+export {
+  createConversationManager,
+  type ConversationManager,
+  type ConversationManagerDependencies,
+  type SubmitUserTurnInput,
+} from "./conversation/conversationManager.js";
+export { buildConversationRequest } from "./conversation/buildConversationRequest.js";
+export type {
+  ChatInputMethod,
+  ConversationMessage,
+  UserConversationMessage,
+  AssistantConversationMessage,
+  CoreConversationEvent,
+} from "./conversation/conversationTypes.js";
+
 /**
  * Human-readable identifier for this Core build, stamped with the IPC contract
  * version it was compiled against. The Shell surfaces it so the Shell<->Core

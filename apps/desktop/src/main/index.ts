@@ -1,22 +1,25 @@
 import { readFileSync, watch } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { app, BrowserWindow, ipcMain, systemPreferences, type WebContents } from "electron";
 import {
+  createConversationManager,
   createReasoningCapability,
   describeCore,
   RoutingConfigStore,
-  screenAwareChatRequest,
   type ReasoningVendorId,
   type ScreenCaptureInput,
 } from "@lune/core";
 import {
   CHAT_EVENT_CHANNEL,
   CHAT_START_CHANNEL,
-  ChatStreamEventSchema,
   ChatTurnRequestSchema,
+  ConversationStreamEventSchema,
   LUNE_IPC_VERSION,
-  type ChatStreamEvent,
+  type ConversationStreamEvent,
 } from "@lune/shared";
 import { APP_QUIT_CHANNEL } from "../ipc/pillControl";
+import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
+import { toggleChatPanelWindow } from "./chatPanelWindow";
 import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
@@ -78,6 +81,14 @@ const reasoningCapability = createReasoningCapability({
   downscaleScreenshot: nativeImageDownscale,
 });
 
+// Conversation state lives in the Core (ticket 06): the Chat Panel renders the history
+// the manager owns. One manager holds the single in-memory conversation for now;
+// multiple conversations + durable last-10 persistence arrive in ticket 12.
+const conversationManager = createConversationManager({
+  reasoningCapability,
+  generateMessageId: () => randomUUID(),
+});
+
 /**
  * This app's macOS Screen Recording access, as the OS reports it. Off macOS, screen
  * capture is ungated, so it is always granted (keeping the M7 Windows port a no-op here).
@@ -114,18 +125,18 @@ async function captureScreensForTurn(includeScreen: boolean): Promise<ScreenCapt
 }
 
 /**
- * Sends one streamed chat event to the renderer, validating it against the shared
- * contract on the way out so no untyped shape ever crosses the boundary (developer
- * story 46). A dead/closed WebContents (window gone mid-stream) is skipped silently.
+ * Sends one streamed conversation event to the renderer, validating it against the
+ * shared contract on the way out so no untyped shape ever crosses the boundary
+ * (developer story 46). A dead/closed WebContents (window gone mid-stream) is skipped.
  */
-function sendChatEvent(webContents: WebContents, event: ChatStreamEvent): void {
+function sendConversationEvent(webContents: WebContents, event: ConversationStreamEvent): void {
   if (webContents.isDestroyed()) {
     return;
   }
   // Parse (not just assert) on the way out so the event the renderer receives is
   // exactly the validated shape - a drift in the Core's event mapping fails loudly
   // here rather than as a confusing shape error in the renderer.
-  webContents.send(CHAT_EVENT_CHANNEL, ChatStreamEventSchema.parse(event));
+  webContents.send(CHAT_EVENT_CHANNEL, ConversationStreamEventSchema.parse(event));
 }
 
 /**
@@ -139,10 +150,10 @@ function describeChatError(error: unknown): string {
   return rawMessage.length > 0 ? rawMessage : "Chat request failed for an unknown reason";
 }
 
-// Drive one chat turn: validate the request, stream the Core's canonical events to
-// the renderer tagged with the turn id, and translate a thrown Core error (not
-// ready, Vendor rejection) into a terminal `error` event so the renderer never
-// hangs waiting for a `done` that will not come.
+// Drive one conversation turn: validate the request, capture screen context, advance
+// the Core conversation, and stream its events to the renderer tagged with the turn
+// id. A thrown Core error (not ready, Vendor rejection) becomes a terminal `error`
+// event so the renderer never hangs waiting for a completion that will not come.
 ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
   const parsedRequest = ChatTurnRequestSchema.safeParse(rawChatTurnRequest);
   if (!parsedRequest.success) {
@@ -151,30 +162,63 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
     console.error("[lune] dropping malformed chat start request:", parsedRequest.error.message);
     return;
   }
-  const { turnId, prompt, includeScreen } = parsedRequest.data;
+  const { turnId, prompt, inputMethod, includeScreen } = parsedRequest.data;
   const webContents = event.sender;
 
   void (async () => {
-    sendChatEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
+    sendConversationEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
     try {
       // Capture the screen(s) first (when opted in and permitted) so the answer is
       // screen-aware; with no captures this is exactly a text-only turn.
       const screens = await captureScreensForTurn(includeScreen);
-      for await (const chatEvent of reasoningCapability.streamChat(screenAwareChatRequest(prompt, screens))) {
-        switch (chatEvent.type) {
-          case "text-delta":
-            sendChatEvent(webContents, { type: "delta", turnId, text: chatEvent.text });
+      for await (const coreEvent of conversationManager.submitUserTurn({
+        text: prompt,
+        inputMethod,
+        screenshots: screens,
+      })) {
+        switch (coreEvent.type) {
+          case "user-message":
+            sendConversationEvent(webContents, {
+              type: "user-message",
+              turnId,
+              messageId: coreEvent.message.id,
+              text: coreEvent.message.text,
+              inputMethod: coreEvent.message.inputMethod,
+            });
             break;
-          case "done":
-            sendChatEvent(webContents, { type: "done", turnId });
+          case "assistant-started":
+            sendConversationEvent(webContents, {
+              type: "assistant-started",
+              turnId,
+              messageId: coreEvent.messageId,
+            });
+            break;
+          case "assistant-delta":
+            sendConversationEvent(webContents, {
+              type: "assistant-delta",
+              turnId,
+              messageId: coreEvent.messageId,
+              text: coreEvent.text,
+            });
+            break;
+          case "assistant-completed":
+            sendConversationEvent(webContents, {
+              type: "assistant-completed",
+              turnId,
+              messageId: coreEvent.messageId,
+            });
             break;
         }
       }
     } catch (error) {
-      sendChatEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
+      sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
     }
   })();
 });
+
+// Open/close the Chat Panel from the Pill menu (or its own close button). One toggle
+// keeps both entry points in agreement.
+ipcMain.on(CHAT_PANEL_TOGGLE_CHANNEL, () => toggleChatPanelWindow());
 
 // Quit from the pill menu tears the whole app down (developer story 41). Registered
 // at app scope because quitting is not tied to any one window; the whisper child
