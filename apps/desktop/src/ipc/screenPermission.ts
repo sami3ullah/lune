@@ -33,6 +33,15 @@ export const SCREEN_PERMISSION_REQUEST_CHANNEL = "lune:screen:permission-request
 export const SCREEN_RELAUNCH_CHANNEL = "lune:screen:relaunch";
 
 /**
+ * Renderer -> main (send): open System Settings straight to the Screen Recording pane.
+ * Once macOS has recorded a denial it never re-prompts, so re-probing a capture is a
+ * dead end - the only way forward is the settings pane, where the user flips the toggle
+ * (the permission UI then live-detects the grant on its next poll). This is the action
+ * behind the denied-state button.
+ */
+export const SCREEN_OPEN_SETTINGS_CHANNEL = "lune:screen:open-settings";
+
+/**
  * The permission state codec the renderer and main process share. It is built from
  * the same {@link SCREEN_PERMISSION_STATES} tuple the pure `ScreenPermissionState`
  * union derives from, so the wire codec and the domain type cannot drift. That tuple

@@ -26,6 +26,7 @@ export function MicAccessSection() {
   const isRequesting = useMicAccessStore((state) => state.isRequesting);
   const refresh = useMicAccessStore((state) => state.refresh);
   const request = useMicAccessStore((state) => state.request);
+  const openSettings = useMicAccessStore((state) => state.openSettings);
 
   // Poll while the section is mounted (the menu is open) so a grant made in System
   // Settings shows up live. Stop once granted - there is nothing left to watch for.
@@ -59,10 +60,10 @@ export function MicAccessSection() {
 
       {permissionState === "denied" && (
         <ActionRow
-          hint="Enable Lune under System Settings > Privacy & Security > Microphone, then try again."
-          buttonLabel={isRequesting ? "Checking..." : "Try again"}
-          disabled={isRequesting}
-          onClick={() => void request()}
+          hint="Turn on Lune under System Settings > Privacy & Security > Microphone - it activates here automatically once enabled."
+          buttonLabel="Open System Settings"
+          disabled={false}
+          onClick={openSettings}
         />
       )}
     </div>

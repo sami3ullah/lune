@@ -19,6 +19,8 @@ interface MicAccessState {
   refresh: () => Promise<void>;
   /** Requests mic access, popping the OS prompt on the first try. */
   request: () => Promise<void>;
+  /** Opens System Settings to the Microphone pane (the denied case never re-prompts). */
+  openSettings: () => void;
 }
 
 export const useMicAccessStore = create<MicAccessState>((set) => ({
@@ -37,4 +39,5 @@ export const useMicAccessStore = create<MicAccessState>((set) => ({
       set({ isRequesting: false });
     }
   },
+  openSettings: () => window.lune.voice.openMicSettings(),
 }));

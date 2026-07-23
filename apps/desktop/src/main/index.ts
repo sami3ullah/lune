@@ -67,6 +67,7 @@ import { OnboardingStore } from "./onboarding/onboardingStore";
 import { createOnboardingService, type OnboardingService } from "./onboarding/onboardingService";
 import { closeOnboardingWindow, openOnboardingWindow } from "./onboardingWindow";
 import {
+  SCREEN_OPEN_SETTINGS_CHANNEL,
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
   SCREEN_RELAUNCH_CHANNEL,
@@ -105,6 +106,7 @@ import {
   type VoiceRecordCommand,
 } from "../ipc/voiceInput";
 import {
+  MIC_OPEN_SETTINGS_CHANNEL,
   MIC_PERMISSION_REQUEST_CHANNEL,
   MIC_PERMISSION_STATUS_CHANNEL,
   MicPermissionStateSchema,
@@ -653,6 +655,10 @@ ipcMain.on(ONBOARDING_START_DOWNLOAD_CHANNEL, () => requireOnboardingService().s
 ipcMain.on(ONBOARDING_COMPLETE_CHANNEL, () => {
   requireOnboardingService().markComplete();
   closeOnboardingWindow();
+  // Now that the user has reached the Pill, start the global push-to-talk hook (deferred
+  // during onboarding so its Accessibility prompt didn't interrupt first run). Idempotent,
+  // so a returning user that already started it at boot is unaffected.
+  voiceController?.start();
 });
 
 // Open a Vendor's "get a key" page. The renderer sends only a Vendor id; the URL is
@@ -752,6 +758,22 @@ ipcMain.handle(SCREEN_PERMISSION_REQUEST_CHANNEL, async () => {
 ipcMain.on(SCREEN_RELAUNCH_CHANNEL, () => {
   app.relaunch();
   app.quit();
+});
+
+// Deep-link System Settings to the exact permission pane. After macOS has recorded a
+// denial it never re-prompts, so the denied-state button opens the pane where the user
+// flips the toggle (the permission UI then live-detects the grant on its next poll). The
+// `x-apple.systempreferences:` URLs open the specific Privacy panes on macOS; off macOS
+// these are no-ops (the permissions themselves are ungated there).
+ipcMain.on(SCREEN_OPEN_SETTINGS_CHANNEL, () => {
+  if (process.platform === "darwin") {
+    void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
+  }
+});
+ipcMain.on(MIC_OPEN_SETTINGS_CHANNEL, () => {
+  if (process.platform === "darwin") {
+    void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone");
+  }
 });
 
 // Microphone permission (ticket 11, contract shared with ticket 14 onboarding). The
@@ -888,7 +910,15 @@ void app.whenReady().then(() => {
     generateId: () => randomUUID(),
     decodeBase64: (base64) => new Uint8Array(Buffer.from(base64, "base64")),
   });
-  voiceController.start();
+  // The global push-to-talk hook (uiohook) needs macOS Accessibility permission, and
+  // starting it pops that System Settings pane. During first-run onboarding that prompt
+  // is off-topic and jarring (onboarding covers only mic + screen; voice isn't usable
+  // until the "ready moment" anyway), so defer the hook until onboarding completes. A
+  // returning user (flag already set) starts it now. Starting the hook is idempotent, so
+  // the completion handler can safely call it too.
+  if (onboardingStore.isComplete()) {
+    voiceController.start();
+  }
 
   // Settings (ticket 13): now that Provisioning exists, wire the service the Settings
   // IPC handlers call. Readiness reads the Provisioning run's live status + per-Runtime

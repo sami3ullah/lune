@@ -22,6 +22,14 @@ export const MIC_PERMISSION_STATUS_CHANNEL = "lune:mic:permission-status";
 export const MIC_PERMISSION_REQUEST_CHANNEL = "lune:mic:permission-request";
 
 /**
+ * Renderer -> main (send): open System Settings straight to the Microphone pane. Once
+ * macOS has recorded a denial it never re-prompts, so the denied-state button opens the
+ * pane where the user flips the toggle; the permission UI live-detects the grant on its
+ * next poll.
+ */
+export const MIC_OPEN_SETTINGS_CHANNEL = "lune:mic:open-settings";
+
+/**
  * The mic permission state codec the renderer and main process share, built from the
  * same {@link MIC_PERMISSION_STATES} tuple the pure `MicPermissionState` union derives
  * from, so the wire codec and the domain type cannot drift. That tuple lives in a

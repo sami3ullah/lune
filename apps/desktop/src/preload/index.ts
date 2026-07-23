@@ -47,6 +47,7 @@ import {
   type OverlayEvent,
 } from "../ipc/overlayControl";
 import {
+  SCREEN_OPEN_SETTINGS_CHANNEL,
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
   SCREEN_RELAUNCH_CHANNEL,
@@ -59,6 +60,7 @@ import {
   type SpeechEvent,
 } from "../ipc/speechPlayback";
 import {
+  MIC_OPEN_SETTINGS_CHANNEL,
   MIC_PERMISSION_REQUEST_CHANNEL,
   MIC_PERMISSION_STATUS_CHANNEL,
   MicPermissionStateSchema,
@@ -278,6 +280,10 @@ const luneBridge = {
     async requestMicPermission(): Promise<MicPermissionStateValue> {
       return MicPermissionStateSchema.parse(await ipcRenderer.invoke(MIC_PERMISSION_REQUEST_CHANNEL));
     },
+    /** Opens System Settings to the Microphone pane (for the denied case, which never re-prompts). */
+    openMicSettings(): void {
+      ipcRenderer.send(MIC_OPEN_SETTINGS_CHANNEL);
+    },
   },
   pill: {
     /**
@@ -318,6 +324,10 @@ const luneBridge = {
     /** Relaunches Lune so a freshly-granted permission takes effect (macOS quirk). */
     relaunch(): void {
       ipcRenderer.send(SCREEN_RELAUNCH_CHANNEL);
+    },
+    /** Opens System Settings to the Screen Recording pane (for the denied case, which never re-prompts). */
+    openSettings(): void {
+      ipcRenderer.send(SCREEN_OPEN_SETTINGS_CHANNEL);
     },
   },
   onboarding: {

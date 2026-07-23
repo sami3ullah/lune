@@ -28,6 +28,7 @@ export function ScreenAccessSection() {
   const refresh = useScreenAccessStore((state) => state.refresh);
   const request = useScreenAccessStore((state) => state.request);
   const relaunch = useScreenAccessStore((state) => state.relaunch);
+  const openSettings = useScreenAccessStore((state) => state.openSettings);
 
   // Poll while the section is mounted (the menu is open) so a grant made in System
   // Settings, or the needs-relaunch tell, shows up live. Stop once fully granted -
@@ -62,10 +63,10 @@ export function ScreenAccessSection() {
 
       {permissionState === "denied" && (
         <ActionRow
-          hint="Enable Lune under System Settings > Privacy & Security > Screen Recording, then try again."
-          buttonLabel={isRequesting ? "Checking..." : "Try again"}
-          disabled={isRequesting}
-          onClick={() => void request()}
+          hint="Turn on Lune under System Settings > Privacy & Security > Screen Recording - it activates here automatically once enabled."
+          buttonLabel="Open System Settings"
+          disabled={false}
+          onClick={openSettings}
         />
       )}
 

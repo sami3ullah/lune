@@ -281,10 +281,13 @@ function PermissionsStep() {
   const requestScreen = useScreenAccessStore((state) => state.request);
   const relaunch = useScreenAccessStore((state) => state.relaunch);
 
+  const openScreenSettings = useScreenAccessStore((state) => state.openSettings);
+
   const micState = useMicAccessStore((state) => state.permissionState);
   const micRequesting = useMicAccessStore((state) => state.isRequesting);
   const refreshMic = useMicAccessStore((state) => state.refresh);
   const requestMic = useMicAccessStore((state) => state.request);
+  const openMicSettings = useMicAccessStore((state) => state.openSettings);
 
   // Poll both permissions while this step is open so a grant made in System Settings (or
   // the screen needs-relaunch tell) shows up live without a restart.
@@ -315,11 +318,13 @@ function PermissionsStep() {
             requesting={screenRequesting}
             onRequest={() => void requestScreen()}
             onRelaunch={relaunch}
+            onOpenSettings={openScreenSettings}
           />
           <MicPermissionCard
             state={micState}
             requesting={micRequesting}
             onRequest={() => void requestMic()}
+            onOpenSettings={openMicSettings}
           />
         </div>
       }
@@ -389,11 +394,13 @@ function ScreenPermissionCard({
   requesting,
   onRequest,
   onRelaunch,
+  onOpenSettings,
 }: {
   state: RendererScreenPermissionState;
   requesting: boolean;
   onRequest: () => void;
   onRelaunch: () => void;
+  onOpenSettings: () => void;
 }) {
   const presentation = SCREEN_PRESENTATION[state];
   return (
@@ -405,7 +412,9 @@ function ScreenPermissionCard({
         state === "granted"
           ? undefined
           : state === "denied"
-            ? "Enable Lune under System Settings › Privacy & Security › Screen Recording, then try again."
+            ? // macOS never re-prompts after a denial, so the button opens the pane; the
+              // toggle then takes effect and this step detects it on its next poll.
+              "Turn on Lune under System Settings › Privacy & Security › Screen Recording - it activates here automatically once enabled."
             : state === "granted-needs-relaunch"
               ? "Access granted. macOS needs Lune to relaunch before it can capture."
               : "Let Lune see your screen to answer questions about it."
@@ -413,9 +422,11 @@ function ScreenPermissionCard({
       action={
         state === "granted" ? undefined : state === "granted-needs-relaunch" ? (
           <PermissionButton label="Relaunch Lune" onClick={onRelaunch} />
+        ) : state === "denied" ? (
+          <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
         ) : (
           <PermissionButton
-            label={requesting ? "Checking…" : state === "denied" ? "Try again" : "Grant screen access"}
+            label={requesting ? "Checking…" : "Grant screen access"}
             onClick={onRequest}
             disabled={requesting}
           />
@@ -436,10 +447,12 @@ function MicPermissionCard({
   state,
   requesting,
   onRequest,
+  onOpenSettings,
 }: {
   state: RendererMicPermissionState;
   requesting: boolean;
   onRequest: () => void;
+  onOpenSettings: () => void;
 }) {
   const presentation = MIC_PRESENTATION[state];
   return (
@@ -451,13 +464,15 @@ function MicPermissionCard({
         state === "granted"
           ? undefined
           : state === "denied"
-            ? "Enable Lune under System Settings › Privacy & Security › Microphone, then try again."
+            ? "Turn on Lune under System Settings › Privacy & Security › Microphone - it activates here automatically once enabled."
             : "Let Lune hear you so you can hold the hotkey and talk."
       }
       action={
-        state === "granted" ? undefined : (
+        state === "granted" ? undefined : state === "denied" ? (
+          <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+        ) : (
           <PermissionButton
-            label={requesting ? "Checking…" : state === "denied" ? "Try again" : "Grant mic access"}
+            label={requesting ? "Checking…" : "Grant mic access"}
             onClick={onRequest}
             disabled={requesting}
           />

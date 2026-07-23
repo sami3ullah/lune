@@ -20,6 +20,8 @@ interface ScreenAccessState {
   request: () => Promise<void>;
   /** Relaunches Lune so a freshly-granted permission takes effect. */
   relaunch: () => void;
+  /** Opens System Settings to the Screen Recording pane (the denied case never re-prompts). */
+  openSettings: () => void;
 }
 
 export const useScreenAccessStore = create<ScreenAccessState>((set) => ({
@@ -39,4 +41,5 @@ export const useScreenAccessStore = create<ScreenAccessState>((set) => ({
     }
   },
   relaunch: () => window.lune.screen.relaunch(),
+  openSettings: () => window.lune.screen.openSettings(),
 }));
