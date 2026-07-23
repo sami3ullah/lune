@@ -4,7 +4,12 @@ node_modules/
 # Build output
 dist/
 out/
-build/
+# The whisper-server binary is built into the repo-root build/ (scripts/build-whisper-server.sh).
+# Root-anchored so it never shadows apps/desktop/build/, electron-builder's tracked signing
+# resources (entitlements). The models/weights are never here - Provisioning downloads them.
+/build/
+# electron-builder packaging output (the .app and DMG), at any package level.
+release/
 *.tsbuildinfo
 
 # Logs

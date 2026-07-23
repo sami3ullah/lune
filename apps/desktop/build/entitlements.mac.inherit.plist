@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Entitlements applied when re-signing the nested Mach-O binaries inside the bundle
+    (the Electron helper apps and the staged whisper-server child). They carry the same
+    hardened-runtime exceptions as the main app so a helper renderer can JIT and the
+    child binaries load without library-validation blocking them. No resource-access
+    keys here: the mic is only touched from the main app's Pill renderer, and TCC
+    grants are attributed to the top-level bundle identity, not per-helper.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

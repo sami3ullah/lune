@@ -91,6 +91,7 @@ import {
   runTranscriptionDevTrigger,
   type DesktopTranscription,
 } from "./transcription/transcriptionService";
+import { resolveWhisperServerBinaryPath, WHISPER_SERVER_PATH_ENV } from "./transcription/whisperServerBinaryPath";
 import { createDesktopSpeech, runSpeechDevTrigger } from "./speech/speechService";
 import { createSpeechTurnPlayer, type SpeechTurnPlayer } from "./speech/speechTurnPlayer";
 import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ipc/speechPlayback";
@@ -814,11 +815,17 @@ void app.whenReady().then(() => {
   // Transcription (ticket 10): on-device whisper.cpp batch STT. The Core owns the
   // supervision + readiness + transcribe logic; this injects the whisper-server edge
   // and drives the lifecycle. Whisper is ready only when its weights are provisioned
-  // AND its child Runtime is healthy; the binary comes from a pinned-source build
-  // pointed at by LUNE_WHISPER_SERVER_PATH (absent in dev → whisper reports not-ready).
+  // AND its child Runtime is healthy. The binary comes from a pinned-source build: in a
+  // packaged app it is staged into the bundle's Resources (ticket 15), and in dev it is
+  // pointed at via LUNE_WHISPER_SERVER_PATH (absent → whisper reports not-ready).
   transcription = createDesktopTranscription({
     modelsDirectoryPath: provisioning.modelsDirectoryPath,
     isWhisperProvisioned: () => provisioning.capability.isRuntimeReady("whisper"),
+    whisperServerBinaryPath: resolveWhisperServerBinaryPath({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      envOverride: process.env[WHISPER_SERVER_PATH_ENV],
+    }),
   });
 
   // Speech (ticket 09): the in-process Kokoro engine, gated on the Kokoro weights being

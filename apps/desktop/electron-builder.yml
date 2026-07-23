@@ -1,0 +1,96 @@
+# electron-builder configuration for Lune (ticket 15 - signed, notarized DMG).
+#
+# The pipeline that produces the shipping DMG is: `electron-vite build` emits the
+# runnable app into `out/`, then electron-builder (invoked with this config) packages,
+# deep-signs with the hardened runtime, notarizes, and staples. `scripts/package-dmg.sh`
+# runs the whole chain (including building the whisper-server binary) end-to-end.
+$schema: https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json
+
+appId: com.lune.desktop
+productName: Lune
+copyright: Copyright © 2026 Lune
+
+directories:
+  # Keep build inputs (entitlements, icons) and the release output out of the source tree.
+  output: release
+  buildResources: build
+
+# What ships inside the app. electron-vite already bundles @lune/core and @lune/shared
+# into out/main + out/preload, so only the compiled app and the externalized native deps
+# (onnxruntime-node, uiohook-napi, phonemizer) need to travel; electron-builder collects
+# the production node_modules automatically.
+files:
+  - out/**/*
+  - package.json
+  # @lune/core and @lune/shared are workspace packages, already bundled into out/main +
+  # out/preload by electron-vite (they are excluded from externalization in
+  # electron.vite.config.ts). They must NOT be collected as node_modules: they are pnpm
+  # symlinks pointing outside the app directory, which electron-builder cannot pack.
+  - "!node_modules/@lune/**"
+  # The model weights are never bundled - Provisioning downloads them on first run into
+  # userData (ADR: weights are never in the installer). They live outside the app, so
+  # there is nothing to exclude here; this comment is the reminder that it stays that way.
+  #
+  # Trim the multi-platform native payloads down to the one target Lune ships in M1
+  # (macOS arm64) so the installer never carries Linux/Windows/x64 binaries it cannot
+  # use - keeping the installer small (acceptance #3).
+  - "!node_modules/onnxruntime-node/bin/napi-v6/linux"
+  - "!node_modules/onnxruntime-node/bin/napi-v6/win32"
+  - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/x64"
+  - "!node_modules/uiohook-napi/prebuilds/linux-*"
+  - "!node_modules/uiohook-napi/prebuilds/win32-*"
+  - "!node_modules/uiohook-napi/prebuilds/darwin-x64"
+
+# Native code cannot be loaded or dlopen'd from inside the asar archive, so the addons
+# and their dylibs are unpacked to app.asar.unpacked/ where the loader (and the deep
+# signer) can reach every Mach-O file.
+asarUnpack:
+  - "**/*.node"
+  - "node_modules/onnxruntime-node/**"
+
+# The whisper-server binary is built from pinned source (scripts/build-whisper-server.sh),
+# not downloaded, so it is staged into the app as a resource. It lands at
+# Contents/Resources/whisper-server, which is where resolveWhisperServerBinaryPath points
+# the installed app (process.resourcesPath). It is a Mach-O executable inside the bundle,
+# so the deep signer signs it with the inherited hardened-runtime entitlements.
+extraResources:
+  - from: "../../build/whisper-server"
+    to: "whisper-server"
+
+mac:
+  category: public.app-category.productivity
+  # arm64 only in M1 (the whisper-server build and the shipped onnxruntime binary are
+  # both arm64); a universal/x64 build is a later concern.
+  target:
+    - target: dmg
+      arch: arm64
+  hardenedRuntime: true
+  # Skip the local Gatekeeper assessment during signing; the real Gatekeeper check is
+  # notarization + stapling, which this pipeline does.
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+  # Notarize with Apple. electron-builder reads the credentials from the environment
+  # (APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID, or an App Store Connect API
+  # key via APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER). See scripts/package-dmg.sh.
+  notarize: true
+  extendInfo:
+    # Lune is a background companion: no dock icon, no app-switcher entry (story 40).
+    # LSUIElement makes it an accessory from launch, before app.dock.hide() runs.
+    LSUIElement: true
+    # The mic prompt's rationale, tied to the signed bundle identity so the grant sticks.
+    NSMicrophoneUsageDescription: >-
+      Lune records your voice while you hold the push-to-talk hotkey, transcribing it
+      on-device so you can talk to Lune.
+
+dmg:
+  title: Lune ${version}
+  # A simple drag-to-Applications layout.
+  contents:
+    - x: 130
+      y: 220
+      type: file
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

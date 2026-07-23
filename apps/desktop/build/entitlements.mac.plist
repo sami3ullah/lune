@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened-runtime entitlements for the signed, notarized Lune bundle (ticket 15).
+    Lune ships with the hardened runtime on (a notarization requirement) but is NOT
+    sandboxed (Developer ID / DMG distribution, not the Mac App Store), so the only
+    entitlements that carry meaning here are the hardened-runtime `cs.*` exceptions
+    plus the resource-access keys. Sandbox-only keys (network.client, files.*) are
+    deliberately omitted - they would be inert and only widen the claimed surface.
+
+    Grant exactly what the addons need and nothing more (ticket 15):
+      - Electron's V8 JITs JavaScript (and phonemizer's espeak-ng runs as WebAssembly),
+        which needs writable-then-executable memory.
+      - onnxruntime-node and uiohook-napi are third-party native (.node) addons Lune
+        did not sign as libraries, and the app spawns the separately-built
+        whisper-server child; loading/spawning them requires library validation off.
+  -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!--
+    Microphone: push-to-talk records the mic in the Pill renderer. Under the hardened
+    runtime this resource-access entitlement pairs with the NSMicrophoneUsageDescription
+    string (electron-builder.yml) so the TCC prompt appears and the grant sticks to the
+    signed bundle identity. Screen Recording needs no entitlement - it is TCC-only.
+  -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
