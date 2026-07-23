@@ -13,8 +13,11 @@ beforeEach(() => {
   useConversationStore.setState({
     messages: [],
     activeTurnId: null,
+    committedMessageCount: 0,
     turnStatus: "idle",
     errorMessage: null,
+    conversations: [],
+    activeConversationId: null,
   });
 });
 
@@ -121,5 +124,73 @@ describe("conversationStore projection", () => {
       { type: "assistant-delta", turnId: "turn-old", messageId: "a-old", text: "stale" },
     ]);
     expect(useConversationStore.getState().messages).toEqual([]);
+  });
+});
+
+describe("conversationStore recent-conversations (ticket 12)", () => {
+  it("mirrors the Shell's list + active id for the dropdown", () => {
+    useConversationStore.getState().setConversationList({
+      conversations: [
+        { id: "c2", title: "second", updatedAtMs: 20 },
+        { id: "c1", title: "first", updatedAtMs: 10 },
+      ],
+      activeId: "c2",
+    });
+
+    const state = useConversationStore.getState();
+    expect(state.conversations.map((conversation) => conversation.id)).toEqual(["c2", "c1"]);
+    expect(state.activeConversationId).toBe("c2");
+  });
+
+  it("resumes a conversation by rendering its full text history and making it active", () => {
+    // Start from a different conversation's leftover state...
+    useConversationStore.setState({
+      messages: [{ id: "old", role: "user", text: "stale" }],
+      turnStatus: "error",
+      errorMessage: "boom",
+    });
+
+    useConversationStore.getState().resumeConversation({
+      activeId: "resumed-1",
+      messages: [
+        { id: "u1", role: "user", inputMethod: "text", text: "what is this?" },
+        { id: "a1", role: "assistant", text: "a config file" },
+      ],
+    });
+
+    const state = useConversationStore.getState();
+    expect(state.activeConversationId).toBe("resumed-1");
+    expect(state.messages).toEqual([
+      { id: "u1", role: "user", inputMethod: "text", text: "what is this?" },
+      { id: "a1", role: "assistant", text: "a config file" },
+    ]);
+    // Turn state is reset so the panel is clean and ready for the next turn.
+    expect(state.turnStatus).toBe("idle");
+    expect(state.errorMessage).toBeNull();
+    // The whole resumed history counts as committed, so a later failed turn rolls back to it.
+    expect(state.committedMessageCount).toBe(2);
+  });
+
+  it("carries the input method through a resumed voice turn", () => {
+    useConversationStore.getState().resumeConversation({
+      activeId: "resumed-1",
+      messages: [{ id: "u1", role: "user", inputMethod: "voice", text: "spoken" }],
+    });
+    expect(useConversationStore.getState().messages[0]).toMatchObject({ inputMethod: "voice" });
+  });
+
+  it("starts a new conversation by clearing the rendered history", () => {
+    useConversationStore.setState({
+      messages: [{ id: "old", role: "user", text: "previous" }],
+      committedMessageCount: 1,
+    });
+
+    useConversationStore.getState().startNewConversation("fresh-1");
+
+    const state = useConversationStore.getState();
+    expect(state.messages).toEqual([]);
+    expect(state.activeConversationId).toBe("fresh-1");
+    expect(state.committedMessageCount).toBe(0);
+    expect(state.turnStatus).toBe("idle");
   });
 });

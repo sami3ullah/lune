@@ -1,4 +1,5 @@
-import { readFileSync, watch } from "node:fs";
+import { readFileSync, watch, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { app, BrowserWindow, ipcMain, screen, systemPreferences, type WebContents } from "electron";
 import {
@@ -20,6 +21,15 @@ import {
 } from "@lune/shared";
 import { APP_QUIT_CHANNEL } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
+import {
+  CONVERSATIONS_CHANGED_CHANNEL,
+  CONVERSATIONS_LIST_CHANNEL,
+  CONVERSATIONS_NEW_CHANNEL,
+  CONVERSATIONS_RESUME_CHANNEL,
+  ConversationListSnapshotSchema,
+  ResumedConversationSchema,
+} from "../ipc/conversations";
+import { ConversationHistoryStore } from "./conversationHistoryStore";
 import { toggleChatPanelWindow } from "./chatPanelWindow";
 import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
@@ -100,12 +110,49 @@ const reasoningCapability = createReasoningCapability({
 });
 
 // Conversation state lives in the Core (ticket 06): the Chat Panel renders the history
-// the manager owns. One manager holds the single in-memory conversation for now;
-// multiple conversations + durable last-10 persistence arrive in ticket 12.
+// the manager owns. The manager holds one *active* conversation; the durable set of
+// the last 10 (text only, oldest pruned) is the Shell's ConversationHistoryStore below.
 const conversationManager = createConversationManager({
   reasoningCapability,
   generateMessageId: () => randomUUID(),
 });
+
+// The durable last-10 conversation store (ticket 12): text only, under the app's
+// userData, oldest auto-pruned. Persistence is a platform concern, so it sits in the
+// Shell behind an injected fs seam; the Core stays filesystem-agnostic. A missing file
+// (first run) simply loads as empty history.
+const conversationHistoryStore = new ConversationHistoryStore(
+  join(app.getPath("userData"), "conversations.json"),
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+  () => Date.now(),
+);
+
+// The active conversation the next turn belongs to. On boot we resume the most recent
+// one so a restart lands the user back where they left off (and every stored one is in
+// the dropdown); a first run starts a fresh, unpersisted conversation.
+let activeConversationId: string = (() => {
+  const mostRecent = conversationHistoryStore.list()[0];
+  if (mostRecent) {
+    const resumed = conversationHistoryStore.get(mostRecent.id);
+    if (resumed) {
+      conversationManager.loadConversation(resumed.messages);
+      return mostRecent.id;
+    }
+  }
+  return randomUUID();
+})();
+
+/**
+ * Tells the Chat Panel its recent-conversations set changed (a turn created a new
+ * conversation, firmed up a title, or pruned the oldest) so it re-reads the list. Sent
+ * to the window that ran the turn - the only surface that starts turns is the panel.
+ */
+function notifyConversationsChanged(webContents: WebContents): void {
+  if (!webContents.isDestroyed()) {
+    webContents.send(CONVERSATIONS_CHANGED_CHANNEL);
+  }
+}
 
 /**
  * This app's macOS Screen Recording access, as the OS reports it. Off macOS, screen
@@ -337,6 +384,13 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
           }
         }
       }
+
+      // The turn committed in the Core, so persist the active conversation's text-only
+      // history (ticket 12) - creating it on the first turn, updating it after, pruning
+      // the oldest beyond 10 - and tell the panel its recent-list may have changed. A
+      // failed turn throws above and never reaches here, matching the Core's rollback.
+      conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
+      notifyConversationsChanged(webContents);
     } catch (error) {
       sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
       // End any Overlay interaction this turn opened so the cursor fades out rather
@@ -356,6 +410,47 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
 // Open/close the Chat Panel from the Pill menu (or its own close button). One toggle
 // keeps both entry points in agreement.
 ipcMain.on(CHAT_PANEL_TOGGLE_CHANNEL, () => toggleChatPanelWindow());
+
+// The recent-conversations dropdown (ticket 12). These drive the Shell's durable store
+// and the Core's active conversation; the answer stream still flows over the shared
+// chat contract. Each result is parsed on the way out so no untyped shape crosses the
+// boundary (developer story 46).
+
+// The dropdown's list + which conversation is active. A fresh, not-yet-persisted
+// conversation reports a `null` active id, so the panel shows "New conversation" rather
+// than selecting a row that is not in the list yet.
+ipcMain.handle(CONVERSATIONS_LIST_CHANNEL, () =>
+  ConversationListSnapshotSchema.parse({
+    conversations: conversationHistoryStore.list(),
+    activeId: conversationHistoryStore.get(activeConversationId) ? activeConversationId : null,
+  }),
+);
+
+// Resume a stored conversation: seed the Core with its prior text history and make it
+// active, then return that history for the panel to render. An unknown id leaves the
+// current conversation active (the renderer only ever sends ids from the live list).
+// The resumed turn answers with fresh screen context - screenshots were never stored.
+ipcMain.handle(CONVERSATIONS_RESUME_CHANNEL, (_event, rawId: unknown) => {
+  if (typeof rawId === "string") {
+    const resumed = conversationHistoryStore.get(rawId);
+    if (resumed) {
+      conversationManager.loadConversation(resumed.messages);
+      activeConversationId = rawId;
+    }
+  }
+  return ResumedConversationSchema.parse({
+    activeId: activeConversationId,
+    messages: conversationManager.getMessages(),
+  });
+});
+
+// Start a new, empty conversation: reset the Core's active history and mint a fresh id
+// (persisted only once its first turn completes). Returns the new active id.
+ipcMain.handle(CONVERSATIONS_NEW_CHANNEL, () => {
+  activeConversationId = randomUUID();
+  conversationManager.loadConversation([]);
+  return activeConversationId;
+});
 
 // Quit from the pill menu tears the whole app down (developer story 41). Registered
 // at app scope because quitting is not tied to any one window. The whisper child

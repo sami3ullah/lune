@@ -11,7 +11,12 @@
  * user/assistant shape every Vendor requires. The failure propagates (thrown, like the
  * pipeline) for the Shell to surface as a readable error.
  *
- * In-memory only for now; durable last-10 persistence is ticket 12.
+ * The manager holds one *active* conversation. Ticket 12 adds `loadConversation`: the
+ * Shell's durable last-10 store seeds the manager with a resumed conversation's prior
+ * messages, or an empty history to start a new one. Persistence of the set of
+ * conversations (text only, oldest pruned beyond 10) is the Shell's concern - the Core
+ * stays transport- and filesystem-agnostic; only the active conversation's turn logic
+ * lives here.
  */
 import { buildConversationRequest } from "./buildConversationRequest.js";
 import type { ScreenCaptureInput } from "../reasoning/chatTypes.js";
@@ -49,6 +54,13 @@ export interface ConversationManager {
   submitUserTurn(input: SubmitUserTurnInput): AsyncGenerator<CoreConversationEvent>;
   /** A snapshot copy of the committed conversation history. */
   getMessages(): ConversationMessage[];
+  /**
+   * Replaces the active conversation's committed history (ticket 12). Called with a
+   * resumed conversation's prior messages to continue it, or an empty array to start
+   * a fresh one. The messages are defensively copied, so the caller's array (the
+   * Shell's persisted snapshot) is never aliased into committed state.
+   */
+  loadConversation(messages: ConversationMessage[]): void;
 }
 
 export function createConversationManager(
@@ -98,8 +110,17 @@ export function createConversationManager(
     yield { type: "assistant-completed", messageId: assistantMessage.id };
   }
 
+  function loadConversation(messages: ConversationMessage[]): void {
+    // Replace in place (rather than rebind) so the closure the in-flight turn holds
+    // keeps referencing the live history; defensively copy each message so the Shell's
+    // persisted snapshot is never aliased into committed state.
+    committedMessages.length = 0;
+    committedMessages.push(...messages.map((message) => ({ ...message })));
+  }
+
   return {
     submitUserTurn,
     getMessages: () => committedMessages.map((message) => ({ ...message })),
+    loadConversation,
   };
 }

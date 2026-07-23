@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import { createConversationManager } from "../src/conversation/conversationManager.js";
 import type { ReasoningCapability } from "../src/reasoning/reasoningCapability.js";
 import type { CoreChatRequest, CoreChatStreamEvent } from "../src/reasoning/chatTypes.js";
-import type { CoreConversationEvent } from "../src/conversation/conversationTypes.js";
+import type {
+  ConversationMessage,
+  CoreConversationEvent,
+} from "../src/conversation/conversationTypes.js";
 
 // The conversation manager is tested at the Core's public seam - exactly how the
 // Electron main process drives it - by injecting a stub Reasoning Capability that
@@ -155,5 +158,69 @@ describe("conversationManager.submitUserTurn", () => {
       { id: "m3", role: "user", inputMethod: "text", text: "try again" },
       { id: "m4", role: "assistant", text: "recovered" },
     ]);
+  });
+});
+
+const RESUMED_HISTORY: ConversationMessage[] = [
+  { id: "u1", role: "user", inputMethod: "text", text: "what is this file?" },
+  { id: "a1", role: "assistant", text: "it's a config file." },
+];
+
+describe("conversationManager.loadConversation (ticket 12 - resume/new)", () => {
+  it("seeds committed history so a resumed conversation renders its prior turns", () => {
+    const manager = createConversationManager({
+      reasoningCapability: stubReasoning({}),
+      generateMessageId: sequentialIds(),
+    });
+
+    manager.loadConversation(RESUMED_HISTORY);
+
+    expect(manager.getMessages()).toEqual(RESUMED_HISTORY);
+  });
+
+  it("answers a resumed turn with the full prior text history as context", async () => {
+    const reasoning = stubReasoning({ replies: [["and this?"]] });
+    const manager = createConversationManager({
+      reasoningCapability: reasoning,
+      generateMessageId: sequentialIds(),
+    });
+
+    manager.loadConversation(RESUMED_HISTORY);
+    await drain(manager.submitUserTurn({ text: "and now?", inputMethod: "text", screenshots: [] }));
+
+    // The resumed history is replayed as plain-text context ahead of the new turn - a
+    // resumed conversation keeps its full text history (screenshots were never stored).
+    expect(reasoning.requests[0]!.messages).toEqual([
+      { role: "user", content: "what is this file?" },
+      { role: "assistant", content: "it's a config file." },
+      { role: "user", content: "and now?" },
+    ]);
+  });
+
+  it("starts a fresh conversation clean when loaded with no history", async () => {
+    const manager = createConversationManager({
+      reasoningCapability: stubReasoning({ replies: [["ok"]] }),
+      generateMessageId: sequentialIds(),
+    });
+
+    manager.loadConversation(RESUMED_HISTORY);
+    manager.loadConversation([]);
+    await drain(manager.submitUserTurn({ text: "fresh start", inputMethod: "text", screenshots: [] }));
+
+    // None of the previous conversation's turns survive the reset.
+    expect(manager.getMessages().map((message) => message.text)).toEqual(["fresh start", "ok"]);
+  });
+
+  it("does not alias the caller's array into committed state", () => {
+    const manager = createConversationManager({
+      reasoningCapability: stubReasoning({}),
+      generateMessageId: sequentialIds(),
+    });
+
+    const seed: ConversationMessage[] = [{ id: "u1", role: "user", inputMethod: "text", text: "hi" }];
+    manager.loadConversation(seed);
+    // Mutating the original seed after loading must not corrupt committed history.
+    seed.push({ id: "leak", role: "assistant", text: "leaked" });
+    expect(manager.getMessages()).toHaveLength(1);
   });
 });

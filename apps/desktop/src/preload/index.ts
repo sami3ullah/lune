@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import { z } from "zod";
 import {
   CHAT_EVENT_CHANNEL,
   CHAT_START_CHANNEL,
@@ -13,6 +14,16 @@ import {
   type PillContentSize,
 } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
+import {
+  CONVERSATIONS_CHANGED_CHANNEL,
+  CONVERSATIONS_LIST_CHANNEL,
+  CONVERSATIONS_NEW_CHANNEL,
+  CONVERSATIONS_RESUME_CHANNEL,
+  ConversationListSnapshotSchema,
+  ResumedConversationSchema,
+  type ConversationListSnapshotValue,
+  type ResumedConversationValue,
+} from "../ipc/conversations";
 import {
   OVERLAY_EVENT_CHANNEL,
   OVERLAY_IDLE_CHANNEL,
@@ -65,6 +76,38 @@ const luneBridge = {
     /** Opens the Chat Panel window, or hides it if already open. */
     toggle(): void {
       ipcRenderer.send(CHAT_PANEL_TOGGLE_CHANNEL);
+    },
+  },
+  conversations: {
+    /**
+     * Reads the recent-conversations list and the active id for the dropdown, validated
+     * against the shared codec before the renderer sees it (no untyped shape crosses in).
+     */
+    async list(): Promise<ConversationListSnapshotValue> {
+      return ConversationListSnapshotSchema.parse(await ipcRenderer.invoke(CONVERSATIONS_LIST_CHANNEL));
+    },
+    /**
+     * Resumes a stored conversation by id, resolving with its full text history to
+     * render (the main process seeds the Core and makes it active). The next turn
+     * answers with fresh screen context - screenshots were never stored.
+     */
+    async resume(id: string): Promise<ResumedConversationValue> {
+      return ResumedConversationSchema.parse(await ipcRenderer.invoke(CONVERSATIONS_RESUME_CHANNEL, id));
+    },
+    /** Starts a new, empty conversation, resolving with its freshly-minted active id. */
+    async startNew(): Promise<{ activeId: string }> {
+      const activeId = z.string().min(1).parse(await ipcRenderer.invoke(CONVERSATIONS_NEW_CHANNEL));
+      return { activeId };
+    },
+    /**
+     * Subscribes to "the persisted set changed" notifications (a turn added, renamed,
+     * or pruned a conversation) so the panel can refresh its dropdown. Returns an
+     * unsubscribe function.
+     */
+    onChanged(listener: () => void): () => void {
+      const forward = (): void => listener();
+      ipcRenderer.on(CONVERSATIONS_CHANGED_CHANNEL, forward);
+      return () => ipcRenderer.removeListener(CONVERSATIONS_CHANGED_CHANNEL, forward);
     },
   },
   overlay: {
