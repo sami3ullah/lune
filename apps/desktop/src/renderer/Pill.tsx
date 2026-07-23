@@ -1,9 +1,11 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { StateIndicator, labelForState } from "./StateIndicator";
 import { PILL_INDICATOR_STATES, usePillStore, type PillIndicatorState } from "./pillStore";
 import { ScreenAccessSection } from "./ScreenAccessSection";
+import { MicAccessSection } from "./MicAccessSection";
 import { useSpeechPlayback } from "./useSpeechPlayback";
+import { useVoiceRecording } from "./useVoiceRecording";
 
 // The Pill: Lune's home surface (ticket 04). A thin always-on-top bar that expands
 // into its menu on hover. The window is frameless and transparent and sized to this
@@ -18,10 +20,24 @@ export function Pill() {
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const indicatorState = usePillStore((state) => state.indicatorState);
+  const setIndicatorState = usePillStore((state) => state.setIndicatorState);
 
   // The Pill owns Lune's audio output: it plays the Kokoro speech clips the main
   // process streams over IPC and drives the "speaking" state while they play (ticket 09).
   useSpeechPlayback();
+
+  // The Pill also owns the mic: it records push-to-talk audio when the main process
+  // (driven by the global hotkey) tells it to, streaming the live level for the Overlay
+  // waveform and the finished clip back for transcription (ticket 11).
+  useVoiceRecording();
+
+  // The voice loop drives the Pill's listening/thinking/idle state over IPC; Kokoro
+  // playback drives speaking/idle separately (useSpeechPlayback). Together they light
+  // the at-a-glance indicator through a full voice turn (user story 15).
+  useEffect(
+    () => window.lune.voice.onPillActivity((activity) => setIndicatorState(activity.state)),
+    [setIndicatorState],
+  );
 
   // The main process sizes the frameless window to whatever we render, so it must
   // learn the current content size: on first paint, on every hover expand, and -
@@ -69,6 +85,7 @@ export function Pill() {
             <MenuButton label="Settings" onClick={() => window.lune.settings.toggle()} />
             <MenuButton label="Quit Lune" onClick={() => window.lune.pill.quit()} />
             <ScreenAccessSection />
+            <MicAccessSection />
             {IS_DEV && <DevStateSwitcher current={indicatorState} />}
           </motion.div>
         )}

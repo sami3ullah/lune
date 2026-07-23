@@ -25,6 +25,19 @@ const CHAT_PANEL_ROUTE_HASH = "chat";
 // There is exactly one Chat Panel; a module-level handle lets the toggle reuse it.
 let chatPanelWindow: BrowserWindow | null = null;
 
+/**
+ * The Chat Panel's WebContents when it is open and alive, else `null`. A voice turn
+ * (ticket 11) streams its conversation events here so the transcript and reply appear in
+ * the same unified history as typed turns - when the panel is closed there is nothing to
+ * render live (the Core still commits the turn and the durable store persists it).
+ */
+export function getChatPanelWebContents(): Electron.WebContents | null {
+  if (chatPanelWindow && !chatPanelWindow.isDestroyed()) {
+    return chatPanelWindow.webContents;
+  }
+  return null;
+}
+
 /** Opens the Chat Panel when closed, hides it when open (the Pill menu + close button share this). */
 export function toggleChatPanelWindow(): void {
   if (chatPanelWindow && !chatPanelWindow.isDestroyed()) {

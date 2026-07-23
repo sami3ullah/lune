@@ -55,11 +55,16 @@ export function Overlay() {
   const answerText = useOverlayStore((state) => state.answerText);
   const pointTarget = useOverlayStore((state) => state.pointTarget);
   const showStreamingText = useOverlayStore((state) => state.showStreamingText);
+  const listening = useOverlayStore((state) => state.listening);
+  const listeningLevel = useOverlayStore((state) => state.listeningLevel);
   const beginInteraction = useOverlayStore((state) => state.beginInteraction);
   const appendAnswer = useOverlayStore((state) => state.appendAnswer);
   const setPointTarget = useOverlayStore((state) => state.setPointTarget);
   const endInteraction = useOverlayStore((state) => state.endInteraction);
   const reset = useOverlayStore((state) => state.reset);
+  const beginListening = useOverlayStore((state) => state.beginListening);
+  const setListeningLevel = useOverlayStore((state) => state.setListeningLevel);
+  const endListening = useOverlayStore((state) => state.endListening);
 
   const [visible, setVisible] = useState(false);
   const [cursorFrame, setCursorFrame] = useState<CursorFrame>(() => ({
@@ -83,6 +88,19 @@ export function Overlay() {
     return window.lune.overlay.onOverlayEvent((event) => {
       lastActivityRef.current = performance.now();
       switch (event.type) {
+        case "listen-start":
+          // Push-to-talk held: show the waveform near the cursor (ticket 11).
+          beginListening();
+          setVisible(true);
+          break;
+        case "listen-level":
+          setListeningLevel(event.level);
+          break;
+        case "listen-end":
+          // Hotkey released: stop the waveform. If an answer follows it takes over; if
+          // not (silence), the inactivity timer fades the overlay out.
+          endListening();
+          break;
         case "activity-start":
           beginInteraction();
           setVisible(true);
@@ -98,7 +116,7 @@ export function Overlay() {
           break;
       }
     });
-  }, [beginInteraction, appendAnswer, setPointTarget, endInteraction]);
+  }, [beginInteraction, appendAnswer, setPointTarget, endInteraction, beginListening, setListeningLevel, endListening]);
 
   // Start a flight whenever a (new) pointing target arrives, from wherever the cursor
   // currently rests. Recording the flight in a ref (not state) keeps the RAF loop the
@@ -163,9 +181,13 @@ export function Overlay() {
       rotationRef.current += (targetRotation - rotationRef.current) * ROTATION_EASE;
       setCursorFrame({ x, y, rotationDegrees: rotationRef.current, scale });
 
-      // Fade out once the answer is finished and the cursor has been still for a beat.
+      // Fade out once nothing is happening for a beat: either the answer finished
+      // (phase "ending"), or a listen-only episode ended with no answer following it
+      // (not listening, and no answer active). Never while still listening or answering.
       const isIdleLongEnough = now - lastActivityRef.current > INACTIVITY_FADE_DELAY_MS;
-      if (phase === "ending" && flightRef.current === null && isIdleLongEnough) {
+      const answerSettled = phase === "ending";
+      const listenOnlyEnded = !listening && phase === "idle";
+      if ((answerSettled || listenOnlyEnded) && flightRef.current === null && isIdleLongEnough) {
         setVisible(false);
         return;
       }
@@ -175,7 +197,7 @@ export function Overlay() {
 
     rafId = requestAnimationFrame(renderFrame);
     return () => cancelAnimationFrame(rafId);
-  }, [visible, phase]);
+  }, [visible, phase, listening]);
 
   // When a new interaction begins, seed the resting position back at the idle home so
   // the cursor doesn't start a fresh answer wherever the last one happened to point.
@@ -206,9 +228,49 @@ export function Overlay() {
         }
       }}
     >
-      <PlayfulCursor frame={cursorFrame} />
-      {bubbleText !== null && <ResponseBubble text={bubbleText} anchor={cursorFrame} />}
+      {listening ? (
+        <ListeningWaveform level={listeningLevel} />
+      ) : (
+        <>
+          <PlayfulCursor frame={cursorFrame} />
+          {bubbleText !== null && <ResponseBubble text={bubbleText} anchor={cursorFrame} />}
+        </>
+      )}
     </motion.div>
+  );
+}
+
+/** The number of bars in the listening waveform. */
+const WAVEFORM_BAR_COUNT = 5;
+
+/**
+ * The live recording waveform shown near the cursor while push-to-talk is held (ticket
+ * 11, user story 18). A small row of bars whose heights ride the mic level, with a gentle
+ * per-bar phase offset so it reads as alive rather than a flat meter. Purely presentational
+ * - the level arrives from the Pill's mic capture over IPC via the store.
+ */
+function ListeningWaveform({ level }: { level: number }) {
+  return (
+    <div
+      className="absolute flex items-center gap-1"
+      style={{ left: "50%", top: IDLE_TOP_OFFSET, transform: "translate(-50%, -50%)" }}
+    >
+      {Array.from({ length: WAVEFORM_BAR_COUNT }, (_, barIndex) => {
+        // Center bars react a touch more than the edges, so the shape feels voice-like.
+        const distanceFromCenter = Math.abs(barIndex - (WAVEFORM_BAR_COUNT - 1) / 2);
+        const emphasis = 1 - distanceFromCenter / WAVEFORM_BAR_COUNT;
+        const height = 4 + level * 22 * (0.5 + emphasis);
+        return (
+          <motion.span
+            key={barIndex}
+            className="w-1 rounded-full bg-emerald-400"
+            style={{ boxShadow: "0 0 6px rgba(52, 211, 153, 0.9)" }}
+            animate={{ height }}
+            transition={{ type: "spring", stiffness: 500, damping: 24 }}
+          />
+        );
+      })}
+    </div>
   );
 }
 

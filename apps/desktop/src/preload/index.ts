@@ -58,6 +58,23 @@ import {
   SpeechEventSchema,
   type SpeechEvent,
 } from "../ipc/speechPlayback";
+import {
+  MIC_PERMISSION_REQUEST_CHANNEL,
+  MIC_PERMISSION_STATUS_CHANNEL,
+  MicPermissionStateSchema,
+  type MicPermissionStateValue,
+} from "../ipc/micPermission";
+import {
+  VOICE_PILL_ACTIVITY_CHANNEL,
+  VOICE_RECORD_COMMAND_CHANNEL,
+  VOICE_RECORD_EVENT_CHANNEL,
+  VoicePillActivitySchema,
+  VoiceRecordCommandSchema,
+  VoiceRecordEventSchema,
+  type VoicePillActivity,
+  type VoiceRecordCommand,
+  type VoiceRecordEvent,
+} from "../ipc/voiceInput";
 
 // The typed bridge the renderer uses to reach the Core through the main process.
 // It is deliberately tiny: the shared zod contract in @lune/shared is the single
@@ -194,6 +211,59 @@ const luneBridge = {
       };
       ipcRenderer.on(SPEECH_EVENT_CHANNEL, forwardValidatedEvent);
       return () => ipcRenderer.removeListener(SPEECH_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+  },
+  voice: {
+    /**
+     * Subscribes the Pill to recording commands from the main process (the hotkey
+     * drives start/stop/cancel). Only the Pill renderer subscribes - it owns the mic
+     * (and audio output). Each command is validated before the renderer acts on it.
+     * Returns an unsubscribe function.
+     */
+    onRecordCommand(listener: (command: VoiceRecordCommand) => void): () => void {
+      const forwardValidatedCommand = (_event: IpcRendererEvent, rawCommand: unknown): void => {
+        const parsedCommand = VoiceRecordCommandSchema.safeParse(rawCommand);
+        if (parsedCommand.success) {
+          listener(parsedCommand.data);
+        } else {
+          console.error("[lune] dropping malformed voice record command:", parsedCommand.error.message);
+        }
+      };
+      ipcRenderer.on(VOICE_RECORD_COMMAND_CHANNEL, forwardValidatedCommand);
+      return () => ipcRenderer.removeListener(VOICE_RECORD_COMMAND_CHANNEL, forwardValidatedCommand);
+    },
+    /**
+     * Sends one recording event (live level, finished clip, or error) to the main
+     * process, validated against the shared codec on the way out so no untyped shape
+     * crosses the boundary.
+     */
+    sendRecordEvent(event: VoiceRecordEvent): void {
+      ipcRenderer.send(VOICE_RECORD_EVENT_CHANNEL, VoiceRecordEventSchema.parse(event));
+    },
+    /**
+     * Subscribes to the voice-loop activity state (idle/listening/thinking) the main
+     * process pushes so the Pill's indicator reflects the loop live. Returns an
+     * unsubscribe function. (Speaking is driven separately by Kokoro playback.)
+     */
+    onPillActivity(listener: (activity: VoicePillActivity) => void): () => void {
+      const forwardValidatedActivity = (_event: IpcRendererEvent, rawActivity: unknown): void => {
+        const parsedActivity = VoicePillActivitySchema.safeParse(rawActivity);
+        if (parsedActivity.success) {
+          listener(parsedActivity.data);
+        } else {
+          console.error("[lune] dropping malformed pill activity:", parsedActivity.error.message);
+        }
+      };
+      ipcRenderer.on(VOICE_PILL_ACTIVITY_CHANNEL, forwardValidatedActivity);
+      return () => ipcRenderer.removeListener(VOICE_PILL_ACTIVITY_CHANNEL, forwardValidatedActivity);
+    },
+    /** Reads the current mic-permission state without prompting (for live polling). */
+    async getMicPermissionStatus(): Promise<MicPermissionStateValue> {
+      return MicPermissionStateSchema.parse(await ipcRenderer.invoke(MIC_PERMISSION_STATUS_CHANNEL));
+    },
+    /** Requests mic access, popping the OS prompt on the first attempt; resolves to the state. */
+    async requestMicPermission(): Promise<MicPermissionStateValue> {
+      return MicPermissionStateSchema.parse(await ipcRenderer.invoke(MIC_PERMISSION_REQUEST_CHANNEL));
     },
   },
   pill: {

@@ -21,7 +21,8 @@
       "electron",
       "esbuild",
       "@tailwindcss/oxide",
-      "onnxruntime-node"
+      "onnxruntime-node",
+      "uiohook-napi"
     ]
   }
 }

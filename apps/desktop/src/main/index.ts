@@ -18,6 +18,7 @@ import {
   ChatTurnRequestSchema,
   ConversationStreamEventSchema,
   LUNE_IPC_VERSION,
+  type ChatInputMethod,
   type ConversationStreamEvent,
 } from "@lune/shared";
 import { APP_QUIT_CHANNEL } from "../ipc/pillControl";
@@ -31,7 +32,7 @@ import {
   ResumedConversationSchema,
 } from "../ipc/conversations";
 import { ConversationHistoryStore } from "./conversationHistoryStore";
-import { toggleChatPanelWindow } from "./chatPanelWindow";
+import { getChatPanelWebContents, toggleChatPanelWindow } from "./chatPanelWindow";
 import { toggleSettingsWindow } from "./settingsWindow";
 import {
   SETTINGS_GET_CHANNEL,
@@ -77,6 +78,27 @@ import {
 import { createDesktopSpeech, runSpeechDevTrigger } from "./speech/speechService";
 import { createSpeechTurnPlayer, type SpeechTurnPlayer } from "./speech/speechTurnPlayer";
 import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ipc/speechPlayback";
+import {
+  VOICE_PILL_ACTIVITY_CHANNEL,
+  VOICE_RECORD_COMMAND_CHANNEL,
+  VOICE_RECORD_EVENT_CHANNEL,
+  VoicePillActivitySchema,
+  VoiceRecordCommandSchema,
+  VoiceRecordEventSchema,
+  type VoiceRecordCommand,
+} from "../ipc/voiceInput";
+import {
+  MIC_PERMISSION_REQUEST_CHANNEL,
+  MIC_PERMISSION_STATUS_CHANNEL,
+  MicPermissionStateSchema,
+} from "../ipc/micPermission";
+import {
+  deriveMicPermissionState,
+  type MicrophoneAccessStatus,
+} from "./permissions/micPermissionState";
+import { PushToTalkMonitor } from "./voice/pushToTalkMonitor";
+import { createUiohookKeyEventSource } from "./voice/globalKeyEventSource";
+import { VoiceLoopController } from "./voice/voiceLoopController";
 
 // The Electron main process is the only place the in-process Core is imported; it
 // bridges the Core's plain typed functions/streams to the renderer over typed IPC
@@ -250,6 +272,49 @@ let speechCapability: SpeechCapability | null = null;
 // creates the Pill.
 let pillWindow: BrowserWindow | null = null;
 
+// The push-to-talk voice loop (ticket 11): the orchestrator that turns the global
+// hotkey into hold-to-talk + Barge-in. Assigned once the app is ready (it needs the
+// Pill, Overlay, and Transcription). Held at module scope so the chat-start handler can
+// register a typed turn with it for Barge-in, and teardown can stop the OS hook.
+let voiceController: VoiceLoopController | null = null;
+
+// The Overlay display currently showing the listening waveform, resolved at the cursor
+// when a recording starts so the live level and the end signal reach the same window.
+let listeningDisplayId: number | undefined;
+
+/** This app's macOS microphone access, as the OS reports it (always granted off macOS). */
+function getMicrophoneAccessStatus(): MicrophoneAccessStatus {
+  if (process.platform !== "darwin") {
+    return "granted";
+  }
+  return systemPreferences.getMediaAccessStatus("microphone") as MicrophoneAccessStatus;
+}
+
+/** Sends one recording command to the Pill renderer (which owns the mic), validated on the way out. */
+function sendRecordCommand(command: VoiceRecordCommand): void {
+  if (pillWindow === null || pillWindow.isDestroyed()) {
+    return;
+  }
+  pillWindow.webContents.send(VOICE_RECORD_COMMAND_CHANNEL, VoiceRecordCommandSchema.parse(command));
+}
+
+/** Sets the Pill's voice-loop activity indicator (idle/listening/thinking). */
+function setPillActivity(state: "idle" | "listening" | "thinking"): void {
+  if (pillWindow === null || pillWindow.isDestroyed()) {
+    return;
+  }
+  pillWindow.webContents.send(VOICE_PILL_ACTIVITY_CHANNEL, VoicePillActivitySchema.parse({ state }));
+}
+
+/** The window a voice turn streams its conversation events to: the Chat Panel if open, else the Pill. */
+function voiceTurnWebContents(): WebContents | null {
+  const panel = getChatPanelWebContents();
+  if (panel !== null) {
+    return panel;
+  }
+  return pillWindow !== null && !pillWindow.isDestroyed() ? pillWindow.webContents : null;
+}
+
 /**
  * Sends one Kokoro speech-playback event to the Pill renderer (which owns audio
  * output), validating it against the shared codec on the way out so no untyped shape
@@ -307,10 +372,187 @@ function describeChatError(error: unknown): string {
   return rawMessage.length > 0 ? rawMessage : "Chat request failed for an unknown reason";
 }
 
-// Drive one conversation turn: validate the request, capture screen context, advance
-// the Core conversation, and stream its events to the renderer tagged with the turn
-// id. A thrown Core error (not ready, Vendor rejection) becomes a terminal `error`
-// event so the renderer never hangs waiting for a completion that will not come.
+/** Whether a thrown error is the Barge-in abort (a cancelled turn), not a real failure. */
+function isAbortError(error: unknown, signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+}
+
+/** One conversation turn to run: how it arrived, where its events stream, and its abort signal. */
+interface RunConversationTurnOptions {
+  turnId: string;
+  prompt: string;
+  inputMethod: ChatInputMethod;
+  includeScreen: boolean;
+  /** Where the streamed conversation events go (the Chat Panel, or the Pill for voice). */
+  webContents: WebContents;
+  /** Aborts this turn mid-stream on Barge-in; the turn then leaves no trace and stays silent. */
+  signal?: AbortSignal;
+}
+
+// Drive one conversation turn (text or voice): capture screen context, advance the Core
+// conversation, stream its events to the renderer, and drive the Overlay + Kokoro speech.
+// Shared by the typed Chat Panel path and the push-to-talk voice loop so both render and
+// speak identically. A thrown Core error becomes a terminal `error` event so the renderer
+// never hangs; a Barge-in abort ends the turn quietly (no error, nothing committed).
+// Returns whether the turn engaged speech, so the caller knows who returns the Pill to idle.
+async function runConversationTurn(options: RunConversationTurnOptions): Promise<{ spoke: boolean }> {
+  const { turnId, prompt, inputMethod, includeScreen, webContents, signal } = options;
+
+  sendConversationEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
+
+  // Hide any lingering Overlay before capturing so it can never photograph its own
+  // cursor/bubble into this turn's screen context.
+  overlayManager?.hideAll();
+
+  // Overlay driving state for this turn (ticket 07): the answer bubble + cursor run on
+  // the display holding the user's cursor (screen 1, the model's primary focus). We
+  // stream the answer with its trailing Point Tag stripped, then point once the tag is
+  // complete. `sentCleanLength` tracks how much clean text the Overlay already has.
+  let overlayActive = false;
+  let accumulatedAnswer = "";
+  let sentCleanLength = 0;
+  let cursorDisplayId: number | undefined;
+  // Kokoro speech for this turn (ticket 09): created only when Speech is ready, so a
+  // not-ready Kokoro answers in text without speaking (and without hanging).
+  let speechTurn: SpeechTurnPlayer | null = null;
+  // Whether this turn actually engaged speech AND produced speakable text - only then
+  // does Kokoro playback own the return to idle. Set at completion so an empty or
+  // tag-only answer (nothing to speak) reports `spoke: false` and the caller idles the Pill.
+  let speechEngaged = false;
+  let spoke = false;
+
+  // The streaming-text toggle (ticket 13): read once at the turn's start so a change
+  // takes effect on the next turn. When off, the Overlay cursor still flies and points,
+  // but the answer text is not streamed into its response bubble (voice-only preference).
+  const showStreamingText = settingsStore.getStreamingText();
+
+  try {
+    // Capture the screen(s) first (when opted in and permitted) so the answer is
+    // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
+    const { screens, geometry } = await captureScreensForTurn(includeScreen);
+
+    cursorDisplayId =
+      geometry.find((display) => display.screenNumber === 1)?.displayId ??
+      overlayManager?.displayIdAt(screen.getCursorScreenPoint());
+
+    for await (const coreEvent of conversationManager.submitUserTurn({
+      text: prompt,
+      inputMethod,
+      screenshots: screens,
+      signal,
+    })) {
+      switch (coreEvent.type) {
+        case "user-message":
+          sendConversationEvent(webContents, {
+            type: "user-message",
+            turnId,
+            messageId: coreEvent.message.id,
+            text: coreEvent.message.text,
+            inputMethod: coreEvent.message.inputMethod,
+          });
+          break;
+        case "assistant-started":
+          sendConversationEvent(webContents, {
+            type: "assistant-started",
+            turnId,
+            messageId: coreEvent.messageId,
+          });
+          // Fade the Overlay in for this interaction on the cursor's display.
+          if (overlayManager && cursorDisplayId !== undefined) {
+            overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
+            overlayActive = true;
+          }
+          // Begin sentence-streamed speech only when Kokoro is provisioned; otherwise
+          // the turn answers in text without speaking (never a hang).
+          if (speechCapability?.isReady()) {
+            speechTurn = createSpeechTurnPlayer({
+              speech: speechCapability,
+              turnId,
+              sendEvent: sendSpeechEvent,
+              encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+            });
+            speechEngaged = true;
+          }
+          break;
+        case "assistant-delta":
+          sendConversationEvent(webContents, {
+            type: "assistant-delta",
+            turnId,
+            messageId: coreEvent.messageId,
+            text: coreEvent.text,
+          });
+          accumulatedAnswer += coreEvent.text;
+          // Sentence-stream the growing answer to Kokoro: each completed sentence is
+          // synthesized and played while the next is still arriving (first audio fast).
+          speechTurn?.pushAnswerText(accumulatedAnswer);
+          // Stream the answer into the Overlay bubble, but only the clean human text, and
+          // only when the streaming-text toggle is on.
+          if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
+            const { displayText } = parseAnswerPointTag(accumulatedAnswer);
+            if (displayText.length > sentCleanLength) {
+              overlayManager.sendToDisplay(cursorDisplayId, {
+                type: "answer-delta",
+                text: displayText.slice(sentCleanLength),
+              });
+              sentCleanLength = displayText.length;
+            }
+          }
+          break;
+        case "assistant-completed": {
+          sendConversationEvent(webContents, {
+            type: "assistant-completed",
+            turnId,
+            messageId: coreEvent.messageId,
+          });
+          {
+            const { directive, displayText } = parseAnswerPointTag(accumulatedAnswer);
+            if (overlayManager && cursorDisplayId !== undefined) {
+              // The full answer has streamed, so its trailing Point Tag (if any) is now
+              // complete. The planner turns the parsed directive + capture geometry into
+              // the exact messages to send (fly to the target on the correct monitor,
+              // then close out), keeping the multi-monitor sequencing in one tested place.
+              for (const message of planCompletionMessages(directive, geometry, cursorDisplayId)) {
+                overlayManager.sendToDisplay(message.displayId, message.event);
+              }
+            }
+            // The turn "spoke" only if speech was engaged AND there was speakable text;
+            // an empty or tag-only answer plays no audio, so the caller must idle the Pill.
+            spoke = speechEngaged && displayText.trim().length > 0;
+          }
+          // Flush the final (unterminated) sentence and let speech drain.
+          await speechTurn?.finish(accumulatedAnswer);
+          break;
+        }
+      }
+    }
+
+    // The turn committed in the Core, so persist the active conversation's text-only
+    // history (ticket 12) and tell the panel its recent-list may have changed. A failed
+    // or aborted turn throws above and never reaches here, matching the Core's rollback.
+    conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
+    notifyConversationsChanged(webContents);
+  } catch (error) {
+    // End any Overlay interaction this turn opened so the cursor fades out rather than
+    // hanging, and silence any speech, whether the turn failed or was interrupted.
+    if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
+      overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
+    }
+    if (speechTurn !== null) {
+      sendSpeechEvent({ type: "stop" });
+    }
+    // A Barge-in abort is a deliberate cancellation, not a failure: end quietly so the
+    // panel does not show an error banner for a turn the user chose to interrupt.
+    if (!isAbortError(error, signal)) {
+      sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
+    }
+  }
+
+  return { spoke };
+}
+
+// The typed Chat Panel turn (ticket 06): validate the request and run it, streaming its
+// events back to the panel. It gets an abort handle registered with the voice loop, so
+// pressing the push-to-talk hotkey during its playback is Barge-in (ticket 11).
 ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
   const parsedRequest = ChatTurnRequestSchema.safeParse(rawChatTurnRequest);
   if (!parsedRequest.success) {
@@ -322,153 +564,10 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
   const { turnId, prompt, inputMethod, includeScreen } = parsedRequest.data;
   const webContents = event.sender;
 
-  void (async () => {
-    sendConversationEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
-
-    // Hide any lingering Overlay before capturing so it can never photograph its own
-    // cursor/bubble into this turn's screen context.
-    overlayManager?.hideAll();
-
-    // Overlay driving state for this turn (ticket 07): the answer bubble + cursor run on
-    // the display holding the user's cursor (screen 1, the model's primary focus). We
-    // stream the answer with its trailing Point Tag stripped, then point once the tag is
-    // complete. `sentCleanLength` tracks how much clean text the Overlay already has.
-    let overlayActive = false;
-    let accumulatedAnswer = "";
-    let sentCleanLength = 0;
-    // The Overlay display for this turn - hoisted so the catch below can end the
-    // interaction it may have started. Resolved once the screens are captured.
-    let cursorDisplayId: number | undefined;
-    // Kokoro speech for this turn (ticket 09): created only when Speech is ready, so a
-    // not-ready Kokoro answers in text without speaking (and without hanging). It
-    // sentence-streams the answer to the Pill's audio output as the reply arrives.
-    let speechTurn: SpeechTurnPlayer | null = null;
-
-    // The streaming-text toggle (ticket 13): read once at the turn's start so a change
-    // takes effect on the next turn. When off, the Overlay cursor still flies and points,
-    // but the answer text is not streamed into its response bubble (voice-only preference).
-    const showStreamingText = settingsStore.getStreamingText();
-
-    try {
-      // Capture the screen(s) first (when opted in and permitted) so the answer is
-      // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
-      const { screens, geometry } = await captureScreensForTurn(includeScreen);
-
-      // Where the Overlay bubble/cursor lives: the cursor's display (screen 1 in the
-      // capture geometry), falling back to whatever display the cursor is on now for a
-      // text-only turn that captured nothing.
-      cursorDisplayId =
-        geometry.find((display) => display.screenNumber === 1)?.displayId ??
-        overlayManager?.displayIdAt(screen.getCursorScreenPoint());
-
-      for await (const coreEvent of conversationManager.submitUserTurn({
-        text: prompt,
-        inputMethod,
-        screenshots: screens,
-      })) {
-        switch (coreEvent.type) {
-          case "user-message":
-            sendConversationEvent(webContents, {
-              type: "user-message",
-              turnId,
-              messageId: coreEvent.message.id,
-              text: coreEvent.message.text,
-              inputMethod: coreEvent.message.inputMethod,
-            });
-            break;
-          case "assistant-started":
-            sendConversationEvent(webContents, {
-              type: "assistant-started",
-              turnId,
-              messageId: coreEvent.messageId,
-            });
-            // Fade the Overlay in for this interaction on the cursor's display.
-            if (overlayManager && cursorDisplayId !== undefined) {
-              overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
-              overlayActive = true;
-            }
-            // Begin sentence-streamed speech only when Kokoro is provisioned; otherwise
-            // the turn answers in text without speaking (never a hang).
-            if (speechCapability?.isReady()) {
-              speechTurn = createSpeechTurnPlayer({
-                speech: speechCapability,
-                turnId,
-                sendEvent: sendSpeechEvent,
-                encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
-              });
-            }
-            break;
-          case "assistant-delta":
-            sendConversationEvent(webContents, {
-              type: "assistant-delta",
-              turnId,
-              messageId: coreEvent.messageId,
-              text: coreEvent.text,
-            });
-            accumulatedAnswer += coreEvent.text;
-            // Sentence-stream the growing answer to Kokoro: each completed sentence is
-            // synthesized and played while the next is still arriving (first audio fast).
-            speechTurn?.pushAnswerText(accumulatedAnswer);
-            // Stream the answer into the Overlay bubble, but only the clean human text:
-            // parse the accumulated answer and emit just the newly-revealed display
-            // characters, so the trailing `[POINT:...]` tag never appears in the bubble.
-            // Gated on the streaming-text toggle: when off, no bubble text is sent.
-            if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
-              const { displayText } = parseAnswerPointTag(accumulatedAnswer);
-              if (displayText.length > sentCleanLength) {
-                overlayManager.sendToDisplay(cursorDisplayId, {
-                  type: "answer-delta",
-                  text: displayText.slice(sentCleanLength),
-                });
-                sentCleanLength = displayText.length;
-              }
-            }
-            break;
-          case "assistant-completed": {
-            sendConversationEvent(webContents, {
-              type: "assistant-completed",
-              turnId,
-              messageId: coreEvent.messageId,
-            });
-            if (overlayManager && cursorDisplayId !== undefined) {
-              // The full answer has streamed, so its trailing Point Tag (if any) is now
-              // complete. The planner turns the parsed directive + capture geometry into
-              // the exact messages to send (fly to the target on the correct monitor,
-              // then close out), keeping the multi-monitor sequencing in one tested place.
-              const { directive } = parseAnswerPointTag(accumulatedAnswer);
-              for (const message of planCompletionMessages(directive, geometry, cursorDisplayId)) {
-                overlayManager.sendToDisplay(message.displayId, message.event);
-              }
-            }
-            // Flush the final (unterminated) sentence and let speech drain. The first
-            // audio already started mid-stream; a not-ready turn has no speechTurn and
-            // simply stayed silent.
-            await speechTurn?.finish(accumulatedAnswer);
-            break;
-          }
-        }
-      }
-
-      // The turn committed in the Core, so persist the active conversation's text-only
-      // history (ticket 12) - creating it on the first turn, updating it after, pruning
-      // the oldest beyond 10 - and tell the panel its recent-list may have changed. A
-      // failed turn throws above and never reaches here, matching the Core's rollback.
-      conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
-      notifyConversationsChanged(webContents);
-    } catch (error) {
-      sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
-      // End any Overlay interaction this turn opened so the cursor fades out rather
-      // than hanging on screen after a failed answer.
-      if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
-        overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
-      }
-      // Stop any speech this turn had queued or was playing so a failed answer doesn't
-      // keep talking (and the Pill returns to idle).
-      if (speechTurn !== null) {
-        sendSpeechEvent({ type: "stop" });
-      }
-    }
-  })();
+  const abortController = new AbortController();
+  voiceController?.noteExternalTurnStarted(abortController);
+  void runConversationTurn({ turnId, prompt, inputMethod, includeScreen, webContents, signal: abortController.signal })
+    .finally(() => voiceController?.noteTurnEnded(abortController));
 });
 
 // Open/close the Chat Panel from the Pill menu (or its own close button). One toggle
@@ -552,6 +651,8 @@ ipcMain.on(APP_QUIT_CHANNEL, () => app.quit());
 // intercepted by anyone, but there is no owning watchdog process to route around it.)
 app.on("before-quit", () => {
   void transcription?.shutdown();
+  // Release the global keyboard hook so the native uiohook thread stops cleanly (ticket 11).
+  voiceController?.stop();
 });
 process.on("exit", () => {
   transcription?.killSync();
@@ -583,6 +684,33 @@ ipcMain.handle(SCREEN_PERMISSION_REQUEST_CHANNEL, async () => {
 ipcMain.on(SCREEN_RELAUNCH_CHANNEL, () => {
   app.relaunch();
   app.quit();
+});
+
+// Microphone permission (ticket 11, contract shared with ticket 14 onboarding). The
+// status channel reads the OS state without prompting so the UI can poll it live; the
+// request channel calls `askForMediaAccess`, which pops the macOS prompt on the first
+// attempt and resolves once the user answers - so the flow live-detects the grant.
+ipcMain.handle(MIC_PERMISSION_STATUS_CHANNEL, () =>
+  MicPermissionStateSchema.parse(deriveMicPermissionState(getMicrophoneAccessStatus())),
+);
+ipcMain.handle(MIC_PERMISSION_REQUEST_CHANNEL, async () => {
+  if (process.platform === "darwin" && getMicrophoneAccessStatus() === "not-determined") {
+    // Prompts once and resolves when the user answers; a no-op if already decided.
+    await systemPreferences.askForMediaAccess("microphone").catch(() => false);
+  }
+  return MicPermissionStateSchema.parse(deriveMicPermissionState(getMicrophoneAccessStatus()));
+});
+
+// The Pill's recording events (live level, finished clip, capture error) drive the voice
+// loop. Validated on the way in, then handed to the controller (which ignores events
+// from a superseded recording). Before the controller is ready, there are no recordings.
+ipcMain.on(VOICE_RECORD_EVENT_CHANNEL, (_event, rawRecordEvent: unknown) => {
+  const parsedEvent = VoiceRecordEventSchema.safeParse(rawRecordEvent);
+  if (!parsedEvent.success) {
+    console.error("[lune] dropping malformed voice record event:", parsedEvent.error.message);
+    return;
+  }
+  voiceController?.handleRecordEvent(parsedEvent.data);
 });
 
 void app.whenReady().then(() => {
@@ -634,6 +762,59 @@ void app.whenReady().then(() => {
     getRoutingConfig: () => routingConfigStore.getConfig(),
     isKokoroReady: () => provisioning.capability.isRuntimeReady("kokoro"),
   });
+
+  // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the
+  // hotkey live from the routing config (editable in Settings, ticket 13), records
+  // through the Pill, transcribes on release via whisper, and answers the transcript as
+  // a screen-aware voice turn - reusing the same turn runner as the Chat Panel so voice
+  // and text share one history. Barge-in (a hotkey press mid-answer) aborts the in-flight
+  // turn's Reasoning stream and speech, then starts a fresh recording.
+  voiceController = new VoiceLoopController({
+    monitor: new PushToTalkMonitor({
+      keySource: createUiohookKeyEventSource(),
+      getHotkeyToken: () => routingConfigStore.getConfig().hotkey.pushToTalk,
+    }),
+    isTranscriptionReady: () => transcription?.capability.isReady() ?? false,
+    transcribe: async (audioWav) => (await transcription!.capability.transcribe(audioWav)).text,
+    sendRecordCommand,
+    setPillActivity,
+    stopSpeech: () => sendSpeechEvent({ type: "stop" }),
+    overlayListenStart: () => {
+      // Resolve the cursor's display once, so the level and end signal reach the same one.
+      listeningDisplayId = overlayManager?.displayIdAt(screen.getCursorScreenPoint());
+      if (overlayManager && listeningDisplayId !== undefined) {
+        overlayManager.sendToDisplay(listeningDisplayId, { type: "listen-start" });
+      }
+    },
+    overlayListenLevel: (level) => {
+      if (overlayManager && listeningDisplayId !== undefined) {
+        overlayManager.sendToDisplay(listeningDisplayId, { type: "listen-level", level });
+      }
+    },
+    overlayListenEnd: () => {
+      if (overlayManager && listeningDisplayId !== undefined) {
+        overlayManager.sendToDisplay(listeningDisplayId, { type: "listen-end" });
+      }
+    },
+    runVoiceTurn: async ({ turnId, prompt, signal }) => {
+      const webContents = voiceTurnWebContents();
+      if (webContents === null) {
+        // No window to stream to (the Pill is gone): nothing to answer into.
+        return { spoke: false };
+      }
+      return runConversationTurn({
+        turnId,
+        prompt,
+        inputMethod: "voice",
+        includeScreen: true,
+        webContents,
+        signal,
+      });
+    },
+    generateId: () => randomUUID(),
+    decodeBase64: (base64) => new Uint8Array(Buffer.from(base64, "base64")),
+  });
+  voiceController.start();
 
   // Settings (ticket 13): now that Provisioning exists, wire the service the Settings
   // IPC handlers call. Readiness reads the Provisioning run's live status + per-Runtime

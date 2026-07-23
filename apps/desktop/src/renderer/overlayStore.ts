@@ -29,6 +29,14 @@ interface OverlayState {
    * points, but the streamed answer text is not displayed (voice-only preference).
    */
   showStreamingText: boolean;
+  /**
+   * Whether the user is holding push-to-talk (ticket 11): while true the Overlay shows
+   * a live waveform near the cursor instead of the answer cursor, so the user can see
+   * Lune is hearing them (user story 18).
+   */
+  listening: boolean;
+  /** The latest mic input level (0..1) while listening, driving the waveform's height. */
+  listeningLevel: number;
 
   /** Begins an interaction: clears the previous answer/target and shows the cursor. */
   beginInteraction: () => void;
@@ -42,6 +50,12 @@ interface OverlayState {
   reset: () => void;
   /** Sets the streaming-text visibility (ticket 13's Settings toggle). */
   setShowStreamingText: (showStreamingText: boolean) => void;
+  /** Begins the listening waveform (push-to-talk held), resetting the level to zero. */
+  beginListening: () => void;
+  /** Updates the live waveform level (0..1) as the mic amplitude arrives. */
+  setListeningLevel: (level: number) => void;
+  /** Ends listening (the hotkey was released); the waveform gives way to the answer. */
+  endListening: () => void;
 }
 
 export const useOverlayStore = create<OverlayState>((set) => ({
@@ -49,11 +63,18 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   answerText: "",
   pointTarget: null,
   showStreamingText: true,
+  listening: false,
+  listeningLevel: 0,
 
-  beginInteraction: () => set({ phase: "active", answerText: "", pointTarget: null }),
+  // Starting an answer also clears any lingering listening waveform, so the surface
+  // switches cleanly from "hearing you" to "answering".
+  beginInteraction: () => set({ phase: "active", answerText: "", pointTarget: null, listening: false }),
   appendAnswer: (text) => set((state) => ({ answerText: state.answerText + text })),
   setPointTarget: (target) => set({ pointTarget: target }),
   endInteraction: () => set({ phase: "ending" }),
-  reset: () => set({ phase: "idle", answerText: "", pointTarget: null }),
+  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0 }),
   setShowStreamingText: (showStreamingText) => set({ showStreamingText }),
+  beginListening: () => set({ listening: true, listeningLevel: 0 }),
+  setListeningLevel: (listeningLevel) => set({ listeningLevel }),
+  endListening: () => set({ listening: false, listeningLevel: 0 }),
 }));

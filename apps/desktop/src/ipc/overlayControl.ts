@@ -48,14 +48,23 @@ export const OverlayPointSchema = z.object({
 export type OverlayPoint = z.infer<typeof OverlayPointSchema>;
 
 /**
- * One Overlay event, main -> a single window. An interaction opens with
- * `activity-start` (fade the cursor in, clear any previous answer/target), then zero
- * or more `answer-delta`s stream the clean answer text into the bubble, an optional
- * `point` flies the cursor to a target, and `activity-end` closes it (after which the
- * window fades out on its inactivity timer). The answer text is already stripped of
- * the Point Tag by the main process, so the bubble only ever shows human-readable text.
+ * One Overlay event, main -> a single window. Two interactions share the surface:
+ *
+ * Listening (push-to-talk, ticket 11): `listen-start` fades in a live waveform near the
+ * cursor while the user holds the hotkey, `listen-level` streams the mic amplitude
+ * (0..1) into it, and `listen-end` closes it when the key is released.
+ *
+ * Answering (ticket 07): `activity-start` fades the cursor in (clearing any previous
+ * answer/target), zero or more `answer-delta`s stream the clean answer text into the
+ * bubble, an optional `point` flies the cursor to a target, and `activity-end` closes
+ * it (after which the window fades out on its inactivity timer). The answer text is
+ * already stripped of the Point Tag by the main process, so the bubble only ever shows
+ * human-readable text.
  */
 export const OverlayEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("listen-start") }),
+  z.object({ type: z.literal("listen-level"), level: z.number().min(0).max(1) }),
+  z.object({ type: z.literal("listen-end") }),
   z.object({ type: z.literal("activity-start") }),
   z.object({ type: z.literal("answer-delta"), text: z.string() }),
   z.object({ type: z.literal("point"), point: OverlayPointSchema }),
