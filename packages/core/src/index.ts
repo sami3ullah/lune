@@ -39,6 +39,15 @@ export {
   type ReasoningVendorId,
 } from "./reasoning/cloudReasoningVendors.js";
 
+// The cheap key-validation call the onboarding key step uses to live-validate a Vendor
+// key before it is stored (ticket 14): one one-token request through the Vendor adapter,
+// verdict as a plain reason.
+export {
+  validateReasoningKey,
+  type KeyValidationResult,
+  type ValidateReasoningKeyInput,
+} from "./reasoning/validateReasoningKey.js";
+
 // The routing config: which Vendor + Model Slot answers, Gemini by default.
 export {
   DEFAULT_ROUTING_CONFIG,

@@ -46,6 +46,19 @@ export const SettingsVendorIdSchema = z.enum(SETTINGS_VENDOR_IDS);
 export type SettingsVendorId = z.infer<typeof SettingsVendorIdSchema>;
 
 /**
+ * Where a user gets an API key for each Vendor (the onboarding key step's "get a key"
+ * links, ticket 14). This is Shell/UI data, not Core intelligence, so it lives here in
+ * the settings contract - dependency-free. The main process's open-external handler is
+ * the sole reader: the renderer sends only a Vendor id and the handler resolves the URL
+ * from this fixed map, so no arbitrary renderer-supplied string is ever opened.
+ */
+export const VENDOR_GET_KEY_URLS: Record<SettingsVendorId, string> = {
+  anthropic: "https://console.anthropic.com/settings/keys",
+  openai: "https://platform.openai.com/api-keys",
+  google: "https://aistudio.google.com/app/apikey",
+};
+
+/**
  * The editable Settings values the user changes and the Shell persists to the config
  * file (Vendor + Model Slot + Voice + push-to-talk hotkey, which the Core reads, plus
  * the Shell-only streaming-text toggle). Holds no secrets - API keys go through the

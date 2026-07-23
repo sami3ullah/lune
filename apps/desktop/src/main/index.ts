@@ -1,14 +1,16 @@
 import { readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { app, BrowserWindow, ipcMain, safeStorage, screen, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
   createConversationManager,
   createReasoningCapability,
   describeCore,
+  findReasoningVendor,
   parseAnswerPointTag,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
+  validateReasoningKey,
   type ReasoningVendorId,
   type SpeechCapability,
 } from "@lune/core";
@@ -47,9 +49,23 @@ import {
   SettingsStateSchema,
   SettingsValuesSchema,
 } from "../ipc/settings";
+import { VENDOR_GET_KEY_URLS, SettingsVendorIdSchema } from "../ipc/settings";
 import { SettingsStore } from "./settings/settingsStore";
 import { CredentialStore } from "./settings/credentialStore";
 import { createSettingsService, type SettingsService } from "./settings/settingsService";
+import {
+  ONBOARDING_COMPLETE_CHANNEL,
+  ONBOARDING_DOWNLOAD_STATUS_CHANNEL,
+  ONBOARDING_OPEN_GET_KEY_CHANNEL,
+  ONBOARDING_START_DOWNLOAD_CHANNEL,
+  ONBOARDING_VALIDATE_KEY_CHANNEL,
+  OnboardingDownloadStatusSchema,
+  ValidateKeyRequestSchema,
+  ValidateKeyResponseSchema,
+} from "../ipc/onboarding";
+import { OnboardingStore } from "./onboarding/onboardingStore";
+import { createOnboardingService, type OnboardingService } from "./onboarding/onboardingService";
+import { closeOnboardingWindow, openOnboardingWindow } from "./onboardingWindow";
 import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
@@ -187,6 +203,27 @@ function requireSettingsService(): SettingsService {
     throw new Error("Settings service is not ready yet");
   }
   return settingsService;
+}
+
+// Onboarding (ticket 14): the jargon-free first run. The completion flag is a Shell
+// concern (a tiny userData file), so it lives here behind an injected fs seam; a fresh
+// profile with no file reads as not-complete and gets onboarding, a returning user never
+// sees it again. The service (composing key validation, the download, and completion) is
+// assigned once the app is ready - it needs the Provisioning Capability - and the
+// onboarding window opens only after the UI is up, so it is set before any onboarding IPC.
+const onboardingStore = new OnboardingStore(
+  join(app.getPath("userData"), "onboarding.json"),
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+);
+let onboardingService: OnboardingService | null = null;
+
+/** The onboarding service once ready; an onboarding IPC before then is a programmer error. */
+function requireOnboardingService(): OnboardingService {
+  if (onboardingService === null) {
+    throw new Error("Onboarding service is not ready yet");
+  }
+  return onboardingService;
 }
 
 // Conversation state lives in the Core (ticket 06): the Chat Panel renders the history
@@ -596,6 +633,36 @@ ipcMain.handle(SETTINGS_READINESS_CHANNEL, () =>
   ReadinessRowSchema.array().parse(requireSettingsService().readiness()),
 );
 
+// The onboarding surface's IPC (ticket 14): live-validate + store a Vendor key, start
+// (or resume) the background download, poll its progress, open a "get a key" page, and
+// mark completion. The catalog/keyed-Vendors/readiness the flow also needs are read over
+// the Settings channels above (not duplicated here). Every payload is validated on the
+// way in and every reply parsed on the way out (developer story 46).
+ipcMain.handle(ONBOARDING_VALIDATE_KEY_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = ValidateKeyRequestSchema.parse(rawRequest);
+  return ValidateKeyResponseSchema.parse(await requireOnboardingService().validateAndSaveKey(request));
+});
+ipcMain.handle(ONBOARDING_DOWNLOAD_STATUS_CHANNEL, () =>
+  OnboardingDownloadStatusSchema.parse(requireOnboardingService().downloadStatus()),
+);
+ipcMain.on(ONBOARDING_START_DOWNLOAD_CHANNEL, () => requireOnboardingService().startDownload());
+
+// Completion persists the flag and closes the window; the Pill is the app's home from
+// here on, and onboarding is never opened again (developer story: returning users skip it).
+ipcMain.on(ONBOARDING_COMPLETE_CHANNEL, () => {
+  requireOnboardingService().markComplete();
+  closeOnboardingWindow();
+});
+
+// Open a Vendor's "get a key" page. The renderer sends only a Vendor id; the URL is
+// looked up from the fixed catalog map, so no arbitrary renderer string is ever opened.
+ipcMain.on(ONBOARDING_OPEN_GET_KEY_CHANNEL, (_event, rawVendor: unknown) => {
+  const parsed = SettingsVendorIdSchema.safeParse(rawVendor);
+  if (parsed.success) {
+    void shell.openExternal(VENDOR_GET_KEY_URLS[parsed.data]);
+  }
+});
+
 // The recent-conversations dropdown (ticket 12). These drive the Shell's durable store
 // and the Core's active conversation; the answer stream still flows over the shared
 // chat contract. Each result is parsed on the way out so no untyped shape crosses the
@@ -833,6 +900,35 @@ void app.whenReady().then(() => {
       routingConfigStore.reload();
     },
   });
+
+  // Onboarding (ticket 14): now that the Settings service + Provisioning exist, wire the
+  // service the onboarding IPC calls. Key validation is the cheap Core test call with the
+  // platform `fetch` injected; the download is the one shared Provisioning run (started
+  // silently at the welcome screen, resumed on a re-launched onboarding).
+  onboardingService = createOnboardingService({
+    settingsService,
+    validateKey: (vendorId, key) =>
+      validateReasoningKey({
+        vendor: findReasoningVendor(vendorId),
+        apiKey: key,
+        upstreamFetch: (url, requestInit) => fetch(url, requestInit),
+      }),
+    provisioningStatus: () => provisioning.capability.status(),
+    isAllProvisioned: () => REPAIR_RUNTIME_IDS.every((runtimeId) => provisioning.capability.isRuntimeReady(runtimeId)),
+    startProvisioning: () => {
+      provisioning.capability.start(REPAIR_RUNTIME_IDS);
+      void provisioning.capability.awaitCurrentRun().then(() => transcription?.reconcile());
+    },
+    onboardingStore,
+  });
+
+  // First run: a fresh profile that has never finished onboarding sees it now. It opens
+  // after Provisioning readiness is wired (so the welcome screen's silent download can
+  // start), but before the async dev triggers below - which are no-ops on a normal launch.
+  // A returning user (flag set) goes straight to the Pill.
+  if (!onboardingStore.isComplete()) {
+    openOnboardingWindow();
+  }
 
   // Refresh Provisioning readiness (and optionally run the ~2 GB dev download), then
   // start the whisper child if it can run, and finally exercise the Core transcribe

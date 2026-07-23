@@ -75,6 +75,19 @@ import {
   type VoiceRecordCommand,
   type VoiceRecordEvent,
 } from "../ipc/voiceInput";
+import {
+  ONBOARDING_COMPLETE_CHANNEL,
+  ONBOARDING_DOWNLOAD_STATUS_CHANNEL,
+  ONBOARDING_OPEN_GET_KEY_CHANNEL,
+  ONBOARDING_START_DOWNLOAD_CHANNEL,
+  ONBOARDING_VALIDATE_KEY_CHANNEL,
+  OnboardingDownloadStatusSchema,
+  ValidateKeyResponseSchema,
+  type OnboardingDownloadStatusValue,
+  type ValidateKeyRequest,
+  type ValidateKeyResponse,
+} from "../ipc/onboarding";
+import type { SettingsVendorId } from "../ipc/settings";
 
 // The typed bridge the renderer uses to reach the Core through the main process.
 // It is deliberately tiny: the shared zod contract in @lune/shared is the single
@@ -305,6 +318,37 @@ const luneBridge = {
     /** Relaunches Lune so a freshly-granted permission takes effect (macOS quirk). */
     relaunch(): void {
       ipcRenderer.send(SCREEN_RELAUNCH_CHANNEL);
+    },
+  },
+  onboarding: {
+    /**
+     * Live-validates a candidate Vendor key with a cheap test call and, on success,
+     * stores it (routing the Vendor if the currently-routed one has no key). Resolves
+     * with the verdict and the resulting Settings state, validated against the shared
+     * codec before the renderer sees it (no untyped shape crosses in).
+     */
+    async validateKey(request: ValidateKeyRequest): Promise<ValidateKeyResponse> {
+      return ValidateKeyResponseSchema.parse(
+        await ipcRenderer.invoke(ONBOARDING_VALIDATE_KEY_CHANNEL, request),
+      );
+    },
+    /** Starts (or resumes) the background model download; idempotent. */
+    startDownload(): void {
+      ipcRenderer.send(ONBOARDING_START_DOWNLOAD_CHANNEL);
+    },
+    /** Reads the download step's live progress / preflight state. */
+    async downloadStatus(): Promise<OnboardingDownloadStatusValue> {
+      return OnboardingDownloadStatusSchema.parse(
+        await ipcRenderer.invoke(ONBOARDING_DOWNLOAD_STATUS_CHANNEL),
+      );
+    },
+    /** Marks onboarding complete and closes the window. */
+    complete(): void {
+      ipcRenderer.send(ONBOARDING_COMPLETE_CHANNEL);
+    },
+    /** Opens one Vendor's "get a key" page in the default browser. */
+    openGetKeyLink(vendor: SettingsVendorId): void {
+      ipcRenderer.send(ONBOARDING_OPEN_GET_KEY_CHANNEL, vendor);
     },
   },
 };
