@@ -26,6 +26,11 @@ import {
   ScreenPermissionStateSchema,
   type ScreenPermissionStateValue,
 } from "../ipc/screenPermission";
+import {
+  SPEECH_EVENT_CHANNEL,
+  SpeechEventSchema,
+  type SpeechEvent,
+} from "../ipc/speechPlayback";
 
 // The typed bridge the renderer uses to reach the Core through the main process.
 // It is deliberately tiny: the shared zod contract in @lune/shared is the single
@@ -84,6 +89,26 @@ const luneBridge = {
     /** Tells the main process this Overlay has faded out and its window can be hidden. */
     signalIdle(): void {
       ipcRenderer.send(OVERLAY_IDLE_CHANNEL);
+    },
+  },
+  speech: {
+    /**
+     * Subscribes to Kokoro speech-playback events (synthesized clips, turn-complete,
+     * stop), validating each against the shared codec before the renderer plays it.
+     * Only the Pill renderer subscribes - it owns Lune's audio output. Returns an
+     * unsubscribe function.
+     */
+    onSpeechEvent(listener: (event: SpeechEvent) => void): () => void {
+      const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
+        const parsedEvent = SpeechEventSchema.safeParse(rawEvent);
+        if (parsedEvent.success) {
+          listener(parsedEvent.data);
+        } else {
+          console.error("[lune] dropping malformed speech event:", parsedEvent.error.message);
+        }
+      };
+      ipcRenderer.on(SPEECH_EVENT_CHANNEL, forwardValidatedEvent);
+      return () => ipcRenderer.removeListener(SPEECH_EVENT_CHANNEL, forwardValidatedEvent);
     },
   },
   pill: {

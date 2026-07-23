@@ -48,9 +48,10 @@ function workAreaAt(anchor: PillAnchor) {
 /**
  * Creates the Pill window and wires its hover-resize and drag-persistence. Registers
  * the pill-resize IPC as a side effect - there is exactly one Pill, so a
- * module-level registration is correct.
+ * module-level registration is correct. Returns the window so the main process can
+ * address it directly (e.g. streaming Kokoro speech clips to the Pill's audio output).
  */
-export function createPillWindow(): void {
+export function createPillWindow(): BrowserWindow {
   const positionStore = new PillPositionStore(
     join(app.getPath("userData"), "pill-position.json"),
     (filePath) => readFileSync(filePath, "utf8"),
@@ -168,4 +169,6 @@ export function createPillWindow(): void {
       persistAnchor();
     }
   });
+
+  return pillWindow;
 }

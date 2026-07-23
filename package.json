@@ -20,7 +20,8 @@
     "onlyBuiltDependencies": [
       "electron",
       "esbuild",
-      "@tailwindcss/oxide"
+      "@tailwindcss/oxide",
+      "onnxruntime-node"
     ]
   }
 }

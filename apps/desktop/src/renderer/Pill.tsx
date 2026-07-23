@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { StateIndicator, labelForState } from "./StateIndicator";
 import { PILL_INDICATOR_STATES, usePillStore, type PillIndicatorState } from "./pillStore";
 import { ScreenAccessSection } from "./ScreenAccessSection";
+import { useSpeechPlayback } from "./useSpeechPlayback";
 
 // The Pill: Lune's home surface (ticket 04). A thin always-on-top bar that expands
 // into its menu on hover. The window is frameless and transparent and sized to this
@@ -17,6 +18,10 @@ export function Pill() {
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const indicatorState = usePillStore((state) => state.indicatorState);
+
+  // The Pill owns Lune's audio output: it plays the Kokoro speech clips the main
+  // process streams over IPC and drives the "speaking" state while they play (ticket 09).
+  useSpeechPlayback();
 
   // The main process sizes the frameless window to whatever we render, so it must
   // learn the current content size: on first paint, on every hover expand, and -

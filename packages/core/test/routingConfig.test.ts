@@ -19,14 +19,37 @@ describe("DEFAULT_ROUTING_CONFIG", () => {
   it("defaults Reasoning to Gemini", () => {
     expect(DEFAULT_ROUTING_CONFIG.reasoning.vendor).toBe("google");
   });
+
+  it("defaults Speech to Kokoro's flagship Voice", () => {
+    expect(DEFAULT_ROUTING_CONFIG.speech.voice).toBe("af_heart");
+  });
 });
 
 describe("parseRoutingConfig", () => {
   it("parses a complete, valid config verbatim", () => {
-    const rawJson = JSON.stringify({ reasoning: { vendor: "openai", modelSlot: "gpt-4o" } });
+    const rawJson = JSON.stringify({
+      reasoning: { vendor: "openai", modelSlot: "gpt-4o" },
+      speech: { voice: "am_michael" },
+    });
     expect(parseRoutingConfig(rawJson)).toEqual({
       reasoning: { vendor: "openai", modelSlot: "gpt-4o" },
+      speech: { voice: "am_michael" },
     });
+  });
+
+  it("keeps an unknown-but-present Voice (the Capability applies the fallback later)", () => {
+    const config = parseRoutingConfig(JSON.stringify({ speech: { voice: "future_voice" } }));
+    expect(config.speech.voice).toBe("future_voice");
+  });
+
+  it("defaults the Voice when the Speech selection is missing, empty, or malformed", () => {
+    expect(parseRoutingConfig("{}").speech).toEqual(DEFAULT_ROUTING_CONFIG.speech);
+    expect(parseRoutingConfig(JSON.stringify({ speech: { voice: "" } })).speech).toEqual(
+      DEFAULT_ROUTING_CONFIG.speech,
+    );
+    expect(parseRoutingConfig(JSON.stringify({ speech: 42 })).speech).toEqual(
+      DEFAULT_ROUTING_CONFIG.speech,
+    );
   });
 
   it("accepts each wired Vendor", () => {
