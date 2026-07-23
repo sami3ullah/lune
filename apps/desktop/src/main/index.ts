@@ -1,12 +1,13 @@
 import { readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { app, BrowserWindow, ipcMain, screen, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, safeStorage, screen, systemPreferences, type WebContents } from "electron";
 import {
   createConversationManager,
   createReasoningCapability,
   describeCore,
   parseAnswerPointTag,
+  PROVISIONING_MANIFEST,
   RoutingConfigStore,
   type ReasoningVendorId,
   type SpeechCapability,
@@ -31,6 +32,23 @@ import {
 } from "../ipc/conversations";
 import { ConversationHistoryStore } from "./conversationHistoryStore";
 import { toggleChatPanelWindow } from "./chatPanelWindow";
+import { toggleSettingsWindow } from "./settingsWindow";
+import {
+  SETTINGS_GET_CHANNEL,
+  SETTINGS_READINESS_CHANNEL,
+  SETTINGS_REPAIR_CHANNEL,
+  SETTINGS_SAVE_CHANNEL,
+  SETTINGS_SET_KEY_CHANNEL,
+  SETTINGS_TOGGLE_CHANNEL,
+  ReadinessRowSchema,
+  SetApiKeyRequestSchema,
+  SettingsSnapshotSchema,
+  SettingsStateSchema,
+  SettingsValuesSchema,
+} from "../ipc/settings";
+import { SettingsStore } from "./settings/settingsStore";
+import { CredentialStore } from "./settings/credentialStore";
+import { createSettingsService, type SettingsService } from "./settings/settingsService";
 import {
   SCREEN_PERMISSION_REQUEST_CHANNEL,
   SCREEN_PERMISSION_STATUS_CHANNEL,
@@ -64,50 +82,90 @@ import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ip
 // bridges the Core's plain typed functions/streams to the renderer over typed IPC
 // (Implementation Decisions). Ticket 03 wires the full cloud Reasoning core: the
 // three Vendors behind the Vendor table, selected by the routing config and gated
-// on per-Vendor keys. Screen capture, the OS keychain, and the config-writing
-// Settings UI arrive in later tickets; until then the config path and keys come
-// from the environment and no screenshots flow over IPC yet.
+// on per-Vendor keys. Ticket 13 wires Settings: the config file the Shell now writes,
+// and the OS-encrypted key store the routed Vendor's key comes from.
 
-/** The environment variable carrying each Vendor's API key (keychain comes later). */
+/**
+ * The dev-only env fallback for each Vendor's API key, used when no key is stored in
+ * the OS-encrypted CredentialStore yet (so a `LUNE_*_API_KEY` still works in dev).
+ */
 const API_KEY_ENV_BY_VENDOR: Record<ReasoningVendorId, string> = {
   anthropic: "LUNE_ANTHROPIC_API_KEY",
   openai: "LUNE_OPENAI_API_KEY",
   google: "LUNE_GEMINI_API_KEY",
 };
 
-// The live routing config: which Vendor + Model Slot answers. It is read from the
-// file the Shell writes (once Settings exists); before then, the store falls back
-// to the Gemini-default config. Watching the file lets a Setting the user edits
-// reconcile routing with no restart.
-const routingConfigPath = process.env.LUNE_CONFIG_PATH;
+// The one config file the Shell writes and the Core reads (ticket 13). It defaults to
+// config.json under the app's userData so Settings always has a real place to persist -
+// a returning user's Vendor/Model/Voice/hotkey/streaming choices survive restarts;
+// LUNE_CONFIG_PATH overrides it for dev/tests.
+const routingConfigPath =
+  process.env.LUNE_CONFIG_PATH !== undefined && process.env.LUNE_CONFIG_PATH.trim().length > 0
+    ? process.env.LUNE_CONFIG_PATH
+    : join(app.getPath("userData"), "config.json");
+
+// The Shell-owned settings store over that file (reasoning/speech the Core reads, plus
+// the Shell-only streaming-text toggle and push-to-talk hotkey), and the Core's
+// read-only routing view of the same file. The Shell is the sole writer; after a save
+// it reloads the Core store so the next turn routes to the new selection with no restart.
+const settingsStore = new SettingsStore(
+  routingConfigPath,
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+);
 const routingConfigStore = new RoutingConfigStore(routingConfigPath, (path) =>
   readFileSync(path, "utf8"),
 );
 
-if (routingConfigPath !== undefined && routingConfigPath.trim().length > 0) {
-  try {
-    watch(routingConfigPath, () => {
-      routingConfigStore.reload();
-    });
-  } catch (error) {
-    // A missing file (not yet written) is fine - the store already holds the
-    // defaults, and the watcher is best-effort until the Shell writes the file.
-    console.error("[lune] could not watch routing config file:", error);
-  }
+// The Vendor API keys, in OS-encrypted storage (never the config file - the config
+// holds no secrets). Constructing the store only reads the ciphertext file; the
+// encrypt/decrypt calls run after the app is ready, on a key change or a chat turn. A
+// stored key takes precedence over the dev env fallback.
+const credentialStore = new CredentialStore(
+  join(app.getPath("userData"), "credentials.json"),
+  safeStorage,
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+);
+
+// Best-effort watch so a hand-edit of the config file reconciles routing without a
+// restart. A save from Settings reloads the Core store explicitly (below), so this only
+// covers external edits; a missing file (first run) simply has no watcher yet.
+try {
+  watch(routingConfigPath, () => {
+    routingConfigStore.reload();
+  });
+} catch (error) {
+  console.error("[lune] could not watch routing config file:", error);
 }
 
 // The Core is credentials-gated and transport-agnostic: the main process injects the
-// platform `fetch`, the per-Vendor keys, and the screenshot downscale. Screen capture
-// (ticket 05) now wires the real `nativeImage`-backed downscale, so the pipeline's
-// coordinate remap runs against a genuine scale factor. An empty or absent key for the
-// routed Vendor leaves the Capability gated off, surfacing as a terminal `error` event
-// rather than an upstream call.
+// platform `fetch`, the per-Vendor keys, and the screenshot downscale. Keys come from
+// the OS-encrypted CredentialStore, falling back to the dev env var when none is stored
+// yet. An empty or absent key for the routed Vendor leaves the Capability gated off,
+// surfacing as a terminal `error` event rather than an upstream call.
 const reasoningCapability = createReasoningCapability({
   getRoutingConfig: () => routingConfigStore.getConfig(),
-  getApiKey: (vendorId) => process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
+  getApiKey: (vendorId) => credentialStore.getKey(vendorId) ?? process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
   upstreamFetch: (url, requestInit) => fetch(url, requestInit),
   downscaleScreenshot: nativeImageDownscale,
 });
+
+// The Settings service (ticket 13): composes the config-file store, the OS-encrypted
+// key store, and the Provisioning run into the snapshots the Settings window reads and
+// the edits it applies. Assigned once the app is ready (it needs the Provisioning
+// Capability); the Settings window opens only after the UI is up, so it is set before
+// any Settings IPC fires. The repair action re-runs every pinned Runtime's download.
+let settingsService: SettingsService | null = null;
+const REPAIR_RUNTIME_IDS = PROVISIONING_MANIFEST.map((runtime) => runtime.id);
+
+/** The Settings service once ready; a Settings IPC before then is a programmer error. */
+function requireSettingsService(): SettingsService {
+  if (settingsService === null) {
+    throw new Error("Settings service is not ready yet");
+  }
+  return settingsService;
+}
 
 // Conversation state lives in the Core (ticket 06): the Chat Panel renders the history
 // the manager owns. The manager holds one *active* conversation; the durable set of
@@ -286,6 +344,11 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
     // sentence-streams the answer to the Pill's audio output as the reply arrives.
     let speechTurn: SpeechTurnPlayer | null = null;
 
+    // The streaming-text toggle (ticket 13): read once at the turn's start so a change
+    // takes effect on the next turn. When off, the Overlay cursor still flies and points,
+    // but the answer text is not streamed into its response bubble (voice-only preference).
+    const showStreamingText = settingsStore.getStreamingText();
+
     try {
       // Capture the screen(s) first (when opted in and permitted) so the answer is
       // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
@@ -349,7 +412,8 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
             // Stream the answer into the Overlay bubble, but only the clean human text:
             // parse the accumulated answer and emit just the newly-revealed display
             // characters, so the trailing `[POINT:...]` tag never appears in the bubble.
-            if (overlayManager && cursorDisplayId !== undefined) {
+            // Gated on the streaming-text toggle: when off, no bubble text is sent.
+            if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
               const { displayText } = parseAnswerPointTag(accumulatedAnswer);
               if (displayText.length > sentCleanLength) {
                 overlayManager.sendToDisplay(cursorDisplayId, {
@@ -410,6 +474,28 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
 // Open/close the Chat Panel from the Pill menu (or its own close button). One toggle
 // keeps both entry points in agreement.
 ipcMain.on(CHAT_PANEL_TOGGLE_CHANNEL, () => toggleChatPanelWindow());
+
+// Open/close the Settings window from the Pill menu (ticket 13).
+ipcMain.on(SETTINGS_TOGGLE_CHANNEL, () => toggleSettingsWindow());
+
+// The Settings surface's request/response IPC (ticket 13): read the current snapshot,
+// persist edited Vendor/Model/Voice/hotkey/streaming values, set/clear a Vendor's API
+// key in OS-encrypted storage, re-run/repair Provisioning, and poll live readiness.
+// Every payload is validated on the way in and every reply parsed on the way out, so no
+// untyped shape crosses the boundary (developer story 46).
+ipcMain.handle(SETTINGS_GET_CHANNEL, () => SettingsSnapshotSchema.parse(requireSettingsService().snapshot()));
+ipcMain.handle(SETTINGS_SAVE_CHANNEL, (_event, rawValues: unknown) => {
+  const values = SettingsValuesSchema.parse(rawValues);
+  return SettingsStateSchema.parse(requireSettingsService().save(values));
+});
+ipcMain.handle(SETTINGS_SET_KEY_CHANNEL, (_event, rawRequest: unknown) => {
+  const request = SetApiKeyRequestSchema.parse(rawRequest);
+  return SettingsStateSchema.parse(requireSettingsService().setKey(request));
+});
+ipcMain.handle(SETTINGS_REPAIR_CHANNEL, () => SettingsStateSchema.parse(requireSettingsService().repair()));
+ipcMain.handle(SETTINGS_READINESS_CHANNEL, () =>
+  ReadinessRowSchema.array().parse(requireSettingsService().readiness()),
+);
 
 // The recent-conversations dropdown (ticket 12). These drive the Shell's durable store
 // and the Core's active conversation; the answer stream still flows over the shared
@@ -547,6 +633,24 @@ void app.whenReady().then(() => {
     modelsDirectoryPath: provisioning.modelsDirectoryPath,
     getRoutingConfig: () => routingConfigStore.getConfig(),
     isKokoroReady: () => provisioning.capability.isRuntimeReady("kokoro"),
+  });
+
+  // Settings (ticket 13): now that Provisioning exists, wire the service the Settings
+  // IPC handlers call. Readiness reads the Provisioning run's live status + per-Runtime
+  // verified state; Repair re-downloads every pinned Runtime, then reconciles the
+  // whisper child once the run settles so a repaired Transcription comes back healthy.
+  settingsService = createSettingsService({
+    settingsStore,
+    credentialStore,
+    provisioningStatus: () => provisioning.capability.status(),
+    isRuntimeReady: (runtimeId) => provisioning.capability.isRuntimeReady(runtimeId),
+    startRepair: () => {
+      provisioning.capability.start(REPAIR_RUNTIME_IDS);
+      void provisioning.capability.awaitCurrentRun().then(() => transcription?.reconcile());
+    },
+    reloadRouting: () => {
+      routingConfigStore.reload();
+    },
   });
 
   // Refresh Provisioning readiness (and optionally run the ~2 GB dev download), then

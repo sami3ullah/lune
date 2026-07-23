@@ -40,20 +40,40 @@ export interface SpeechSelection {
   voice: string;
 }
 
+/**
+ * The hotkey selection: which chord holds-to-talk (push-to-talk, ticket 11). The
+ * chord is a plain "+"-joined token string (e.g. "control+alt") so it is both
+ * hand-editable in the config file and simple for the Settings editor (ticket 13) to
+ * write. Parsing the string into actual key matching is Shell plumbing (it depends on
+ * the platform key source), so the Core just carries the value tolerantly - default
+ * ctrl+option, and any non-empty string kept as-is.
+ */
+export interface HotkeySelection {
+  pushToTalk: string;
+}
+
 /** The full routing configuration. */
 export interface RoutingConfig {
   reasoning: ReasoningSelection;
   speech: SpeechSelection;
+  hotkey: HotkeySelection;
 }
 
 /**
+ * The default push-to-talk chord: ctrl+option (the v1 default, carried verbatim).
+ * Held anywhere in the OS to talk, released to send (ticket 11).
+ */
+export const DEFAULT_PUSH_TO_TALK_HOTKEY = "control+alt";
+
+/**
  * The defaults used when no config file exists yet: Gemini for Reasoning (the "Gemini
- * as default" rule - the first Vendor a fresh install reaches for), and Kokoro's
- * flagship Voice for Speech.
+ * as default" rule - the first Vendor a fresh install reaches for), Kokoro's flagship
+ * Voice for Speech, and ctrl+option for push-to-talk.
  */
 export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
   reasoning: { vendor: "google", modelSlot: REASONING_VENDORS.google.defaultModel },
   speech: { voice: DEFAULT_KOKORO_VOICE },
+  hotkey: { pushToTalk: DEFAULT_PUSH_TO_TALK_HOTKEY },
 };
 
 /** A copy of the defaults so callers never mutate the shared constant. */
@@ -61,6 +81,7 @@ function cloneDefaultRoutingConfig(): RoutingConfig {
   return {
     reasoning: { ...DEFAULT_ROUTING_CONFIG.reasoning },
     speech: { ...DEFAULT_ROUTING_CONFIG.speech },
+    hotkey: { ...DEFAULT_ROUTING_CONFIG.hotkey },
   };
 }
 
@@ -114,6 +135,29 @@ function mergeSpeechSelection(candidate: unknown): SpeechSelection {
 }
 
 /**
+ * Validates and merges the hotkey selection over its default. The push-to-talk chord
+ * is kept when it is a non-empty string, else defaulted - so a partial file still
+ * yields a usable chord. The chord's exact key tokens are validated at parse time in
+ * the Shell (which owns the platform key mapping), matching how the Voice's known-set
+ * check happens later at synthesis, not here.
+ */
+function mergeHotkeySelection(candidate: unknown): HotkeySelection {
+  const fallback = DEFAULT_ROUTING_CONFIG.hotkey;
+  if (candidate === null || typeof candidate !== "object") {
+    return { ...fallback };
+  }
+
+  const candidateObject = candidate as Record<string, unknown>;
+
+  const pushToTalk =
+    typeof candidateObject.pushToTalk === "string" && candidateObject.pushToTalk.trim().length > 0
+      ? candidateObject.pushToTalk
+      : fallback.pushToTalk;
+
+  return { pushToTalk };
+}
+
+/**
  * Parses the routing config from the file's raw JSON text, merging it over the
  * defaults so a partial or malformed file still yields a complete config. A file
  * that isn't valid JSON, or isn't an object, yields the defaults wholesale.
@@ -134,6 +178,7 @@ export function parseRoutingConfig(rawJson: string): RoutingConfig {
   return {
     reasoning: mergeReasoningSelection(parsedObject.reasoning),
     speech: mergeSpeechSelection(parsedObject.speech),
+    hotkey: mergeHotkeySelection(parsedObject.hotkey),
   };
 }
 

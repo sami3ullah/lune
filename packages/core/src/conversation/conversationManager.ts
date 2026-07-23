@@ -43,6 +43,13 @@ export interface SubmitUserTurnInput {
   inputMethod: ChatInputMethod;
   /** The screenshots captured for this turn (empty for a text-only or unpermitted turn). */
   screenshots: ScreenCaptureInput[];
+  /**
+   * Cancels this turn's in-flight Reasoning stream when signalled (Barge-in, ticket
+   * 11): the push-to-talk hotkey pressed mid-answer aborts the turn. An aborted turn
+   * throws out of {@link ConversationManager.submitUserTurn} before the commit, so it
+   * leaves no trace in history - exactly like any other failed turn.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ConversationManager {
@@ -97,7 +104,7 @@ export function createConversationManager(
     yield { type: "user-message", message: userMessage };
     yield { type: "assistant-started", messageId: assistantMessage.id };
 
-    for await (const streamEvent of reasoningCapability.streamChat(request)) {
+    for await (const streamEvent of reasoningCapability.streamChat(request, { signal: input.signal })) {
       if (streamEvent.type === "text-delta") {
         assistantMessage.text += streamEvent.text;
         yield { type: "assistant-delta", messageId: assistantMessage.id, text: streamEvent.text };

@@ -15,6 +15,7 @@ export {
   ReasoningNotReadyError,
   type ReasoningCapability,
   type ReasoningCapabilityDependencies,
+  type StreamChatOptions,
 } from "./reasoning/reasoningCapability.js";
 export {
   textOnlyChatRequest,
@@ -41,12 +42,14 @@ export {
 // The routing config: which Vendor + Model Slot answers, Gemini by default.
 export {
   DEFAULT_ROUTING_CONFIG,
+  DEFAULT_PUSH_TO_TALK_HOTKEY,
   parseRoutingConfig,
   loadRoutingConfig,
   RoutingConfigStore,
   type RoutingConfig,
   type ReasoningSelection,
   type SpeechSelection,
+  type HotkeySelection,
 } from "./reasoning/routingConfig.js";
 
 // The Speech Capability: on-device Kokoro synthesis (ticket 09), gated on the Kokoro

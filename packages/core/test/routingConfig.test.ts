@@ -30,10 +30,12 @@ describe("parseRoutingConfig", () => {
     const rawJson = JSON.stringify({
       reasoning: { vendor: "openai", modelSlot: "gpt-4o" },
       speech: { voice: "am_michael" },
+      hotkey: { pushToTalk: "shift+control" },
     });
     expect(parseRoutingConfig(rawJson)).toEqual({
       reasoning: { vendor: "openai", modelSlot: "gpt-4o" },
       speech: { voice: "am_michael" },
+      hotkey: { pushToTalk: "shift+control" },
     });
   });
 
@@ -92,6 +94,21 @@ describe("parseRoutingConfig", () => {
   it("returns the defaults when the JSON is not an object", () => {
     expect(parseRoutingConfig("42")).toEqual(DEFAULT_ROUTING_CONFIG);
     expect(parseRoutingConfig("null")).toEqual(DEFAULT_ROUTING_CONFIG);
+  });
+
+  it("defaults the push-to-talk hotkey to ctrl+option when missing, empty, or malformed", () => {
+    expect(parseRoutingConfig("{}").hotkey).toEqual(DEFAULT_ROUTING_CONFIG.hotkey);
+    expect(parseRoutingConfig(JSON.stringify({ hotkey: { pushToTalk: "" } })).hotkey).toEqual(
+      DEFAULT_ROUTING_CONFIG.hotkey,
+    );
+    expect(parseRoutingConfig(JSON.stringify({ hotkey: 7 })).hotkey).toEqual(
+      DEFAULT_ROUTING_CONFIG.hotkey,
+    );
+  });
+
+  it("keeps a non-empty push-to-talk chord as-is (token validation happens in the Shell)", () => {
+    const config = parseRoutingConfig(JSON.stringify({ hotkey: { pushToTalk: "shift+fn" } }));
+    expect(config.hotkey.pushToTalk).toBe("shift+fn");
   });
 
   it("does not let a parsed result mutate the shared defaults constant", () => {

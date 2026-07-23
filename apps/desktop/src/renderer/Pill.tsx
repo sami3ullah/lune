@@ -8,9 +8,9 @@ import { useSpeechPlayback } from "./useSpeechPlayback";
 // The Pill: Lune's home surface (ticket 04). A thin always-on-top bar that expands
 // into its menu on hover. The window is frameless and transparent and sized to this
 // content by the main process, so the layout here is what the user sees floating
-// over their desktop - nothing more. Voice/reasoning/speech will later drive the
-// state indicator and light up the menu targets; today Chat Panel and Settings are
-// placeholders and a dev control drives the state.
+// over their desktop - nothing more. The Chat Panel (ticket 06) and Settings (ticket
+// 13) menu targets open their windows; voice/reasoning/speech will later drive the
+// state indicator, and a dev control drives it until then.
 
 const IS_DEV = import.meta.env.DEV;
 
@@ -66,7 +66,7 @@ export function Pill() {
             transition={{ duration: 0.16, ease: "easeOut" }}
           >
             <MenuButton label="Chat Panel" onClick={() => window.lune.chatPanel.toggle()} />
-            <PlaceholderMenuItem label="Settings" />
+            <MenuButton label="Settings" onClick={() => window.lune.settings.toggle()} />
             <MenuButton label="Quit Lune" onClick={() => window.lune.pill.quit()} />
             <ScreenAccessSection />
             {IS_DEV && <DevStateSwitcher current={indicatorState} />}
@@ -87,22 +87,6 @@ function MenuButton({ label, onClick }: { label: string; onClick: () => void }) 
     >
       {label}
     </button>
-  );
-}
-
-/**
- * A menu target whose surface does not exist yet (Chat Panel, Settings arrive in
- * later tickets). Shown so the menu tour is complete, but visibly not-yet-ready
- * rather than a dead button that looks broken when clicked.
- */
-function PlaceholderMenuItem({ label }: { label: string }) {
-  return (
-    <div className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-sm text-neutral-500">
-      <span>{label}</span>
-      <span className="rounded-full bg-white/5 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-neutral-500">
-        soon
-      </span>
-    </div>
   );
 }
 

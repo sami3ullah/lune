@@ -25,6 +25,22 @@ import {
   type ResumedConversationValue,
 } from "../ipc/conversations";
 import {
+  SETTINGS_GET_CHANNEL,
+  SETTINGS_READINESS_CHANNEL,
+  SETTINGS_REPAIR_CHANNEL,
+  SETTINGS_SAVE_CHANNEL,
+  SETTINGS_SET_KEY_CHANNEL,
+  SETTINGS_TOGGLE_CHANNEL,
+  ReadinessRowSchema,
+  SettingsSnapshotSchema,
+  SettingsStateSchema,
+  type ReadinessRow,
+  type SetApiKeyRequest,
+  type SettingsSnapshot,
+  type SettingsState,
+  type SettingsValues,
+} from "../ipc/settings";
+import {
   OVERLAY_EVENT_CHANNEL,
   OVERLAY_IDLE_CHANNEL,
   OverlayEventSchema,
@@ -76,6 +92,32 @@ const luneBridge = {
     /** Opens the Chat Panel window, or hides it if already open. */
     toggle(): void {
       ipcRenderer.send(CHAT_PANEL_TOGGLE_CHANNEL);
+    },
+  },
+  settings: {
+    /** Opens the Settings window, or hides it if already open. */
+    toggle(): void {
+      ipcRenderer.send(SETTINGS_TOGGLE_CHANNEL);
+    },
+    /** Reads the full Settings snapshot (static catalog + live state) on open. */
+    async get(): Promise<SettingsSnapshot> {
+      return SettingsSnapshotSchema.parse(await ipcRenderer.invoke(SETTINGS_GET_CHANNEL));
+    },
+    /** Persists edited Vendor/Model/Voice/hotkey/streaming values; resolves with new state. */
+    async save(values: SettingsValues): Promise<SettingsState> {
+      return SettingsStateSchema.parse(await ipcRenderer.invoke(SETTINGS_SAVE_CHANNEL, values));
+    },
+    /** Sets (non-empty) or clears (empty) one Vendor's API key; resolves with new state. */
+    async setKey(request: SetApiKeyRequest): Promise<SettingsState> {
+      return SettingsStateSchema.parse(await ipcRenderer.invoke(SETTINGS_SET_KEY_CHANNEL, request));
+    },
+    /** Re-runs/repairs Provisioning; resolves with the state (readiness reflects the run). */
+    async repair(): Promise<SettingsState> {
+      return SettingsStateSchema.parse(await ipcRenderer.invoke(SETTINGS_REPAIR_CHANNEL));
+    },
+    /** Reads just the live readiness rows, for polling the download percentage. */
+    async readiness(): Promise<ReadinessRow[]> {
+      return ReadinessRowSchema.array().parse(await ipcRenderer.invoke(SETTINGS_READINESS_CHANNEL));
     },
   },
   conversations: {

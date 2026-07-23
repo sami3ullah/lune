@@ -132,6 +132,7 @@ async function collectDeltaText(stream: AsyncGenerator<CoreChatStreamEvent>): Pr
 const reasoningRouting = (vendor: ReasoningVendorId, modelSlot: string): RoutingConfig => ({
   reasoning: { vendor, modelSlot },
   speech: { voice: "af_heart" },
+  hotkey: { pushToTalk: "control+alt" },
 });
 
 describe("Reasoning routed to the OpenAI Vendor", () => {

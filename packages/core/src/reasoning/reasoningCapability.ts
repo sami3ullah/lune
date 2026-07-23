@@ -45,6 +45,16 @@ export interface ReasoningCapabilityDependencies {
   downscaleScreenshot: DownscaleScreenshot;
 }
 
+/** Per-turn options for {@link ReasoningCapability.streamChat}. */
+export interface StreamChatOptions {
+  /**
+   * Cancels the in-flight upstream stream when signalled (Barge-in, ticket 11). The
+   * push-to-talk hotkey pressed mid-answer aborts the turn at the network source, so
+   * the stream ends rather than lingering as a zombie read.
+   */
+  signal?: AbortSignal;
+}
+
 /** The Core's Reasoning Capability: a single streaming entry point. */
 export interface ReasoningCapability {
   /**
@@ -52,9 +62,10 @@ export interface ReasoningCapability {
    * the live routing config; switching the config's Vendor/Model Slot changes which
    * upstream is called and with which model. Throws {@link ReasoningNotReadyError}
    * (before any upstream call) when the routed Vendor has no key, and throws if the
-   * Vendor rejects the request or the stream cannot be opened.
+   * Vendor rejects the request or the stream cannot be opened. An optional
+   * {@link StreamChatOptions.signal} aborts the turn mid-stream (Barge-in).
    */
-  streamChat(request: CoreChatRequest): AsyncGenerator<CoreChatStreamEvent>;
+  streamChat(request: CoreChatRequest, options?: StreamChatOptions): AsyncGenerator<CoreChatStreamEvent>;
 }
 
 export function createReasoningCapability(
@@ -62,7 +73,10 @@ export function createReasoningCapability(
 ): ReasoningCapability {
   const { getRoutingConfig, getApiKey, upstreamFetch, downscaleScreenshot } = dependencies;
 
-  async function* streamChat(request: CoreChatRequest): AsyncGenerator<CoreChatStreamEvent> {
+  async function* streamChat(
+    request: CoreChatRequest,
+    options?: StreamChatOptions,
+  ): AsyncGenerator<CoreChatStreamEvent> {
     const { vendor: vendorId, modelSlot } = getRoutingConfig().reasoning;
     const vendor = findReasoningVendor(vendorId);
 
@@ -79,6 +93,7 @@ export function createReasoningCapability(
       apiKey,
       upstreamFetch,
       downscaleScreenshot,
+      signal: options?.signal,
     });
   }
 

@@ -36,12 +36,20 @@ export interface ReasoningPipelineInput {
   upstreamFetch: UpstreamFetch;
   /** Downscales each screenshot before it is sent (production resize; tests stub it). */
   downscaleScreenshot: DownscaleScreenshot;
+  /**
+   * Aborts the in-flight upstream stream when signalled (Barge-in): the Shell presses
+   * the push-to-talk hotkey mid-answer, so the network stream must genuinely cancel -
+   * not just stop being read (ticket 11). Forwarded to the `upstreamFetch` boundary so
+   * the fetch is aborted at the source, ending this generator's iteration. Absent for
+   * an ordinary turn.
+   */
+  signal?: AbortSignal;
 }
 
 export async function* runReasoningPipeline(
   input: ReasoningPipelineInput,
 ): AsyncGenerator<CoreChatStreamEvent> {
-  const { vendor, request, modelSlot, apiKey, upstreamFetch, downscaleScreenshot } = input;
+  const { vendor, request, modelSlot, apiKey, upstreamFetch, downscaleScreenshot, signal } = input;
 
   const screenshots = extractScreenshots(request);
   const downscaledScreenshots = await Promise.all(
@@ -65,6 +73,7 @@ export async function* runReasoningPipeline(
     method: "POST",
     headers: upstreamRequest.headers,
     body: upstreamRequest.body,
+    signal,
   });
 
   if (!upstreamResponse.ok || upstreamResponse.body === null) {

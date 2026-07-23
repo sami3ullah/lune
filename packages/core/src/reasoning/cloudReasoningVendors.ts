@@ -58,6 +58,13 @@ export interface ReasoningVendor {
    * Model Slot for this Vendor and preselected by the Shell's Settings picker.
    */
   defaultModel: string;
+  /**
+   * A curated shortlist of vision-capable Model Slots the Settings picker offers for
+   * this Vendor (developer story 34). The Model Slot is free-text at the seam, so the
+   * picker always also allows a custom entry; this is just the "sensible defaults"
+   * list, with {@link defaultModel} always among them.
+   */
+  modelShortlist: readonly string[];
   /** Shapes the Vendor's native upstream HTTP request. */
   buildUpstreamRequest(input: BuildUpstreamRequestInput): UpstreamRequest;
   /** Reduces the Vendor's SSE response body to a stream of raw answer-text deltas. */
@@ -74,11 +81,13 @@ function createOpenAiCompatibleVendor(parameters: {
   displayName: string;
   chatCompletionsUrl: string;
   defaultModel: string;
+  modelShortlist: readonly string[];
 }): ReasoningVendor {
   return {
     id: parameters.id,
     displayName: parameters.displayName,
     defaultModel: parameters.defaultModel,
+    modelShortlist: parameters.modelShortlist,
     buildUpstreamRequest: ({ request, downscaledScreenshots, modelSlot, apiKey }) => ({
       url: parameters.chatCompletionsUrl,
       headers: {
@@ -96,6 +105,7 @@ const ANTHROPIC_VENDOR: ReasoningVendor = {
   id: "anthropic",
   displayName: "Anthropic",
   defaultModel: "claude-sonnet-4-6",
+  modelShortlist: ["claude-sonnet-4-6", "claude-opus-4-1", "claude-haiku-4-5"],
   buildUpstreamRequest: ({ request, downscaledScreenshots, modelSlot, apiKey }) => ({
     url: "https://api.anthropic.com/v1/messages",
     headers: {
@@ -114,6 +124,7 @@ const GOOGLE_VENDOR: ReasoningVendor = createOpenAiCompatibleVendor({
   displayName: "Google Gemini",
   chatCompletionsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
   defaultModel: "gemini-2.5-flash",
+  modelShortlist: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
 });
 
 /** OpenAI over its chat-completions endpoint. */
@@ -122,6 +133,7 @@ const OPENAI_VENDOR: ReasoningVendor = createOpenAiCompatibleVendor({
   displayName: "OpenAI",
   chatCompletionsUrl: "https://api.openai.com/v1/chat/completions",
   defaultModel: "gpt-4o",
+  modelShortlist: ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
 });
 
 /** The wired cloud Reasoning Vendors, keyed by id. */
