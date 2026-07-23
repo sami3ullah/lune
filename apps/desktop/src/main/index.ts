@@ -1,6 +1,14 @@
 import { join } from "node:path";
+import { readFileSync, watch } from "node:fs";
 import { app, BrowserWindow, ipcMain, type WebContents } from "electron";
-import { createChatCapability, describeCore, GEMINI_VENDOR } from "@lune/core";
+import {
+  createReasoningCapability,
+  describeCore,
+  RoutingConfigStore,
+  textOnlyChatRequest,
+  type DownscaleScreenshot,
+  type ReasoningVendorId,
+} from "@lune/core";
 import {
   CHAT_EVENT_CHANNEL,
   CHAT_START_CHANNEL,
@@ -12,17 +20,57 @@ import {
 
 // The Electron main process is the only place the in-process Core is imported; it
 // bridges the Core's plain typed functions/streams to the renderer over typed IPC
-// (Implementation Decisions). The walking skeleton (ticket 02) wires the streamed
-// Gemini chat round-trip; the remaining Capability bridges arrive in later tickets.
+// (Implementation Decisions). Ticket 03 wires the full cloud Reasoning core: the
+// three Vendors behind the Vendor table, selected by the routing config and gated
+// on per-Vendor keys. Screen capture, the OS keychain, and the config-writing
+// Settings UI arrive in later tickets; until then the config path and keys come
+// from the environment and no screenshots flow over IPC yet.
 
-// The Core is credentials-gated and transport-agnostic: the main process injects
-// the platform `fetch` and reads the Gemini key/model from the environment for now
-// (later tickets move these to the OS keychain and the routing config). An empty or
-// absent key leaves the Capability gated off, exactly like v1's cloud Providers.
-const chatCapability = createChatCapability({
+/** The environment variable carrying each Vendor's API key (keychain comes later). */
+const API_KEY_ENV_BY_VENDOR: Record<ReasoningVendorId, string> = {
+  anthropic: "LUNE_ANTHROPIC_API_KEY",
+  openai: "LUNE_OPENAI_API_KEY",
+  google: "LUNE_GEMINI_API_KEY",
+};
+
+// The live routing config: which Vendor + Model Slot answers. It is read from the
+// file the Shell writes (once Settings exists); before then, the store falls back
+// to the Gemini-default config. Watching the file lets a Setting the user edits
+// reconcile routing with no restart.
+const routingConfigPath = process.env.LUNE_CONFIG_PATH;
+const routingConfigStore = new RoutingConfigStore(routingConfigPath, (path) =>
+  readFileSync(path, "utf8"),
+);
+
+if (routingConfigPath !== undefined && routingConfigPath.trim().length > 0) {
+  try {
+    watch(routingConfigPath, () => {
+      routingConfigStore.reload();
+    });
+  } catch (error) {
+    // A missing file (not yet written) is fine - the store already holds the
+    // defaults, and the watcher is best-effort until the Shell writes the file.
+    console.error("[lune] could not watch routing config file:", error);
+  }
+}
+
+// Screenshots do not yet cross the IPC boundary (screen capture is a later ticket),
+// so nothing is ever downscaled today. The passthrough keeps the pipeline's remap at
+// the identity; the real pixel-resizing edge is wired when screen capture lands.
+const passthroughDownscale: DownscaleScreenshot = async (screenshot) => ({
+  ...screenshot,
+  scaleFactor: 1,
+});
+
+// The Core is credentials-gated and transport-agnostic: the main process injects the
+// platform `fetch`, the per-Vendor keys, and the (currently passthrough) downscale.
+// An empty or absent key for the routed Vendor leaves the Capability gated off,
+// surfacing as a terminal `error` event rather than an upstream call.
+const reasoningCapability = createReasoningCapability({
+  getRoutingConfig: () => routingConfigStore.getConfig(),
+  getApiKey: (vendorId) => process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
   upstreamFetch: (url, requestInit) => fetch(url, requestInit),
-  getApiKey: () => process.env.LUNE_GEMINI_API_KEY,
-  getModelSlot: () => process.env.LUNE_GEMINI_MODEL ?? GEMINI_VENDOR.defaultModel,
+  downscaleScreenshot: passthroughDownscale,
 });
 
 /**
@@ -69,7 +117,7 @@ ipcMain.on(CHAT_START_CHANNEL, (event, rawChatTurnRequest: unknown) => {
   void (async () => {
     sendChatEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
     try {
-      for await (const chatEvent of chatCapability.streamChat({ prompt })) {
+      for await (const chatEvent of reasoningCapability.streamChat(textOnlyChatRequest(prompt))) {
         switch (chatEvent.type) {
           case "text-delta":
             sendChatEvent(webContents, { type: "delta", turnId, text: chatEvent.text });

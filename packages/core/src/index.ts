@@ -3,20 +3,50 @@ import { LUNE_IPC_VERSION } from "@lune/shared";
 // @lune/core is the pure, transport-agnostic TypeScript package that owns all of
 // Lune's intelligence (developer story 45). It imports no Electron and no HTTP:
 // the Electron main process (or, later, a thin HTTP adapter) is what bridges these
-// plain typed functions/streams to a Shell. The walking skeleton (ticket 02) ports
-// the minimum-width Reasoning slice - a Gemini-only streamed `chat` behind the
-// injected upstream-fetch seam; the remaining Capabilities (transcribe, speech,
-// provisioning, status, config) and Vendors are ported in later tickets.
+// plain typed functions/streams to a Shell. This ticket (03) ports v1's full cloud
+// Reasoning core - three Vendors behind the Vendor table, credentials-gated and
+// config-routed, running one shared pipeline with the Point Tag canonicalizer and
+// coordinate remap. The remaining Capabilities (Transcription, Speech) and local
+// Runtimes are ported in later tickets.
 
+// The Reasoning Capability and its Vendor-independent request/event types.
 export {
-  createChatCapability,
-  ChatNotReadyError,
-  type ChatCapability,
-  type ChatCapabilityDependencies,
+  createReasoningCapability,
+  ReasoningNotReadyError,
+  type ReasoningCapability,
+  type ReasoningCapabilityDependencies,
+} from "./reasoning/reasoningCapability.js";
+export {
+  textOnlyChatRequest,
   type CoreChatRequest,
+  type CoreChatMessage,
+  type CoreContentBlock,
   type CoreChatStreamEvent,
-} from "./reasoning/chatCapability.js";
-export { GEMINI_VENDOR, type CloudReasoningVendor } from "./reasoning/geminiVendor.js";
+  type Screenshot,
+  type DownscaledScreenshot,
+  type DownscaleScreenshot,
+} from "./reasoning/chatTypes.js";
+
+// The Vendor table: the three cloud Reasoning Vendors and their protocol adapters.
+export {
+  REASONING_VENDORS,
+  REASONING_VENDOR_IDS,
+  findReasoningVendor,
+  type ReasoningVendor,
+  type ReasoningVendorId,
+} from "./reasoning/cloudReasoningVendors.js";
+
+// The routing config: which Vendor + Model Slot answers, Gemini by default.
+export {
+  DEFAULT_ROUTING_CONFIG,
+  parseRoutingConfig,
+  loadRoutingConfig,
+  RoutingConfigStore,
+  type RoutingConfig,
+  type ReasoningSelection,
+} from "./reasoning/routingConfig.js";
+
+export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
 
 /**
