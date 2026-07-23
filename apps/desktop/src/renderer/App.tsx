@@ -1,58 +1,94 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { LUNE_IPC_VERSION } from "@lune/shared";
-import { useWiringProofStore } from "./store";
+import { useChatStore } from "./store";
 
-// Scaffold surface: a single button that sends the placeholder ping across the
-// typed IPC boundary (renderer -> preload -> main -> Core) and renders the Core's
-// reply. It exists only to prove the whole architecture is wired end to end; the
-// real Pill, Chat Panel, and Overlay are built in later tickets.
+// The walking-skeleton surface: a bare panel with a text box that streams a Gemini
+// answer token-by-token (ticket 02). Typing a question flows renderer -> preload ->
+// main -> Core -> Gemini, and the streamed reply flows back the same way, proving
+// the whole architecture end to end. The real Pill, Chat Panel, and Overlay are
+// built in later tickets.
 export function App() {
-  const lastPingResponse = useWiringProofStore((state) => state.lastPingResponse);
-  const recordPingResponse = useWiringProofStore((state) => state.recordPingResponse);
-  const [isPingInFlight, setIsPingInFlight] = useState(false);
+  const status = useChatStore((state) => state.status);
+  const answerText = useChatStore((state) => state.answerText);
+  const errorMessage = useChatStore((state) => state.errorMessage);
+  const beginTurn = useChatStore((state) => state.beginTurn);
+  const applyChatEvent = useChatStore((state) => state.applyChatEvent);
 
-  async function sendPingThroughIpc() {
-    setIsPingInFlight(true);
-    try {
-      const pingResponse = await window.lune.ping({
-        sentFromShellAtEpochMs: Date.now(),
-      });
-      recordPingResponse(pingResponse);
-    } finally {
-      setIsPingInFlight(false);
+  const [draftQuestion, setDraftQuestion] = useState("");
+
+  // Subscribe once to the Core's streamed chat events for this window's lifetime.
+  // The store filters by the active turn id, so a single long-lived subscription
+  // correctly serves every turn.
+  useEffect(() => window.lune.chat.onChatEvent(applyChatEvent), [applyChatEvent]);
+
+  function submitQuestion() {
+    const trimmedQuestion = draftQuestion.trim();
+    if (trimmedQuestion.length === 0 || status === "streaming") {
+      return;
     }
+    const turnId = crypto.randomUUID();
+    beginTurn(turnId);
+    window.lune.chat.start({ turnId, prompt: trimmedQuestion });
+    setDraftQuestion("");
   }
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 bg-neutral-950 text-neutral-100">
-      <motion.h1
-        className="text-2xl font-semibold tracking-tight"
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4 }}
+    <div className="flex h-full flex-col gap-4 bg-neutral-950 p-6 text-neutral-100">
+      <div className="flex items-baseline justify-between">
+        <motion.h1
+          className="text-2xl font-semibold tracking-tight"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4 }}
+        >
+          Lune
+        </motion.h1>
+        <span className="text-xs text-neutral-500">IPC contract v{LUNE_IPC_VERSION}</span>
+      </div>
+
+      <form
+        className="flex gap-2"
+        onSubmit={(formEvent) => {
+          formEvent.preventDefault();
+          submitQuestion();
+        }}
       >
-        Lune
-      </motion.h1>
+        <input
+          type="text"
+          value={draftQuestion}
+          onChange={(changeEvent) => setDraftQuestion(changeEvent.target.value)}
+          placeholder="Ask Lune anything..."
+          className="min-w-0 flex-1 rounded-lg bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        />
+        <button
+          type="submit"
+          disabled={status === "streaming" || draftQuestion.trim().length === 0}
+          className="cursor-pointer rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-400 disabled:cursor-default disabled:opacity-50"
+        >
+          {status === "streaming" ? "..." : "Ask"}
+        </button>
+      </form>
 
-      <p className="text-sm text-neutral-400">
-        Shared IPC contract v{LUNE_IPC_VERSION}
-      </p>
-
-      <button
-        type="button"
-        onClick={sendPingThroughIpc}
-        disabled={isPingInFlight}
-        className="cursor-pointer rounded-full bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-400 disabled:cursor-default disabled:opacity-50"
-      >
-        {isPingInFlight ? "Pinging Core..." : "Ping Core over IPC"}
-      </button>
-
-      {lastPingResponse && (
-        <pre className="rounded-lg bg-neutral-900 px-3 py-2 text-xs text-emerald-300">
-          {lastPingResponse.coreDescription}
-        </pre>
-      )}
+      <div className="min-h-0 flex-1 overflow-y-auto rounded-lg bg-neutral-900 px-4 py-3 text-sm leading-relaxed">
+        {status === "idle" && (
+          <p className="text-neutral-500">The streamed answer will appear here.</p>
+        )}
+        {status === "error" ? (
+          <p className="text-rose-400">{errorMessage}</p>
+        ) : (
+          <p className="whitespace-pre-wrap text-neutral-100">
+            {answerText}
+            {status === "streaming" && (
+              <motion.span
+                className="ml-0.5 inline-block h-4 w-[2px] translate-y-0.5 bg-indigo-400"
+                animate={{ opacity: [1, 0.2, 1] }}
+                transition={{ duration: 1, repeat: Infinity }}
+              />
+            )}
+          </p>
+        )}
+      </div>
     </div>
   );
 }
