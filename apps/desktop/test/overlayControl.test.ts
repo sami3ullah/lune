@@ -20,6 +20,39 @@ describe("OverlayEventSchema", () => {
     expect(OverlayEventSchema.parse({ type: "activity-end" }).type).toBe("activity-end");
   });
 
+  it("accepts a word-by-word caption (and an empty word list to clear it)", () => {
+    expect(
+      OverlayEventSchema.parse({ type: "caption", id: "caption-1", words: ["Here", "you"] }),
+    ).toEqual({ type: "caption", id: "caption-1", words: ["Here", "you"] });
+    expect(
+      OverlayEventSchema.safeParse({ type: "caption", id: "", words: [] }).success,
+    ).toBe(true);
+    expect(OverlayEventSchema.safeParse({ type: "caption", id: "caption-1" }).success).toBe(false);
+    expect(OverlayEventSchema.safeParse({ type: "caption", words: ["hi"] }).success).toBe(false);
+  });
+
+  it("accepts the listening + thinking events", () => {
+    expect(OverlayEventSchema.parse({ type: "listen-start" }).type).toBe("listen-start");
+    expect(OverlayEventSchema.parse({ type: "listen-level", level: 0.5 }).type).toBe("listen-level");
+    expect(OverlayEventSchema.parse({ type: "listen-end" }).type).toBe("listen-end");
+    expect(OverlayEventSchema.parse({ type: "thinking-start" }).type).toBe("thinking-start");
+    expect(OverlayEventSchema.parse({ type: "thinking-end" }).type).toBe("thinking-end");
+  });
+
+  it("accepts the cursor-follow events", () => {
+    expect(
+      OverlayEventSchema.parse({ type: "cursor-move", position: { localX: 12, localY: 34 } }),
+    ).toEqual({ type: "cursor-move", position: { localX: 12, localY: 34 } });
+    expect(OverlayEventSchema.parse({ type: "cursor-leave" }).type).toBe("cursor-leave");
+  });
+
+  it("rejects a cursor-move missing its position", () => {
+    expect(OverlayEventSchema.safeParse({ type: "cursor-move" }).success).toBe(false);
+    expect(
+      OverlayEventSchema.safeParse({ type: "cursor-move", position: { localX: 1 } }).success,
+    ).toBe(false);
+  });
+
   it("allows an empty answer delta but requires the field to be a string", () => {
     expect(OverlayEventSchema.safeParse({ type: "answer-delta", text: "" }).success).toBe(true);
     expect(OverlayEventSchema.safeParse({ type: "answer-delta" }).success).toBe(false);

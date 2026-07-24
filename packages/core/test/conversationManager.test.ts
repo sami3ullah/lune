@@ -127,6 +127,43 @@ describe("conversationManager.submitUserTurn", () => {
     expect(manager.getMessages()).toEqual([]);
   });
 
+  it("keeps an interrupted (aborted) turn in history so a follow-up merges its context", async () => {
+    // Barge-in: the signal aborts mid-stream and the stream throws. Unlike a failure, an
+    // interruption is deliberate - the user is adding to the conversation - so the partial
+    // turn (their utterance + whatever streamed) is kept for the next turn to build on.
+    const controller = new AbortController();
+    const interrupted: ReasoningCapability = {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      async *streamChat(_request: CoreChatRequest): AsyncGenerator<CoreChatStreamEvent> {
+        yield { type: "text-delta", text: "Let me look at" };
+        controller.abort();
+        throw new Error("aborted");
+      },
+    };
+    const manager = createConversationManager({
+      reasoningCapability: interrupted,
+      generateMessageId: sequentialIds(),
+    });
+
+    await expect(
+      drain(
+        manager.submitUserTurn({
+          text: "what's on my screen",
+          inputMethod: "voice",
+          screenshots: [],
+          signal: controller.signal,
+        }),
+      ),
+    ).rejects.toThrow("aborted");
+
+    // The interrupted turn is retained (merge-on-interrupt), so the next turn's context
+    // includes both what the user said and the partial reply.
+    expect(manager.getMessages()).toEqual([
+      { id: "m1", role: "user", inputMethod: "voice", text: "what's on my screen" },
+      { id: "m2", role: "assistant", text: "Let me look at" },
+    ]);
+  });
+
   it("keeps history alternating after a failed turn is retried successfully", async () => {
     // First turn fails, second succeeds: the succeeding turn must not carry the failed
     // turn's messages, so its request starts fresh with just the new question.

@@ -145,7 +145,13 @@ export function createNodeWhisperRuntime(options: NodeWhisperRuntimeOptions): {
       signal: AbortSignal.timeout(TRANSCRIBE_TIMEOUT_MS),
     });
     if (!response.ok) {
-      throw new Error(`whisper-server transcription failed: HTTP ${response.status}`);
+      // Include the server's own message: whisper-server returns a short reason in the
+      // body on a 400 (e.g. it couldn't read the audio), which is what actually pins down
+      // the cause rather than a bare status code.
+      const body = (await response.text().catch(() => "")).trim();
+      throw new Error(
+        `whisper-server transcription failed: HTTP ${response.status}${body ? ` - ${body}` : ""}`,
+      );
     }
     const payload = (await response.json()) as { text?: unknown };
     return { text: typeof payload.text === "string" ? payload.text.trim() : "" };

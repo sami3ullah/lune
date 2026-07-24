@@ -46,6 +46,39 @@ describe("resolveWhisperServerBinaryPath", () => {
     expect(resolved).toBeUndefined();
   });
 
+  it("falls back to the repo's locally-built binary in dev when it exists", () => {
+    const resolved = resolveWhisperServerBinaryPath({
+      isPackaged: false,
+      resourcesPath: "/unused/in/dev",
+      envOverride: undefined,
+      devFallbackBinaryPath: "/repo/build/whisper-server",
+      fileExists: (candidatePath) => candidatePath === "/repo/build/whisper-server",
+    });
+    expect(resolved).toBe("/repo/build/whisper-server");
+  });
+
+  it("ignores the dev fallback when the binary has not been built", () => {
+    const resolved = resolveWhisperServerBinaryPath({
+      isPackaged: false,
+      resourcesPath: "/unused/in/dev",
+      envOverride: undefined,
+      devFallbackBinaryPath: "/repo/build/whisper-server",
+      fileExists: () => false,
+    });
+    expect(resolved).toBeUndefined();
+  });
+
+  it("prefers the env override over the dev fallback", () => {
+    const resolved = resolveWhisperServerBinaryPath({
+      isPackaged: false,
+      resourcesPath: "/unused/in/dev",
+      envOverride: "/custom/whisper-server",
+      devFallbackBinaryPath: "/repo/build/whisper-server",
+      fileExists: () => true,
+    });
+    expect(resolved).toBe("/custom/whisper-server");
+  });
+
   it("treats a blank env override as unset", () => {
     expect(
       resolveWhisperServerBinaryPath({ isPackaged: false, resourcesPath: "/x", envOverride: "   " }),

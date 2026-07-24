@@ -242,7 +242,49 @@ function ReasoningSection({
   );
 }
 
-/** The Kokoro Voice picker (all 54). */
+/**
+ * The accent each Kokoro voice-code language prefix maps to (the first letter of the
+ * `<lang><gender>_<name>` code, e.g. the "a" in "af_bella").
+ */
+const VOICE_ACCENTS: Record<string, string> = {
+  a: "American",
+  b: "British",
+  j: "Japanese",
+  z: "Mandarin",
+  e: "Spanish",
+  f: "French",
+  h: "Hindi",
+  i: "Italian",
+  p: "Portuguese",
+};
+
+/** A friendly label + gender/accent for one Kokoro voice code (e.g. "af_bella"). */
+function describeVoice(code: string): {
+  code: string;
+  label: string;
+  /** "f" or "m" - females sort first. */
+  gender: string;
+  accent: string;
+  name: string;
+} {
+  const [prefix = "", rawName = ""] = code.split("_");
+  const accent = VOICE_ACCENTS[prefix[0] ?? ""] ?? "Other";
+  const gender = prefix[1] === "m" ? "m" : "f";
+  const name = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+  return {
+    code,
+    label: `${name} - ${accent} ${gender === "m" ? "Male" : "Female"}`,
+    gender,
+    accent,
+    name,
+  };
+}
+
+/**
+ * The Kokoro Voice picker (all 54), shown with friendly full names ("Bella - American
+ * Female") rather than raw codes, and ordered females first then males (then by accent
+ * and name) so the list is easy to scan.
+ */
 function VoiceSection({
   voices,
   voice,
@@ -252,6 +294,17 @@ function VoiceSection({
   voice: string;
   onSelectVoice: (voice: string) => void;
 }) {
+  const orderedVoices = voices
+    .map(describeVoice)
+    .sort((a, b) => {
+      if (a.gender !== b.gender) {
+        return a.gender === "f" ? -1 : 1;
+      }
+      if (a.accent !== b.accent) {
+        return a.accent.localeCompare(b.accent);
+      }
+      return a.name.localeCompare(b.name);
+    });
   return (
     <Section title="Voice">
       <select
@@ -259,9 +312,9 @@ function VoiceSection({
         onChange={(event) => onSelectVoice(event.target.value)}
         className="app-no-drag w-full cursor-pointer rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-neutral-100 focus:border-white/25 focus:outline-none"
       >
-        {voices.map((name) => (
-          <option key={name} value={name} className="bg-neutral-900">
-            {name}
+        {orderedVoices.map(({ code, label }) => (
+          <option key={code} value={code} className="bg-neutral-900">
+            {label}
           </option>
         ))}
       </select>

@@ -22,6 +22,10 @@ export const SPEECH_EVENT_CHANNEL = "lune:speech:event";
  * `sequence` order, then exactly one `turn-complete` once no more clips are coming, so
  * the player can return to idle after the queue drains. `stop` clears the queue and
  * halts playback at once, regardless of turn.
+ *
+ * Each `clip` also carries the sentence it speaks (`text`), which the Pill shows as a
+ * single caption line while that clip plays - so the answer appears in the Pill in time
+ * with the voice, one line at a time (empty when the streaming-text setting is off).
  */
 export const SpeechEventSchema = z.discriminatedUnion("type", [
   z.object({
@@ -34,6 +38,8 @@ export const SpeechEventSchema = z.discriminatedUnion("type", [
     audioBase64: z.string().min(1),
     /** The clip's MIME type, e.g. `audio/wav`. */
     contentType: z.string().min(1),
+    /** The sentence this clip speaks, shown as the Pill caption while it plays ("" = no caption). */
+    text: z.string(),
   }),
   z.object({
     type: z.literal("turn-complete"),

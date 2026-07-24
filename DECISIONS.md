@@ -43,7 +43,7 @@ The raw material for the specs, tickets, and ADRs (which the owner writes). Each
 ## Interaction
 
 21. **Push-to-talk kept verbatim from v1:** hold ctrl+option to talk, release to send; batch transcription on release; barge-in on hotkey during playback. **All hotkeys configurable in Settings**; no wake word; no toggle-to-talk. Recording indicated on Pill and Overlay.
-22. **Onboarding flow:** Welcome (download silently starts) -> Keys (mandatory; at least one Vendor; live-validated; "get a key" links) -> Permissions (mic + screen recording, live-detected; Accessibility deferred to first Screen Agent run in M2) -> Download progress with tutorial cards -> ready moment. Text chat unlocks after the permissions step, before the download finishes.
+22. **Onboarding flow:** Welcome (download silently starts) -> Keys (mandatory; at least one Vendor; live-validated; "get a key" links) -> Permissions (mic + screen recording + Accessibility, all live-detected) -> Download progress with tutorial cards -> ready moment. Text chat unlocks after the permissions step, before the download finishes. **Accessibility is granted in M1 onboarding** (revised): the global push-to-talk hook (uiohook) needs it to catch the hotkey while any app has focus, so hold-to-talk is a first-class M1 feature and its permission belongs in first-run - not deferred to M2. The hook is never started while untrusted (that would pop the system pane unprompted); the permissions step is the one place Lune asks. M2's Screen Agent then reuses the same already-granted Accessibility for synthetic input.
 23. **Backlog delight:** Farza-style intro video that rides along the cursor (small ~400x600 video following the pointer) - post-M1 Overlay ticket.
 
 ## First ticket

@@ -119,19 +119,19 @@ const ANTHROPIC_VENDOR: ReasoningVendor = {
 };
 
 /**
- * Google Gemini over its OpenAI-compatible endpoint. The default is the
- * `gemini-flash-latest` alias, which Google keeps pointed at the current flash model
- * (the cheapest daily driver, per the Vendor decision), so the out-of-box choice keeps
- * working across Google's frequent model deprecations rather than 404-ing when a pinned
- * version is retired (as `gemini-2.5-flash` was, ahead of schedule, in July 2026). The
- * shortlist offers a pinned flash and the pro alias for users who want to pick explicitly.
+ * Google Gemini over its OpenAI-compatible endpoint. The default is
+ * `gemini-3.5-flash-lite`, the cheapest, fastest daily driver in the flash family - the
+ * out-of-box choice favours a snappy, low-cost first run. The shortlist also offers the
+ * `gemini-flash-latest` alias (which Google keeps pointed at the current flash model, so
+ * it survives Google's frequent deprecations), a pinned flash, and the pro alias for
+ * users who want to pick explicitly.
  */
 const GOOGLE_VENDOR: ReasoningVendor = createOpenAiCompatibleVendor({
   id: "google",
   displayName: "Google Gemini",
   chatCompletionsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-  defaultModel: "gemini-flash-latest",
-  modelShortlist: ["gemini-flash-latest", "gemini-3.5-flash", "gemini-pro-latest"],
+  defaultModel: "gemini-3.5-flash-lite",
+  modelShortlist: ["gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.5-flash", "gemini-pro-latest"],
 });
 
 /** OpenAI over its chat-completions endpoint. */

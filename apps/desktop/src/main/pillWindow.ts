@@ -1,32 +1,28 @@
 import { join } from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
-import { app, BrowserWindow, ipcMain, screen } from "electron";
+import { BrowserWindow, ipcMain, screen } from "electron";
 import { PILL_RESIZE_CHANNEL, PillContentSizeSchema } from "../ipc/pillControl";
 import {
-  anchorFromBounds,
   boundsForAnchor,
   clampAnchor,
   defaultAnchor,
   type PillAnchor,
-  type PillRect,
   type PillSize,
 } from "./pillGeometry";
-import { PillPositionStore } from "./pillPositionStore";
 
 // The Pill is Lune's home surface (ticket 04): a thin, always-on-top, frameless
-// window floating top-center under the notch/menu bar, on every Space and above
+// window fixed top-center directly under the notch/menu bar, on every Space and above
 // full-screen-ish contexts, with no dock icon or app-switcher entry. It is the one
 // window the Shell shows in M1; the Chat Panel and Overlay are their own windows in
 // later tickets.
 //
 // The window is sized to its content and kept there: it starts collapsed (just the
 // bar), and the renderer reports its measured size whenever it expands into the
-// hover menu or collapses back. Sizing to content means the transparent window
-// never leaves an invisible region around the pill to swallow clicks meant for the
-// apps behind it. Growth is anchored to the pill's top-center so the bar stays put
-// while the menu unfolds downward.
+// menu or collapses back. Sizing to content means the transparent window never leaves
+// an invisible region around the pill to swallow clicks meant for the apps behind it.
+// Growth is anchored to the pill's top-center so the bar stays put while the menu
+// unfolds downward. The pill is not draggable - it always sits at its home position.
 
-/** How far below the menu bar/notch the pill sits by default, in logical pixels. */
+/** How far below the menu bar/notch the pill sits, in logical pixels (right under the notch). */
 const DEFAULT_TOP_MARGIN = 8;
 
 /**
@@ -34,12 +30,9 @@ const DEFAULT_TOP_MARGIN = 8;
  * only needs to be close enough to avoid a visible jump on first paint; the
  * renderer corrects it on mount.
  */
-const INITIAL_COLLAPSED_SIZE: PillSize = { width: 168, height: 40 };
+const INITIAL_COLLAPSED_SIZE: PillSize = { width: 120, height: 44 };
 
-/** Debounce for persisting a drag so a flick of moves becomes one write. */
-const POSITION_SAVE_DEBOUNCE_MS = 300;
-
-/** The work area of the display the pill currently sits on (handles external monitors). */
+/** The work area of the display the pill sits on (the primary display, under its notch). */
 function workAreaAt(anchor: PillAnchor) {
   return screen.getDisplayNearestPoint({ x: Math.round(anchor.x), y: Math.round(anchor.y) })
     .workArea;
@@ -52,18 +45,11 @@ function workAreaAt(anchor: PillAnchor) {
  * address it directly (e.g. streaming Kokoro speech clips to the Pill's audio output).
  */
 export function createPillWindow(): BrowserWindow {
-  const positionStore = new PillPositionStore(
-    join(app.getPath("userData"), "pill-position.json"),
-    (filePath) => readFileSync(filePath, "utf8"),
-    (filePath, contents) => writeFileSync(filePath, contents),
-  );
-
-  // The anchor (pill top-center) is the single source of truth for placement. Start
-  // from the saved position, falling back to top-center of the primary display, and
-  // clamp so a stale saved anchor (display since unplugged) can never strand the
-  // pill off-screen.
+  // The anchor (pill top-center) is the single source of truth for placement. The pill is
+  // fixed, so it always sits at its home: top-center of the primary display, just below the
+  // notch/menu bar. Clamped defensively so an odd work area can never strand it off-screen.
   const primaryWorkArea = screen.getPrimaryDisplay().workArea;
-  let anchor = positionStore.load() ?? defaultAnchor(primaryWorkArea, DEFAULT_TOP_MARGIN);
+  let anchor = defaultAnchor(primaryWorkArea, DEFAULT_TOP_MARGIN);
   let currentSize: PillSize = INITIAL_COLLAPSED_SIZE;
   anchor = clampAnchor(anchor, currentSize, workAreaAt(anchor));
 
@@ -72,9 +58,20 @@ export function createPillWindow(): BrowserWindow {
     show: false,
     frame: false,
     transparent: true,
+    // Fully transparent backing from the first frame. Without an explicit
+    // transparent backgroundColor, macOS paints the window's default (opaque) fill
+    // until the window is first focused, showing a pale rounded-rect border around
+    // the pill that only clears on the first click. "#00000000" removes it outright.
+    backgroundColor: "#00000000",
+    // No macOS rounded-corner treatment: the pill's own `rounded-full` CSS defines its
+    // shape, and the window's system rounded corners would otherwise show as a pale
+    // hairline arc on each side of the transparent window (visible until first focus).
+    roundedCorners: false,
     resizable: false,
-    // The pill is draggable via a CSS app-region on the bar; `movable` lets that
-    // OS-level drag reposition the window.
+    // `movable` stays true so our own `setBounds` re-centres reliably as the window grows
+    // for the menu and shrinks back (a non-movable window can drop the x change and leave
+    // the pill shifted). The user still can't drag it: there is no drag region anywhere,
+    // so there is no handle to grab - the bar is a plain click target.
     movable: true,
     hasShadow: false,
     // A background companion: no taskbar/dock entry, never stealing focus when it
@@ -84,6 +81,10 @@ export function createPillWindow(): BrowserWindow {
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
       sandbox: false,
+      // Push-to-talk mic capture starts from a global OS hotkey, not a page gesture, so
+      // waive the autoplay gesture requirement - otherwise the capture AudioContext stays
+      // suspended and the recorded clip comes back empty (whisper then 400s).
+      autoplayPolicy: "no-user-gesture-required",
     },
   });
 
@@ -101,23 +102,16 @@ export function createPillWindow(): BrowserWindow {
     void pillWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
 
-  // The last bounds we set ourselves (a hover resize), used to tell our own moves
-  // apart from a user drag. A boolean flag is unreliable here: macOS emits `move`
-  // asynchronously after `setBounds`, by which point a flag would already be reset.
-  // Comparing the moved-to bounds against the ones we last applied is robust to that
-  // timing - a user drag lands the window somewhere we did not put it.
-  let lastAppliedBounds: PillRect | null = null;
-
-  function boundsEqual(a: PillRect, b: PillRect): boolean {
-    return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
-  }
-
+  // Keep the pill anchored at its top-center home while the window resizes to the
+  // renderer's measured content, so the menu grows downward from a stationary bar and the
+  // bar stays put horizontally as the menu widens/narrows the window.
   function applyBounds(): void {
-    // Re-clamp against the display the pill is on so a resize near an edge (menu
-    // unfolding past the screen bottom) nudges the whole window back into view.
-    anchor = clampAnchor(anchor, currentSize, workAreaAt(anchor));
-    lastAppliedBounds = boundsForAnchor(anchor, currentSize);
-    pillWindow.setBounds(lastAppliedBounds);
+    // Clamp only the placement used for this resize - never mutate the home `anchor`
+    // itself. Mutating it let a clamp at the wide (menu-open) size stick, so closing the
+    // menu re-placed the pill off-centre (it drifted left). Keeping `anchor` pristine means
+    // every resize re-centres on the exact same home point.
+    const placed = clampAnchor(anchor, currentSize, workAreaAt(anchor));
+    pillWindow.setBounds(boundsForAnchor(placed, currentSize));
   }
 
   // Resize the window to whatever the renderer measured, keeping the pill's
@@ -133,41 +127,8 @@ export function createPillWindow(): BrowserWindow {
   }
   ipcMain.on(PILL_RESIZE_CHANNEL, handleResize);
 
-  // The user dragged the pill: recover the new anchor from the window's bounds,
-  // clamp it, and persist (debounced) so the position survives a restart. Moves to
-  // bounds we set ourselves (hover resize) are ignored.
-  let saveTimer: ReturnType<typeof setTimeout> | undefined;
-  function persistAnchor(): void {
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = undefined;
-    }
-    positionStore.save(anchor);
-  }
-  function handleUserMove(): void {
-    const bounds = pillWindow.getBounds();
-    if (lastAppliedBounds && boundsEqual(bounds, lastAppliedBounds)) {
-      return;
-    }
-    // Clamp against the display the pill was dragged ONTO (derived from the new
-    // bounds), not the one it left - otherwise a drag to a second monitor is
-    // confined to the old monitor's work area and snaps back (user stories 16 & 14).
-    const draggedAnchor = anchorFromBounds(bounds);
-    anchor = clampAnchor(draggedAnchor, currentSize, workAreaAt(draggedAnchor));
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-    }
-    saveTimer = setTimeout(persistAnchor, POSITION_SAVE_DEBOUNCE_MS);
-  }
-  pillWindow.on("move", handleUserMove);
-
   pillWindow.on("closed", () => {
     ipcMain.removeListener(PILL_RESIZE_CHANNEL, handleResize);
-    // Flush a pending debounced save synchronously: a drag immediately followed by
-    // Quit (within the debounce window) must still persist that final position.
-    if (saveTimer) {
-      persistAnchor();
-    }
   });
 
   return pillWindow;

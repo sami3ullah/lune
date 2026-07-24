@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { CaptionData } from "./caption";
 
 // The Overlay's interaction state (ticket 07). One Overlay window per display runs
 // this store; the main process drives it over IPC (activity, streamed answer text, a
@@ -37,6 +38,19 @@ interface OverlayState {
   listening: boolean;
   /** The latest mic input level (0..1) while listening, driving the waveform's height. */
   listeningLevel: number;
+  /**
+   * Whether Lune is transcribing/reasoning between the hotkey release and the first
+   * streamed answer (v1 processing parity). While true the Overlay shows a loading
+   * spinner at the cursor so the user knows work is happening; the answer supersedes it.
+   */
+  thinking: boolean;
+  /**
+   * The caption currently shown beside the cursor, revealed word by word in step with the
+   * spoken reply, or `null` when nothing is being captioned. Mirrors the Pill's caption
+   * (the main process forwards the reveal as `caption` events) so the same words read out
+   * by the mouse. Cleared when playback finishes.
+   */
+  caption: CaptionData | null;
 
   /** Begins an interaction: clears the previous answer/target and shows the cursor. */
   beginInteraction: () => void;
@@ -56,6 +70,12 @@ interface OverlayState {
   setListeningLevel: (level: number) => void;
   /** Ends listening (the hotkey was released); the waveform gives way to the answer. */
   endListening: () => void;
+  /** Shows the loading spinner at the cursor while transcribing/reasoning (also clears any waveform). */
+  beginThinking: () => void;
+  /** Hides the loading spinner (the answer has begun, or the turn ended). */
+  endThinking: () => void;
+  /** Sets the caption shown beside the cursor (`null`/empty words clears it). */
+  setCaption: (caption: CaptionData | null) => void;
 }
 
 export const useOverlayStore = create<OverlayState>((set) => ({
@@ -65,16 +85,26 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   showStreamingText: true,
   listening: false,
   listeningLevel: 0,
+  thinking: false,
+  caption: null,
 
-  // Starting an answer also clears any lingering listening waveform, so the surface
-  // switches cleanly from "hearing you" to "answering".
+  // Starting an answer clears any lingering listening waveform, but deliberately keeps the
+  // thinking spinner up: reasoning has begun, yet Lune is still "working" until it actually
+  // starts speaking (text -> speech synthesis takes a beat). The spinner is cleared when the
+  // first spoken word arrives (the `caption` event) or a pointing flight starts, so the
+  // loading indicator covers the whole gap instead of stopping early and looking hung.
   beginInteraction: () => set({ phase: "active", answerText: "", pointTarget: null, listening: false }),
   appendAnswer: (text) => set((state) => ({ answerText: state.answerText + text })),
   setPointTarget: (target) => set({ pointTarget: target }),
   endInteraction: () => set({ phase: "ending" }),
-  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0 }),
+  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0, thinking: false, caption: null }),
   setShowStreamingText: (showStreamingText) => set({ showStreamingText }),
   beginListening: () => set({ listening: true, listeningLevel: 0 }),
   setListeningLevel: (listeningLevel) => set({ listeningLevel }),
   endListening: () => set({ listening: false, listeningLevel: 0 }),
+  // Thinking begins the moment listening ends, so drop any residual waveform state too.
+  beginThinking: () => set({ thinking: true, listening: false, listeningLevel: 0 }),
+  endThinking: () => set({ thinking: false }),
+  // An empty word list clears the caption (playback finished / stopped).
+  setCaption: (caption) => set({ caption: caption !== null && caption.words.length > 0 ? caption : null }),
 }));

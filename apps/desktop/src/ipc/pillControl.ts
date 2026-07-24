@@ -28,3 +28,21 @@ export type PillContentSize = z.infer<typeof PillContentSizeSchema>;
  * whisper child process teardown joins this path when that Capability lands).
  */
 export const APP_QUIT_CHANNEL = "lune:app:quit";
+
+/**
+ * Renderer(Pill) -> main: the caption the Pill is currently speaking changed. The Pill
+ * owns Kokoro playback, so only it knows a sentence's audio timing; it reveals that
+ * sentence word by word in step with the voice and reports the words revealed so far
+ * here, and the main process mirrors them onto the Overlay so the same reveal also plays
+ * beside the cursor. `id` identifies the sentence (it changes per sentence, so the reveal
+ * restarts cleanly); an empty `words` array clears the caption (playback finished/stopped).
+ */
+export const PILL_CAPTION_CHANNEL = "lune:pill:caption";
+
+export const PillCaptionSchema = z.object({
+  /** Identity of the sentence being spoken; changes per sentence so the reveal restarts. */
+  id: z.string(),
+  /** The words of the current sentence revealed so far, in order; empty clears the caption. */
+  words: z.array(z.string()),
+});
+export type PillCaption = z.infer<typeof PillCaptionSchema>;

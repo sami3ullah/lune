@@ -23,6 +23,14 @@ const CAPTURE_BUFFER_SIZE = 1024;
 /** Scales RMS amplitude to a 0..1 waveform level; speech rarely approaches full-scale. */
 const LEVEL_GAIN = 4;
 
+/**
+ * The peak level a recording must reach to count as speech. Below this the clip is treated
+ * as silence and never transcribed (whisper would only hallucinate a phrase from silence -
+ * "thank you", "you're welcome" - which then gets answered). Real speech clears this
+ * easily; only true silence / a barely-open mic falls under it.
+ */
+const SPEECH_PEAK_LEVEL_THRESHOLD = 0.06;
+
 /** The live capture graph for one recording, held in a ref so it survives re-renders. */
 interface ActiveRecording {
   turnId: string;
@@ -33,6 +41,8 @@ interface ActiveRecording {
   /** Captured mono float chunks, concatenated into the WAV on stop. */
   chunks: Float32Array[];
   sampleRate: number;
+  /** The loudest input level (0..1) seen during the recording, to tell speech from silence. */
+  peakLevel: number;
 }
 
 /**
@@ -172,6 +182,7 @@ export function useVoiceRecording(): void {
         processorNode,
         chunks: [],
         sampleRate: audioContext.sampleRate,
+        peakLevel: 0,
       };
 
       processorNode.onaudioprocess = (event) => {
@@ -185,6 +196,7 @@ export function useVoiceRecording(): void {
         }
         const rms = Math.sqrt(sumOfSquares / input.length);
         const level = Math.min(1, rms * LEVEL_GAIN);
+        recording.peakLevel = Math.max(recording.peakLevel, level);
         window.lune.voice.sendRecordEvent({ type: "level", turnId, level });
         // Emit silence downstream: the node must be connected to run, but the mic must
         // never be echoed to the speakers.
@@ -194,6 +206,12 @@ export function useVoiceRecording(): void {
 
       sourceNode.connect(processorNode);
       processorNode.connect(audioContext.destination);
+      // Push-to-talk is driven by a global OS hotkey, not a DOM gesture, so Chromium's
+      // autoplay policy can leave a freshly-created AudioContext "suspended" - the
+      // processor never fires and the clip comes back empty (whisper then rejects it with
+      // HTTP 400). Resume it explicitly so capture starts regardless of how it was
+      // triggered. Fire-and-forget so a stop arriving mid-resume is never lost.
+      void audioContext.resume().catch(() => {});
       recordingRef.current = recording;
 
       // A stop that arrived while the mic prompt was still open finalizes now that the
@@ -223,6 +241,14 @@ export function useVoiceRecording(): void {
         samples.set(chunk, offset);
         offset += chunk.length;
       }
+      // Nothing was captured, or the clip never rose above the silence floor: don't send it
+      // to whisper (which would either 400 on empty audio or hallucinate a phrase from
+      // silence). Report `silent` so the loop can give the user a friendly nudge instead.
+      if (totalLength === 0 || recording.peakLevel < SPEECH_PEAK_LEVEL_THRESHOLD) {
+        window.lune.voice.sendRecordEvent({ type: "silent", turnId });
+        return;
+      }
+
       const wav = encodeWav(samples, recording.sampleRate);
       window.lune.voice.sendRecordEvent({ type: "clip", turnId, audioBase64: bytesToBase64(wav) });
     };

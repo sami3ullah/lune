@@ -7,12 +7,18 @@ import { MicAccessSection } from "./MicAccessSection";
 import { useSpeechPlayback } from "./useSpeechPlayback";
 import { useVoiceRecording } from "./useVoiceRecording";
 
-// The Pill: Lune's home surface (ticket 04). A thin always-on-top bar that expands
-// into its menu on hover. The window is frameless and transparent and sized to this
+// The Pill: Lune's home surface (ticket 04). A thin always-on-top bar, fixed in place,
+// that expands into its menu on click. The window is frameless
+// and transparent and sized to this
 // content by the main process, so the layout here is what the user sees floating
 // over their desktop - nothing more. The Chat Panel (ticket 06) and Settings (ticket
 // 13) menu targets open their windows; voice/reasoning/speech will later drive the
 // state indicator, and a dev control drives it until then.
+//
+// While *Lune* is speaking, the pill's content is replaced by just the voice waveform (no
+// "Lune" label). The spoken reply's text is NOT shown here; it reveals only beside the
+// cursor on the Overlay. When the user is being heard (push-to-talk), the pill keeps its
+// normal state dot + label - no waveform for the user's own voice.
 
 const IS_DEV = import.meta.env.DEV;
 
@@ -21,6 +27,32 @@ export function Pill() {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const indicatorState = usePillStore((state) => state.indicatorState);
   const setIndicatorState = usePillStore((state) => state.setIndicatorState);
+  // Lune is speaking: the pill collapses to just the waveform. The reply text itself shows
+  // only at the cursor, never in the pill. (The user's own voice does NOT show a waveform.)
+  const speaking = indicatorState === "speaking";
+
+  // The pill is fixed in place (not draggable) and opens its menu on click. The bar is a
+  // normal (no-drag) element so the click reliably registers - a `-webkit-app-region: drag`
+  // region would swallow the DOM pointer events, which is why the old hover/click never
+  // fired until a right-click jolted it.
+  const toggleMenu = useCallback(() => setMenuOpen((open) => !open), []);
+
+  // Close the menu when the pill loses focus (the user clicked away to another app) or on
+  // Escape, so it never stays stuck open once attention has moved elsewhere.
+  useEffect(() => {
+    const closeMenu = (): void => setMenuOpen(false);
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+      }
+    };
+    window.addEventListener("blur", closeMenu);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("blur", closeMenu);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
 
   // The Pill owns Lune's audio output: it plays the Kokoro speech clips the main
   // process streams over IPC and drives the "speaking" state while they play (ticket 09).
@@ -40,7 +72,7 @@ export function Pill() {
   );
 
   // The main process sizes the frameless window to whatever we render, so it must
-  // learn the current content size: on first paint, on every hover expand, and -
+  // learn the current content size: on first paint, on every menu expand, and -
   // via the menu's exit-complete - once it has collapsed back. Measuring the wrapper
   // (which the transform-based menu animation never resizes) keeps the window exactly
   // as large as the visible pill, leaving no invisible region to eat stray clicks.
@@ -56,30 +88,49 @@ export function Pill() {
     });
   }, []);
 
+  // Re-measure whenever the menu opens/closes AND whenever the pill's content switches
+  // between the "Lune" label and the speaking waveform, so the frameless window resizes to
+  // match with no dead click region.
   useLayoutEffect(() => {
     reportContentSize();
-  }, [menuOpen, reportContentSize]);
+  }, [menuOpen, speaking, reportContentSize]);
 
   return (
-    <div
-      ref={wrapperRef}
-      className="app-no-drag inline-flex flex-col items-center"
-      onMouseEnter={() => setMenuOpen(true)}
-      onMouseLeave={() => setMenuOpen(false)}
-    >
-      <div className="app-drag flex items-center gap-2 rounded-full border border-white/10 bg-neutral-900/85 px-3 py-1.5 text-neutral-100 shadow-lg shadow-black/40 backdrop-blur-md">
-        <StateIndicator state={indicatorState} />
-        <span className="text-xs font-medium tracking-wide">Lune</span>
-      </div>
+    <div ref={wrapperRef} className="app-no-drag inline-flex flex-col items-center">
+      {/* The chip: solid near-black, no border and no drop shadow (a shadow clipped by the
+          content-sized transparent window reads as a grey box around the pill). Fixed in
+          place; a click toggles the menu with a springy press. It keeps one consistent
+          footprint (min width/height) whether it shows "Lune" or - while Lune is speaking -
+          the green waveform, so the window shape never shrinks toward a square (which let a
+          faint window-edge show around it). Never shows the reply text. */}
+      <motion.div
+        className="app-no-drag flex min-h-[40px] min-w-[96px] cursor-pointer select-none items-center justify-center gap-2 rounded-full bg-neutral-950/95 px-4 py-2.5 text-neutral-100"
+        onClick={toggleMenu}
+        whileTap={{ scale: 0.94 }}
+        transition={{ type: "spring", stiffness: 600, damping: 18 }}
+      >
+        {speaking ? (
+          // While Lune speaks, the green waveform is the pill's whole content. The reply
+          // text never appears here (only at the cursor).
+          <PillVoiceWave color={PILL_VOICE_WAVE_COLOR} prominent />
+        ) : (
+          <>
+            <StateIndicator state={indicatorState} />
+            <span className="text-sm font-medium tracking-wide">Lune</span>
+          </>
+        )}
+      </motion.div>
 
       <AnimatePresence onExitComplete={reportContentSize}>
         {menuOpen && (
+          // The menu: solid black, no glass/backdrop-blur and no drop shadow (same clipped-
+          // box reason as the bar), springing open on click with a lively bounce.
           <motion.div
-            className="mt-1.5 w-52 overflow-hidden rounded-2xl border border-white/10 bg-neutral-900/90 p-1.5 text-neutral-100 shadow-xl shadow-black/50 backdrop-blur-md"
-            initial={{ opacity: 0, y: -6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.16, ease: "easeOut" }}
+            className="mt-2 w-56 origin-top overflow-hidden rounded-2xl bg-neutral-950 p-1.5 text-neutral-100"
+            initial={{ opacity: 0, y: -10, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.9 }}
+            transition={{ type: "spring", stiffness: 520, damping: 24, mass: 0.8 }}
           >
             <MenuButton label="Chat Panel" onClick={() => window.lune.chatPanel.toggle()} />
             <MenuButton label="Settings" onClick={() => window.lune.settings.toggle()} />
@@ -91,6 +142,45 @@ export function Pill() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+/** The pill's waveform colour while Lune speaks - a single warm green. */
+const PILL_VOICE_WAVE_COLOR = "#34d399";
+
+/** The heights each bar cycles through, offset per bar so the row ripples like a voice. */
+const PILL_WAVE_BAR_HEIGHTS = ["4px", "12px", "6px", "11px", "4px"];
+/** A taller cycle for the prominent (pill-filling) waveform when voice is the sole content. */
+const PILL_WAVE_BAR_HEIGHTS_PROMINENT = ["5px", "17px", "9px", "15px", "5px"];
+
+/**
+ * A small animated waveform: a row of bars rising and falling, tinted to the active state.
+ * `prominent` makes it larger with more bars, for when it is the pill's whole content while
+ * a voice is flowing (rather than the compact leading glyph beside the "Lune" label).
+ */
+function PillVoiceWave({ color, prominent = false }: { color: string; prominent?: boolean }) {
+  const bars = prominent ? [0, 1, 2, 3, 4] : [0, 1, 2, 3];
+  const heights = prominent ? PILL_WAVE_BAR_HEIGHTS_PROMINENT : PILL_WAVE_BAR_HEIGHTS;
+  return (
+    <span
+      className={`relative inline-flex items-center justify-center ${prominent ? "h-[17px] gap-[3px]" : "h-3 w-3 gap-[2px]"}`}
+    >
+      {bars.map((barIndex) => (
+        <motion.span
+          key={barIndex}
+          className={`rounded-full ${prominent ? "w-[3px]" : "w-[2px]"}`}
+          style={{ backgroundColor: color, boxShadow: `0 0 6px ${color}` }}
+          animate={{ height: heights }}
+          transition={{
+            duration: 0.9,
+            repeat: Infinity,
+            ease: "easeInOut",
+            // Stagger each bar so the row ripples rather than pulsing in unison.
+            delay: barIndex * 0.12,
+          }}
+        />
+      ))}
+    </span>
   );
 }
 

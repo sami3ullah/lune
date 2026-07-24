@@ -76,12 +76,16 @@ export const useOnboardingStore = create<OnboardingStoreState>((set, get) => ({
     // Start (or resume) the silent background download the moment onboarding opens, so
     // most of the ~2 GB arrives while the user completes the other steps.
     window.lune.onboarding.startDownload();
-    const [download, screen, mic] = await Promise.all([
+    const [download, screen, mic, accessibility] = await Promise.all([
       window.lune.onboarding.downloadStatus(),
       window.lune.screen.getPermissionStatus(),
       window.lune.voice.getMicPermissionStatus(),
+      window.lune.accessibility.getPermissionStatus(),
     ]);
-    const permissionsReady = screen === "granted" && mic === "granted";
+    // Accessibility joins screen + mic as a required M1 permission (it powers the global
+    // push-to-talk hook), so a resume lands on the permissions step until all three are on.
+    const permissionsReady =
+      screen === "granted" && mic === "granted" && accessibility === "granted";
     set({
       loaded: true,
       catalog: snapshot.catalog,

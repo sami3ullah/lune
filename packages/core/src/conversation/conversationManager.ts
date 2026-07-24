@@ -104,13 +104,25 @@ export function createConversationManager(
     yield { type: "user-message", message: userMessage };
     yield { type: "assistant-started", messageId: assistantMessage.id };
 
-    for await (const streamEvent of reasoningCapability.streamChat(request, { signal: input.signal })) {
-      if (streamEvent.type === "text-delta") {
-        assistantMessage.text += streamEvent.text;
-        yield { type: "assistant-delta", messageId: assistantMessage.id, text: streamEvent.text };
+    try {
+      for await (const streamEvent of reasoningCapability.streamChat(request, { signal: input.signal })) {
+        if (streamEvent.type === "text-delta") {
+          assistantMessage.text += streamEvent.text;
+          yield { type: "assistant-delta", messageId: assistantMessage.id, text: streamEvent.text };
+        }
+        // The stream's terminal `done` simply ends the loop.
       }
-      // The stream's terminal `done` simply ends the loop; a failure throws out of it,
-      // skipping the commit below so the turn leaves no trace in history.
+    } catch (streamError) {
+      // A deliberate interruption (Barge-in) is not a failure: the user pressed the
+      // hotkey to add to or redirect the conversation, so keep the interrupted turn -
+      // their utterance plus whatever the assistant managed to say - in committed history.
+      // The next turn is built from that history, so the follow-up merges with, rather
+      // than discards, what was just said. A genuine stream failure (signal not aborted)
+      // still rolls back, leaving history untouched so it never ends on a dangling turn.
+      if (input.signal?.aborted) {
+        committedMessages.push(userMessage, assistantMessage);
+      }
+      throw streamError;
     }
 
     committedMessages.push(userMessage, assistantMessage);

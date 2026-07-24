@@ -52,6 +52,13 @@ export interface VoiceLoopControllerDependencies {
   overlayListenEnd: () => void;
   /** Runs one screen-aware voice turn end-to-end (stream + speak + persist); returns whether it spoke. */
   runVoiceTurn: (request: VoiceTurnRequest) => Promise<VoiceTurnResult>;
+  /**
+   * Gives the user a friendly "I didn't catch that" when a hold produced no discernible
+   * speech (near-silence), instead of transcribing a whisper hallucination and answering
+   * it. Speaks the nudge when Kokoro is ready; returns whether it spoke so the caller
+   * knows who returns the Pill to idle (like a real turn).
+   */
+  announceNoSpeech: () => Promise<VoiceTurnResult>;
   /** Mints unique ids (recording ids, turn ids); injected so tests are deterministic. */
   generateId: () => string;
   /** Decodes the base64 WAV the Pill sends into bytes for the Core. */
@@ -129,6 +136,14 @@ export class VoiceLoopController {
         return;
       case "clip":
         void this.transcribeAndAnswer(event.audioBase64);
+        return;
+      case "silent":
+        // The hold held no discernible speech: nudge the user instead of transcribing a
+        // hallucination. Settle the machine as a no-speech turn, then announce.
+        this.machine.transcribed(false);
+        this.currentRecordingId = null;
+        this.dependencies.overlayListenEnd();
+        void this.announceNoSpeech();
         return;
       case "error":
         // The mic could not be captured (denied, no device): end the interaction cleanly
@@ -226,6 +241,24 @@ export class VoiceLoopController {
       console.error("[lune] voice turn failed:", error);
       if (this.activeTurnAborts.delete(abort)) {
         this.machine.turnEnded();
+        this.dependencies.setPillActivity("idle");
+      }
+    }
+  }
+
+  /** Speaks the friendly "didn't catch that" nudge for a silent hold, then settles idle. */
+  private async announceNoSpeech(): Promise<void> {
+    const generationAtStart = this.generation;
+    try {
+      const result = await this.dependencies.announceNoSpeech();
+      // If a Barge-in moved on, or the nudge spoke (Kokoro playback owns the return to
+      // idle), don't touch the Pill; otherwise settle it here.
+      if (this.generation === generationAtStart && !result.spoke) {
+        this.dependencies.setPillActivity("idle");
+      }
+    } catch (error) {
+      console.error("[lune] no-speech nudge failed:", error);
+      if (this.generation === generationAtStart) {
         this.dependencies.setPillActivity("idle");
       }
     }

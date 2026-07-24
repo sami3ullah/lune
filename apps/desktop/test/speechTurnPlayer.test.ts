@@ -68,7 +68,7 @@ describe("createSpeechTurnPlayer", () => {
     await flushPendingWork();
     // First clip emitted; second sentence now synthesizing.
     expect(events).toEqual([
-      { type: "clip", turnId: "turn-1", sequence: 0, audioBase64: encodeBase64(new Uint8Array([1, 1])), contentType: "audio/wav" },
+      { type: "clip", turnId: "turn-1", sequence: 0, audioBase64: encodeBase64(new Uint8Array([1, 1])), contentType: "audio/wav", text: "" },
     ]);
     expect(calls).toEqual(["One.", "Two."]);
 
@@ -80,7 +80,29 @@ describe("createSpeechTurnPlayer", () => {
       sequence: 1,
       audioBase64: encodeBase64(new Uint8Array([2, 2])),
       contentType: "audio/wav",
+      // Captions default off, so the clip carries no caption text.
+      text: "",
     });
+  });
+
+  it("carries each sentence as the clip's caption text when captions are enabled", async () => {
+    const { speech, resolveNext } = makeGatedSpeech();
+    const events: SpeechEvent[] = [];
+    const player = createSpeechTurnPlayer({
+      speech,
+      turnId: "turn-caption",
+      sendEvent: (event) => events.push(event),
+      encodeBase64,
+      includeCaption: true,
+    });
+
+    player.pushAnswerText("Hello there. ");
+    await flushPendingWork();
+    resolveNext([1]);
+    await flushPendingWork();
+
+    // The spoken sentence rides along as the caption line the Pill shows, trimmed clean.
+    expect(events[0]).toMatchObject({ type: "clip", sequence: 0, text: "Hello there." });
   });
 
   it("flushes the trailing sentence and emits turn-complete after the queue drains", async () => {
@@ -143,5 +165,31 @@ describe("createSpeechTurnPlayer", () => {
 
     expect(errors).toHaveLength(1);
     expect(events).toHaveLength(0);
+  });
+
+  it("stops emitting clips once stopped (Barge-in), so an interrupted turn goes quiet", async () => {
+    const { speech, calls, resolveNext } = makeGatedSpeech();
+    const events: SpeechEvent[] = [];
+    const player = createSpeechTurnPlayer({
+      speech,
+      turnId: "turn-5",
+      sendEvent: (event) => events.push(event),
+      encodeBase64,
+    });
+
+    // Two sentences queued; the first is synthesizing.
+    player.pushAnswerText("First one. Second one. ");
+    await flushPendingWork();
+    expect(calls).toEqual(["First one."]);
+
+    // Interrupted: stop the turn. The in-flight synthesis resolves after the stop, but
+    // its clip must not be emitted, and the queued second sentence is dropped entirely.
+    player.stop();
+    resolveNext([1, 1]);
+    await flushPendingWork();
+
+    expect(events).toEqual([]);
+    // The dropped second sentence is never synthesized.
+    expect(calls).toEqual(["First one."]);
   });
 });

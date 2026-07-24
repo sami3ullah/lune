@@ -48,25 +48,60 @@ export const OverlayPointSchema = z.object({
 export type OverlayPoint = z.infer<typeof OverlayPointSchema>;
 
 /**
- * One Overlay event, main -> a single window. Two interactions share the surface:
+ * Where the real mouse cursor is within this window's display, in logical pixels from
+ * the window's top-left. The main process polls the global cursor position and converts
+ * it into the target window's local space, so the renderer can glue Lune's playful
+ * cursor to the mouse (v1's `followingCursor` mode) without knowing any display geometry.
+ */
+export const OverlayCursorPositionSchema = z.object({
+  localX: z.number(),
+  localY: z.number(),
+});
+export type OverlayCursorPosition = z.infer<typeof OverlayCursorPositionSchema>;
+
+/**
+ * One Overlay event, main -> a single window. Three concerns share the surface:
  *
- * Listening (push-to-talk, ticket 11): `listen-start` fades in a live waveform near the
+ * Following (v1 parity): Lune's playful cursor tracks the real mouse. `cursor-move`
+ * streams the mouse's window-local position each tick to the window on the cursor's
+ * display (so the buddy follows it), and `cursor-leave` tells a window the cursor has
+ * moved to another display (so it stops drawing the following buddy). Only the window
+ * under the cursor draws the following buddy; a pointing flight can still draw on any
+ * display.
+ *
+ * Listening (push-to-talk, ticket 11): `listen-start` shows a live waveform at the
  * cursor while the user holds the hotkey, `listen-level` streams the mic amplitude
  * (0..1) into it, and `listen-end` closes it when the key is released.
  *
- * Answering (ticket 07): `activity-start` fades the cursor in (clearing any previous
- * answer/target), zero or more `answer-delta`s stream the clean answer text into the
- * bubble, an optional `point` flies the cursor to a target, and `activity-end` closes
- * it (after which the window fades out on its inactivity timer). The answer text is
- * already stripped of the Point Tag by the main process, so the bubble only ever shows
- * human-readable text.
+ * Thinking (v1 processing-spinner parity): after the hotkey is released the turn spends
+ * a beat transcribing and reasoning before any answer streams. `thinking-start` shows a
+ * loading spinner right at the cursor so the user knows Lune is working (not just the
+ * Pill's state dot), and `thinking-end` closes it. `activity-start`/`answer-delta`
+ * supersede it visually when the answer begins; `thinking-end` is the guaranteed
+ * safety-net close for turns that end (or fail) before any answer is produced.
+ *
+ * Answering (ticket 07): `activity-start` begins an interaction (clearing any previous
+ * answer/target), zero or more `answer-delta`s stream the clean answer text, an optional
+ * `point` flies the cursor to a target (then it flies back to the mouse and resumes
+ * following), and `activity-end` closes it. The answer text is already stripped of the
+ * Point Tag by the main process, so it is always human-readable.
+ *
+ * Caption: `caption` mirrors the Pill's word-by-word reveal beside the cursor, in step
+ * with the spoken reply (the Pill owns playback timing). `words` is the current sentence
+ * revealed so far and `id` identifies the sentence (so the reveal restarts per sentence),
+ * exactly as in the Pill. An empty `words` array clears it.
  */
 export const OverlayEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("cursor-move"), position: OverlayCursorPositionSchema }),
+  z.object({ type: z.literal("cursor-leave") }),
   z.object({ type: z.literal("listen-start") }),
   z.object({ type: z.literal("listen-level"), level: z.number().min(0).max(1) }),
   z.object({ type: z.literal("listen-end") }),
+  z.object({ type: z.literal("thinking-start") }),
+  z.object({ type: z.literal("thinking-end") }),
   z.object({ type: z.literal("activity-start") }),
   z.object({ type: z.literal("answer-delta"), text: z.string() }),
+  z.object({ type: z.literal("caption"), id: z.string(), words: z.array(z.string()) }),
   z.object({ type: z.literal("point"), point: OverlayPointSchema }),
   z.object({ type: z.literal("activity-end") }),
 ]);

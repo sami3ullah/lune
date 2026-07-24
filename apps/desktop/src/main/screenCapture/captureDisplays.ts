@@ -92,11 +92,14 @@ export interface DisplayCaptureResult {
 }
 
 /**
- * Captures every connected display as a labeled, JPEG-encoded screenshot in the order
- * the model should read them (cursor's display first), plus the geometry mapping each
- * screen number back to its display bounds + captured pixel size. Returns empty arrays
- * if nothing could be captured - the caller then simply runs a text-only turn with no
- * pointing. Never writes to disk; the bytes live only in the returned base64.
+ * Captures the one display the user is actually looking at - the display under the
+ * cursor - as a single labeled, JPEG-encoded screenshot, plus the geometry mapping its
+ * screen number back to its bounds + captured pixel size. Lune answers about the screen
+ * the mouse is on, never narrating every connected monitor at once; on a multi-monitor
+ * setup that means a question about a selection on screen 2 is answered from screen 2,
+ * not screen 1. If the cursor is outside every display, the display nearest it is used.
+ * Returns empty arrays if nothing could be captured - the caller then simply runs a
+ * text-only turn with no pointing. Never writes to disk; the bytes live only in base64.
  */
 export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> {
   const displays = screen.getAllDisplays();
@@ -105,10 +108,14 @@ export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> 
   }
 
   const displayById = new Map(displays.map((display) => [display.id, display]));
-  const cursorDisplayId = resolveCursorDisplayId(displays);
+  // Only the display under the cursor is captured. When the cursor is off every display
+  // (a rare edge), fall back to the display nearest it so the turn still has one screen.
+  const focusDisplayId =
+    resolveCursorDisplayId(displays) ??
+    screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).id;
   const capturePlans = planScreenCaptures(
-    displays.map<DisplayForCapture>((display) => ({ id: display.id })),
-    cursorDisplayId,
+    [{ id: focusDisplayId } satisfies DisplayForCapture],
+    focusDisplayId,
   );
 
   const sources = await desktopCapturer.getSources({

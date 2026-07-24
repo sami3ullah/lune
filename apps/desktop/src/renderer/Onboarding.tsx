@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ONBOARDING_STEPS, useOnboardingStore, type OnboardingStep } from "./onboardingStore";
 import { useScreenAccessStore, type RendererScreenPermissionState } from "./screenAccessStore";
 import { useMicAccessStore, type RendererMicPermissionState } from "./micAccessStore";
+import {
+  useAccessibilityAccessStore,
+  type RendererAccessibilityPermissionState,
+} from "./accessibilityAccessStore";
 import type { SettingsCatalog } from "../ipc/settings";
 import { displayHotkeyToken } from "../ipc/hotkey";
 
@@ -289,27 +293,38 @@ function PermissionsStep() {
   const requestMic = useMicAccessStore((state) => state.request);
   const openMicSettings = useMicAccessStore((state) => state.openSettings);
 
-  // Poll both permissions while this step is open so a grant made in System Settings (or
-  // the screen needs-relaunch tell) shows up live without a restart.
+  const accessibilityState = useAccessibilityAccessStore((state) => state.permissionState);
+  const accessibilityRequesting = useAccessibilityAccessStore((state) => state.isRequesting);
+  const refreshAccessibility = useAccessibilityAccessStore((state) => state.refresh);
+  const requestAccessibility = useAccessibilityAccessStore((state) => state.request);
+  const openAccessibilitySettings = useAccessibilityAccessStore((state) => state.openSettings);
+
+  // Poll all three permissions while this step is open so a grant made in System Settings
+  // (or the screen needs-relaunch tell) shows up live without a restart. The Accessibility
+  // poll is also what tells the main process to start the push-to-talk hook the moment the
+  // user enables it.
   useEffect(() => {
     void refreshScreen();
     void refreshMic();
+    void refreshAccessibility();
     const timer = setInterval(() => {
       void refreshScreen();
       void refreshMic();
+      void refreshAccessibility();
     }, PERMISSION_POLL_MS);
     return () => clearInterval(timer);
-  }, [refreshScreen, refreshMic]);
+  }, [refreshScreen, refreshMic, refreshAccessibility]);
 
   return (
     <StepLayout
       body={
         <div className="space-y-4">
           <div>
-            <h1 className="text-lg font-semibold text-neutral-50">Grant two permissions</h1>
+            <h1 className="text-lg font-semibold text-neutral-50">Grant three permissions</h1>
             <p className="mt-2 text-sm leading-relaxed text-neutral-400">
-              Lune needs your screen to answer about what you see, and your mic to hear you. You can
-              always change these later in System Settings.
+              Lune needs your screen to answer about what you see, your mic to hear you, and
+              accessibility to catch your push-to-talk hotkey anywhere. You can always change these
+              later in System Settings.
             </p>
           </div>
 
@@ -325,6 +340,12 @@ function PermissionsStep() {
             requesting={micRequesting}
             onRequest={() => void requestMic()}
             onOpenSettings={openMicSettings}
+          />
+          <AccessibilityPermissionCard
+            state={accessibilityState}
+            requesting={accessibilityRequesting}
+            onRequest={() => void requestAccessibility()}
+            onOpenSettings={openAccessibilitySettings}
           />
         </div>
       }
@@ -493,6 +514,56 @@ function MicPermissionCard({
             onClick={onRequest}
             disabled={requesting}
           />
+        )
+      }
+    />
+  );
+}
+
+const ACCESSIBILITY_PRESENTATION: Record<
+  RendererAccessibilityPermissionState,
+  { dot: string; label: string }
+> = {
+  unknown: { dot: "bg-neutral-500", label: "Checking…" },
+  granted: { dot: "bg-emerald-400", label: "On" },
+  "not-granted": { dot: "bg-amber-400", label: "Needed" },
+};
+
+function AccessibilityPermissionCard({
+  state,
+  requesting,
+  onRequest,
+  onOpenSettings,
+}: {
+  state: RendererAccessibilityPermissionState;
+  requesting: boolean;
+  onRequest: () => void;
+  onOpenSettings: () => void;
+}) {
+  const presentation = ACCESSIBILITY_PRESENTATION[state];
+  return (
+    <PermissionCard
+      title="Accessibility"
+      dotClassName={presentation.dot}
+      label={presentation.label}
+      hint={
+        state === "granted"
+          ? undefined
+          : // macOS cannot grant Accessibility inline; the request pops a prompt that
+            // routes to System Settings, where the user turns Lune on. This step detects
+            // it on its next poll and hold-to-talk goes live with no restart.
+            "Let Lune catch your push-to-talk hotkey anywhere. Turn on Lune under System Settings › Privacy & Security › Accessibility - it activates here automatically once enabled."
+      }
+      action={
+        state === "granted" ? undefined : (
+          <div className="space-y-1.5">
+            <PermissionButton
+              label={requesting ? "Waiting…" : "Grant accessibility"}
+              onClick={onRequest}
+              disabled={requesting}
+            />
+            <PermissionButton label="Open System Settings" onClick={onOpenSettings} />
+          </div>
         )
       }
     />

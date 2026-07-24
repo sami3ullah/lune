@@ -10,8 +10,11 @@ import {
 import {
   APP_QUIT_CHANNEL,
   PILL_RESIZE_CHANNEL,
+  PILL_CAPTION_CHANNEL,
   PillContentSizeSchema,
+  PillCaptionSchema,
   type PillContentSize,
+  type PillCaption,
 } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
 import {
@@ -66,6 +69,13 @@ import {
   MicPermissionStateSchema,
   type MicPermissionStateValue,
 } from "../ipc/micPermission";
+import {
+  ACCESSIBILITY_OPEN_SETTINGS_CHANNEL,
+  ACCESSIBILITY_PERMISSION_REQUEST_CHANNEL,
+  ACCESSIBILITY_PERMISSION_STATUS_CHANNEL,
+  AccessibilityPermissionStateSchema,
+  type AccessibilityPermissionStateValue,
+} from "../ipc/accessibilityPermission";
 import {
   VOICE_PILL_ACTIVITY_CHANNEL,
   VOICE_RECORD_COMMAND_CHANNEL,
@@ -299,6 +309,14 @@ const luneBridge = {
     quit(): void {
       ipcRenderer.send(APP_QUIT_CHANNEL);
     },
+    /**
+     * Reports the Pill's current word-by-word caption so the main process can mirror the
+     * same reveal beside the cursor on the Overlay (the Pill owns Kokoro playback timing).
+     * An empty `words` array clears it. Validated before it leaves the renderer.
+     */
+    reportCaption(caption: PillCaption): void {
+      ipcRenderer.send(PILL_CAPTION_CHANNEL, PillCaptionSchema.parse(caption));
+    },
   },
   screen: {
     /**
@@ -328,6 +346,32 @@ const luneBridge = {
     /** Opens System Settings to the Screen Recording pane (for the denied case, which never re-prompts). */
     openSettings(): void {
       ipcRenderer.send(SCREEN_OPEN_SETTINGS_CHANNEL);
+    },
+  },
+  accessibility: {
+    /**
+     * Reads the current Accessibility trust state without prompting, so the renderer can
+     * poll it for live status. The main process starts the push-to-talk hook the moment
+     * it reads "granted", so hold-to-talk goes live without a restart.
+     */
+    async getPermissionStatus(): Promise<AccessibilityPermissionStateValue> {
+      return AccessibilityPermissionStateSchema.parse(
+        await ipcRenderer.invoke(ACCESSIBILITY_PERMISSION_STATUS_CHANNEL),
+      );
+    },
+    /**
+     * Requests Accessibility access - macOS cannot grant it inline, so this pops the
+     * system prompt that offers "Open System Settings". Resolves to the current state;
+     * the next poll detects the grant once the user flips the toggle.
+     */
+    async requestPermission(): Promise<AccessibilityPermissionStateValue> {
+      return AccessibilityPermissionStateSchema.parse(
+        await ipcRenderer.invoke(ACCESSIBILITY_PERMISSION_REQUEST_CHANNEL),
+      );
+    },
+    /** Opens System Settings to the Accessibility pane (a second route to the toggle). */
+    openSettings(): void {
+      ipcRenderer.send(ACCESSIBILITY_OPEN_SETTINGS_CHANNEL);
     },
   },
   onboarding: {

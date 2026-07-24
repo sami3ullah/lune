@@ -27,6 +27,12 @@ export interface SpeechTurnPlayerDependencies {
   sendEvent: (event: SpeechEvent) => void;
   /** Encodes synthesized audio bytes to base64 for the typed IPC payload. */
   encodeBase64: (audio: Uint8Array) => string;
+  /**
+   * Whether each clip should carry the sentence text it speaks, for the Pill's caption
+   * line (the "show streaming text" setting). When false, clips carry an empty `text`
+   * so the Pill shows no caption - voice only. Defaults to false.
+   */
+  includeCaption?: boolean;
   /** Optional error sink for a failed synthesis (defaults to console). */
   onError?: (error: unknown) => void;
 }
@@ -42,12 +48,19 @@ export interface SpeechTurnPlayer {
    * every queued sentence has been synthesized and its `turn-complete` emitted.
    */
   finish(accumulatedAnswer: string): Promise<void>;
+  /**
+   * Halts this turn's speech at once (Barge-in / a failed turn): the worker stops
+   * synthesizing and emits no further clips, so an interrupted turn can never keep
+   * speaking after a newer turn has taken over. Idempotent; safe to call anytime.
+   */
+  stop(): void;
 }
 
 export function createSpeechTurnPlayer(
   dependencies: SpeechTurnPlayerDependencies,
 ): SpeechTurnPlayer {
   const { speech, turnId, sendEvent, encodeBase64 } = dependencies;
+  const includeCaption = dependencies.includeCaption ?? false;
   const reportError = dependencies.onError ?? ((error) => console.error("[lune] speech synthesis failed:", error));
 
   const chunker = new SpeechSentenceChunker();
@@ -93,6 +106,9 @@ export function createSpeechTurnPlayer(
           sequence: nextSequence,
           audioBase64: encodeBase64(result.audio),
           contentType: result.contentType,
+          // The caption shows the sentence as it is spoken; trimmed so the Pill line is
+          // clean. Empty when captions are off, so the Pill stays voice-only.
+          text: includeCaption ? sentence.trim() : "",
         });
         nextSequence += 1;
       } catch (error) {
@@ -141,6 +157,13 @@ export function createSpeechTurnPlayer(
       } else if (!stopped) {
         sendEvent({ type: "turn-complete", turnId });
       }
+    },
+
+    stop(): void {
+      // Setting the flag halts the worker at its next `stopped` check and drops any
+      // sentences still queued, so no more clips are emitted for this (interrupted) turn.
+      stopped = true;
+      pendingSentences.length = 0;
     },
   };
 }

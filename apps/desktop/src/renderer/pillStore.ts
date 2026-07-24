@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { CaptionData } from "./caption";
 
 /**
  * What Lune is doing, shown at a glance on the pill (user story 15), in display
@@ -20,6 +21,15 @@ export type PillIndicatorState = (typeof PILL_INDICATOR_STATES)[number];
 interface PillState {
   indicatorState: PillIndicatorState;
   setIndicatorState: (state: PillIndicatorState) => void;
+  /**
+   * The caption the Pill is currently showing, revealed word by word in time with the
+   * spoken reply, or `null` when Lune isn't captioning. Kokoro playback reveals each
+   * sentence's words as its audio plays and clears it once playback drains
+   * (`useSpeechPlayback`), so the answer reads out word by word and disappears exactly
+   * when the voice finishes.
+   */
+  caption: CaptionData | null;
+  setCaption: (caption: CaptionData | null) => void;
 }
 
 // A dedicated store (rather than local component state) so that when the real
@@ -29,4 +39,6 @@ interface PillState {
 export const usePillStore = create<PillState>((set) => ({
   indicatorState: "idle",
   setIndicatorState: (indicatorState) => set({ indicatorState }),
+  caption: null,
+  setCaption: (caption) => set({ caption }),
 }));

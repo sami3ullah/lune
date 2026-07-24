@@ -1,4 +1,4 @@
-import { readFileSync, watch, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { app, BrowserWindow, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
@@ -23,7 +23,7 @@ import {
   type ChatInputMethod,
   type ConversationStreamEvent,
 } from "@lune/shared";
-import { APP_QUIT_CHANNEL } from "../ipc/pillControl";
+import { APP_QUIT_CHANNEL, PILL_CAPTION_CHANNEL, PillCaptionSchema } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
 import {
   CONVERSATIONS_CHANGED_CHANNEL,
@@ -92,7 +92,11 @@ import {
   runTranscriptionDevTrigger,
   type DesktopTranscription,
 } from "./transcription/transcriptionService";
-import { resolveWhisperServerBinaryPath, WHISPER_SERVER_PATH_ENV } from "./transcription/whisperServerBinaryPath";
+import {
+  resolveWhisperServerBinaryPath,
+  WHISPER_SERVER_PATH_ENV,
+  WHISPER_SERVER_RESOURCE_NAME,
+} from "./transcription/whisperServerBinaryPath";
 import { createDesktopSpeech, runSpeechDevTrigger } from "./speech/speechService";
 import { createSpeechTurnPlayer, type SpeechTurnPlayer } from "./speech/speechTurnPlayer";
 import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ipc/speechPlayback";
@@ -115,6 +119,13 @@ import {
   deriveMicPermissionState,
   type MicrophoneAccessStatus,
 } from "./permissions/micPermissionState";
+import {
+  ACCESSIBILITY_OPEN_SETTINGS_CHANNEL,
+  ACCESSIBILITY_PERMISSION_REQUEST_CHANNEL,
+  ACCESSIBILITY_PERMISSION_STATUS_CHANNEL,
+  AccessibilityPermissionStateSchema,
+} from "../ipc/accessibilityPermission";
+import { deriveAccessibilityPermissionState } from "./permissions/accessibilityPermissionState";
 import { PushToTalkMonitor } from "./voice/pushToTalkMonitor";
 import { createUiohookKeyEventSource } from "./voice/globalKeyEventSource";
 import { VoiceLoopController } from "./voice/voiceLoopController";
@@ -171,13 +182,17 @@ const credentialStore = new CredentialStore(
 
 // Best-effort watch so a hand-edit of the config file reconciles routing without a
 // restart. A save from Settings reloads the Core store explicitly (below), so this only
-// covers external edits; a missing file (first run) simply has no watcher yet.
-try {
-  watch(routingConfigPath, () => {
-    routingConfigStore.reload();
-  });
-} catch (error) {
-  console.error("[lune] could not watch routing config file:", error);
+// covers external edits; a missing file (first run) simply has no watcher yet - `watch`
+// throws ENOENT on a path that does not exist, so guard on existence rather than logging
+// a scary (and harmless) error on every fresh profile.
+if (existsSync(routingConfigPath)) {
+  try {
+    watch(routingConfigPath, () => {
+      routingConfigStore.reload();
+    });
+  } catch (error) {
+    console.error("[lune] could not watch routing config file:", error);
+  }
 }
 
 // The Core is credentials-gated and transport-agnostic: the main process injects the
@@ -330,6 +345,59 @@ function getMicrophoneAccessStatus(): MicrophoneAccessStatus {
   return systemPreferences.getMediaAccessStatus("microphone") as MicrophoneAccessStatus;
 }
 
+/**
+ * Whether this app is a trusted macOS Accessibility client (always true off macOS, where
+ * there is no such trust model). Passing `prompt: true` pops the system Accessibility
+ * pane; `false` is a silent check safe to call on a poll.
+ */
+function isAccessibilityTrusted(prompt: boolean): boolean {
+  if (process.platform !== "darwin") {
+    return true;
+  }
+  return systemPreferences.isTrustedAccessibilityClient(prompt);
+}
+
+/**
+ * Whether a permission that onboarding covers (screen recording, microphone, or
+ * Accessibility) is currently missing. The Pill has no permission UI of its own, so this
+ * lets a returning user who has since revoked a grant be re-surfaced onboarding at its
+ * permissions step rather than silently losing screen-aware answers, voice, or
+ * push-to-talk. Accessibility is included from M1 (DECISIONS #22): the push-to-talk hook
+ * needs it, so onboarding is the guided place to (re-)grant it.
+ */
+function requiredPermissionsMissing(): boolean {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+  return (
+    getScreenMediaAccessStatus() !== "granted" ||
+    getMicrophoneAccessStatus() !== "granted" ||
+    !isAccessibilityTrusted(false)
+  );
+}
+
+// Whether the push-to-talk hook has been started this run, so `startPushToTalkIfAccessible`
+// is idempotent even when the onboarding permissions poll calls it repeatedly.
+let pushToTalkStarted = false;
+
+/**
+ * Starts the global push-to-talk hook, but only when macOS Accessibility is *already*
+ * granted - never prompting for it here. The uiohook global keyboard hook needs
+ * Accessibility, and calling its `start()` while untrusted pops the system Accessibility
+ * pane (libuiohook calls `AXIsProcessTrustedWithOptions` with the prompt option). The
+ * onboarding permissions step owns the explicit grant prompt (M1, DECISIONS #22); this
+ * helper only *starts* the hook once trust exists, so it can be called freely at boot, on
+ * onboarding completion, and whenever a permission poll observes the grant. It is a no-op
+ * until `voiceController` is ready and runs at most once.
+ */
+function startPushToTalkIfAccessible(): void {
+  if (pushToTalkStarted || voiceController === null || !isAccessibilityTrusted(false)) {
+    return;
+  }
+  voiceController.start();
+  pushToTalkStarted = true;
+}
+
 /** Sends one recording command to the Pill renderer (which owns the mic), validated on the way out. */
 function sendRecordCommand(command: VoiceRecordCommand): void {
   if (pillWindow === null || pillWindow.isDestroyed()) {
@@ -340,6 +408,17 @@ function sendRecordCommand(command: VoiceRecordCommand): void {
 
 /** Sets the Pill's voice-loop activity indicator (idle/listening/thinking). */
 function setPillActivity(state: "idle" | "listening" | "thinking"): void {
+  // Mirror the "thinking" phase onto the Overlay as a loading spinner right at the cursor,
+  // so the user sees Lune is working (transcribing + reasoning) the whole time between the
+  // hotkey release and the first streamed answer - not just the Pill's small state dot.
+  // This is the single point every voice-loop transition passes through, so the spinner is
+  // shown and cleared on every path (answered, empty transcript, not ready, error). The
+  // answer's own `activity-start` also clears it when the reply begins to stream.
+  if (overlayManager && listeningDisplayId !== undefined) {
+    overlayManager.sendToDisplay(listeningDisplayId, {
+      type: state === "thinking" ? "thinking-start" : "thinking-end",
+    });
+  }
   if (pillWindow === null || pillWindow.isDestroyed()) {
     return;
   }
@@ -365,6 +444,38 @@ function sendSpeechEvent(event: SpeechEvent): void {
     return;
   }
   pillWindow.webContents.send(SPEECH_EVENT_CHANNEL, SpeechEventSchema.parse(event));
+}
+
+/** Warm, friendly nudges spoken when a push-to-talk hold caught no discernible speech. */
+const NO_SPEECH_NUDGES = [
+  "Hmm, I didn't quite catch that. Could you say it again a little louder?",
+  "Sorry, I didn't hear anything - mind trying that once more, nice and clear?",
+  "I couldn't make that out. Give it another go, a touch louder?",
+  "Oops, that came through silent. Could you repeat it a bit closer to the mic?",
+];
+
+/**
+ * Speaks a short, friendly "didn't catch that" nudge when a push-to-talk hold produced no
+ * discernible speech, instead of transcribing a whisper hallucination and answering it. It
+ * runs through the same Kokoro path as a real turn, so it also captions the line in step
+ * with the voice. If Kokoro isn't ready (or the Pill is gone) it reports it didn't speak,
+ * and the voice loop returns the Pill to idle itself.
+ */
+async function announceNoSpeech(): Promise<{ spoke: boolean }> {
+  if (!speechCapability?.isReady() || pillWindow === null || pillWindow.isDestroyed()) {
+    return { spoke: false };
+  }
+  const nudge = NO_SPEECH_NUDGES[Math.floor(Math.random() * NO_SPEECH_NUDGES.length)]!;
+  const speechTurn = createSpeechTurnPlayer({
+    speech: speechCapability,
+    turnId: randomUUID(),
+    sendEvent: sendSpeechEvent,
+    encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+    // Caption the nudge (in step with the voice) when streaming text is on, like a turn.
+    includeCaption: settingsStore.getStreamingText(),
+  });
+  await speechTurn.finish(nudge);
+  return { spoke: true };
 }
 
 /**
@@ -440,9 +551,11 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
 
   sendConversationEvent(webContents, { type: "started", turnId, ipcVersion: LUNE_IPC_VERSION });
 
-  // Hide any lingering Overlay before capturing so it can never photograph its own
-  // cursor/bubble into this turn's screen context.
-  overlayManager?.hideAll();
+  // Suspend the following cursor before capturing so the overlay can never photograph
+  // its own cursor/bubble into this turn's screen context. Suspending (not just hiding)
+  // also pauses the 60fps follow poll, so it cannot re-show the overlay mid-capture.
+  // Resumed the moment the capture completes (below), and in the catch as a safety net.
+  overlayManager?.suspendFollowing();
 
   // Overlay driving state for this turn (ticket 07): the answer bubble + cursor run on
   // the display holding the user's cursor (screen 1, the model's primary focus). We
@@ -470,6 +583,10 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     // Capture the screen(s) first (when opted in and permitted) so the answer is
     // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
     const { screens, geometry } = await captureScreensForTurn(includeScreen);
+
+    // Capture done: bring the following cursor back so it tracks the mouse while the
+    // answer streams (the interaction content is layered on top of it below).
+    overlayManager?.resumeFollowing();
 
     cursorDisplayId =
       geometry.find((display) => display.screenNumber === 1)?.displayId ??
@@ -510,6 +627,9 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
               turnId,
               sendEvent: sendSpeechEvent,
               encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+              // Carry each spoken sentence as the Pill's caption line when the
+              // streaming-text setting is on (ticket 13); voice-only when off.
+              includeCaption: showStreamingText,
             });
             speechEngaged = true;
           }
@@ -572,17 +692,30 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
     notifyConversationsChanged(webContents);
   } catch (error) {
+    // Safety net: if the turn threw before the capture completed, following is still
+    // suspended - resume it so the cursor doesn't stay frozen/hidden. Idempotent.
+    overlayManager?.resumeFollowing();
     // End any Overlay interaction this turn opened so the cursor fades out rather than
-    // hanging, and silence any speech, whether the turn failed or was interrupted.
+    // hanging.
     if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
       overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
     }
-    if (speechTurn !== null) {
-      sendSpeechEvent({ type: "stop" });
-    }
-    // A Barge-in abort is a deliberate cancellation, not a failure: end quietly so the
-    // panel does not show an error banner for a turn the user chose to interrupt.
-    if (!isAbortError(error, signal)) {
+    // Halt this turn's speech worker so an interrupted (or failed) turn stops synthesizing
+    // and emits no further clips - without this a Barge-in's old turn keeps speaking over
+    // the new one. The Pill renderer also ignores a superseded turn's clips by turn id.
+    speechTurn?.stop();
+    if (isAbortError(error, signal)) {
+      // A Barge-in is a deliberate interruption, not a failure: the controller already
+      // stopped playback and the new turn owns the audio, so end quietly (no error
+      // banner). The Core kept this interrupted turn in history (merge-on-interrupt), so
+      // persist it - the next turn and the Chat Panel build on what the user just said.
+      conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
+      notifyConversationsChanged(webContents);
+    } else {
+      // A genuine failure: clear any audio already queued for this turn and surface it.
+      if (speechTurn !== null) {
+        sendSpeechEvent({ type: "stop" });
+      }
       sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
     }
   }
@@ -655,10 +788,11 @@ ipcMain.on(ONBOARDING_START_DOWNLOAD_CHANNEL, () => requireOnboardingService().s
 ipcMain.on(ONBOARDING_COMPLETE_CHANNEL, () => {
   requireOnboardingService().markComplete();
   closeOnboardingWindow();
-  // Now that the user has reached the Pill, start the global push-to-talk hook (deferred
-  // during onboarding so its Accessibility prompt didn't interrupt first run). Idempotent,
-  // so a returning user that already started it at boot is unaffected.
-  voiceController?.start();
+  // Now that the user has reached the Pill, start the global push-to-talk hook - but only
+  // if Accessibility is already granted, never prompting for it (M1 defers that flow to
+  // M2, DECISIONS #22). Idempotent, so a returning user that already started it at boot
+  // is unaffected; a user without Accessibility simply has hold-to-talk inactive.
+  startPushToTalkIfAccessible();
 });
 
 // Open a Vendor's "get a key" page. The renderer sends only a Vendor id; the URL is
@@ -716,6 +850,22 @@ ipcMain.handle(CONVERSATIONS_NEW_CHANNEL, () => {
 // process is torn down via the `before-quit`/`exit` handlers below, so quitting
 // leaves nothing orphaned (ticket 10 acceptance).
 ipcMain.on(APP_QUIT_CHANNEL, () => app.quit());
+
+// The Pill reports each answer line as its audio begins (it owns Kokoro playback timing);
+// mirror it onto the Overlay so the same line also reads out beside the cursor, in step
+// with the voice. Broadcast to every drawing overlay so it lands wherever the buddy is.
+ipcMain.on(PILL_CAPTION_CHANNEL, (_event, rawCaption: unknown) => {
+  const parsed = PillCaptionSchema.safeParse(rawCaption);
+  if (!parsed.success) {
+    console.error("[lune] dropping malformed pill caption:", parsed.error.message);
+    return;
+  }
+  overlayManager?.broadcast({
+    type: "caption",
+    id: parsed.data.id,
+    words: parsed.data.words,
+  });
+});
 
 // Whisper child-process teardown (ticket 10, developer story 41). `before-quit` runs
 // on the normal quit path (pill menu, relaunch) and issues a SIGTERM via the
@@ -791,6 +941,35 @@ ipcMain.handle(MIC_PERMISSION_REQUEST_CHANNEL, async () => {
   return MicPermissionStateSchema.parse(deriveMicPermissionState(getMicrophoneAccessStatus()));
 });
 
+// Accessibility permission (M1 onboarding permissions step; consumed by the push-to-talk
+// voice loop, whose global uiohook hook needs Accessibility). The status channel is a
+// silent read the onboarding step polls; the request channel pops the system prompt that
+// routes to System Settings (macOS cannot grant Accessibility inline); the open-settings
+// channel is the second route to the toggle. Whenever a read observes the grant, we start
+// the push-to-talk hook so hold-to-talk goes live without a restart.
+ipcMain.handle(ACCESSIBILITY_PERMISSION_STATUS_CHANNEL, () => {
+  const trusted = isAccessibilityTrusted(false);
+  if (trusted) {
+    startPushToTalkIfAccessible();
+  }
+  return AccessibilityPermissionStateSchema.parse(deriveAccessibilityPermissionState(trusted));
+});
+ipcMain.handle(ACCESSIBILITY_PERMISSION_REQUEST_CHANNEL, () => {
+  // `prompt: true` pops the system Accessibility pane. It returns the current trust state
+  // synchronously (still not-granted until the user flips the toggle), which the next poll
+  // then detects; if trust is already present, start the hook immediately.
+  const trusted = isAccessibilityTrusted(true);
+  if (trusted) {
+    startPushToTalkIfAccessible();
+  }
+  return AccessibilityPermissionStateSchema.parse(deriveAccessibilityPermissionState(trusted));
+});
+ipcMain.on(ACCESSIBILITY_OPEN_SETTINGS_CHANNEL, () => {
+  if (process.platform === "darwin") {
+    void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+  }
+});
+
 // The Pill's recording events (live level, finished clip, capture error) drive the voice
 // loop. Validated on the way in, then handed to the controller (which ignores events
 // from a superseded recording). Before the controller is ready, there are no recordings.
@@ -847,6 +1026,13 @@ void app.whenReady().then(() => {
       isPackaged: app.isPackaged,
       resourcesPath: process.resourcesPath,
       envOverride: process.env[WHISPER_SERVER_PATH_ENV],
+      // In a dev launch, fall back to the repo's locally-built binary (the same
+      // `build/whisper-server` electron-builder stages into the bundle - resolved two
+      // levels up from the desktop app dir), so a dev build transcribes with no env var
+      // to set. `app.getAppPath()` is the desktop package dir; the repo root is its
+      // grandparent (apps/desktop → repo).
+      devFallbackBinaryPath: join(app.getAppPath(), "..", "..", "build", WHISPER_SERVER_RESOURCE_NAME),
+      fileExists: (candidatePath) => existsSync(candidatePath),
     }),
   });
 
@@ -898,27 +1084,48 @@ void app.whenReady().then(() => {
         // No window to stream to (the Pill is gone): nothing to answer into.
         return { spoke: false };
       }
-      return runConversationTurn({
-        turnId,
-        prompt,
-        inputMethod: "voice",
-        includeScreen: true,
-        webContents,
-        signal,
-      });
+      // The loading spinner is raised by `setPillActivity("thinking")` on hotkey release
+      // (so it shows through transcription too). This finally is the guaranteed cleanup for
+      // the cursor's display: a turn that spoke returns to idle via Kokoro playback (never
+      // `setPillActivity("idle")`), and the answer may have streamed on a different display,
+      // so clear the spinner on the listening display here whatever happened.
+      const thinkingDisplayId = listeningDisplayId;
+      try {
+        return await runConversationTurn({
+          turnId,
+          prompt,
+          inputMethod: "voice",
+          includeScreen: true,
+          webContents,
+          signal,
+        });
+      } finally {
+        if (overlayManager && thinkingDisplayId !== undefined) {
+          overlayManager.sendToDisplay(thinkingDisplayId, { type: "thinking-end" });
+        }
+      }
+    },
+    announceNoSpeech: async () => {
+      // Clear the thinking spinner on the listening display when the nudge speaks (or if it
+      // can't), mirroring the real-turn cleanup so the loading state never lingers.
+      const thinkingDisplayId = listeningDisplayId;
+      try {
+        return await announceNoSpeech();
+      } finally {
+        if (overlayManager && thinkingDisplayId !== undefined) {
+          overlayManager.sendToDisplay(thinkingDisplayId, { type: "thinking-end" });
+        }
+      }
     },
     generateId: () => randomUUID(),
     decodeBase64: (base64) => new Uint8Array(Buffer.from(base64, "base64")),
   });
   // The global push-to-talk hook (uiohook) needs macOS Accessibility permission, and
-  // starting it pops that System Settings pane. During first-run onboarding that prompt
-  // is off-topic and jarring (onboarding covers only mic + screen; voice isn't usable
-  // until the "ready moment" anyway), so defer the hook until onboarding completes. A
-  // returning user (flag already set) starts it now. Starting the hook is idempotent, so
-  // the completion handler can safely call it too.
-  if (onboardingStore.isComplete()) {
-    voiceController.start();
-  }
+  // calling its start() while untrusted pops that System Settings pane. M1 never drives
+  // the Accessibility flow (deferred to M2, DECISIONS #22), so start the hook only when
+  // Accessibility is already granted and otherwise stay silent - no boot-time prompt for
+  // returning users, no jarring pane during first run.
+  startPushToTalkIfAccessible();
 
   // Settings (ticket 13): now that Provisioning exists, wire the service the Settings
   // IPC handlers call. Readiness reads the Provisioning run's live status + per-Runtime
@@ -959,11 +1166,14 @@ void app.whenReady().then(() => {
     onboardingStore,
   });
 
-  // First run: a fresh profile that has never finished onboarding sees it now. It opens
-  // after Provisioning readiness is wired (so the welcome screen's silent download can
-  // start), but before the async dev triggers below - which are no-ops on a normal launch.
-  // A returning user (flag set) goes straight to the Pill.
-  if (!onboardingStore.isComplete()) {
+  // First run, or a returning user who has since revoked a required permission (screen
+  // recording or mic): open onboarding. It opens after Provisioning readiness is wired (so
+  // the welcome screen's silent download can start), but before the async dev triggers
+  // below - no-ops on a normal launch. The renderer resumes to the furthest incomplete
+  // step, so a returning user who already has a key + finished download lands directly on
+  // the permissions step to re-grant (the Pill has no permission UI of its own). A
+  // returning user with every permission intact goes straight to the Pill.
+  if (!onboardingStore.isComplete() || requiredPermissionsMissing()) {
     openOnboardingWindow();
   }
 

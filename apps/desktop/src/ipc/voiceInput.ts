@@ -39,8 +39,10 @@ export type VoiceRecordCommand = z.infer<typeof VoiceRecordCommandSchema>;
 /**
  * One recording event, the Pill renderer -> main. `level` streams the current input
  * amplitude (0..1) for the live waveform; `clip` delivers the finished recording as a
- * base64 WAV once the hold is released; `error` reports a capture/permission failure so
- * the turn ends cleanly instead of hanging. Each carries its recording's turn id.
+ * base64 WAV once the hold is released; `silent` reports that the clip held no discernible
+ * speech (near-silence) so the loop can prompt the user instead of transcribing a
+ * hallucination; `error` reports a capture/permission failure so the turn ends cleanly
+ * instead of hanging. Each carries its recording's turn id.
  */
 export const VoiceRecordEventSchema = z.discriminatedUnion("type", [
   z.object({
@@ -54,6 +56,10 @@ export const VoiceRecordEventSchema = z.discriminatedUnion("type", [
     turnId: z.string().min(1),
     /** The recorded clip as base64-encoded 16 kHz mono WAV (no `data:` prefix). */
     audioBase64: z.string(),
+  }),
+  z.object({
+    type: z.literal("silent"),
+    turnId: z.string().min(1),
   }),
   z.object({
     type: z.literal("error"),
