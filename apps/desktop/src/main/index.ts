@@ -6,6 +6,7 @@ import {
   createAnthropicComputerUseAdapter,
   createConversationManager,
   createGeminiComputerUseAdapter,
+  createOpenAiComputerUseAdapter,
   createReasoningCapability,
   createScreenAgentCapability,
   describeCore,
@@ -223,23 +224,25 @@ const reasoningCapability = createReasoningCapability({
 
 // The dev-only env fallback for each computer-use Vendor's key, mirroring the Reasoning
 // fallback: the Screen Agent reuses Reasoning's Vendor selection + keys, so a keyed
-// Anthropic/Gemini Vendor can act with no extra credential.
+// Anthropic/Gemini/OpenAI Vendor can act with no extra credential.
 const COMPUTER_USE_API_KEY_ENV_BY_VENDOR: Record<ComputerUseVendorId, string> = {
   anthropic: API_KEY_ENV_BY_VENDOR.anthropic,
   google: API_KEY_ENV_BY_VENDOR.google,
+  openai: API_KEY_ENV_BY_VENDOR.openai,
 };
 
 // The Core's Screen Agent Capability (M2-01): the server-side half of the Shell-driven
 // agent loop. It advances one Session by one Step against the routed computer-use Vendor's
-// adapter (Anthropic + Gemini wired), gated on that Vendor's computer-use capability + key
-// exactly like Reasoning - a non-computer-use Vendor (OpenAI) or a missing key throws a
-// typed not-ready without any upstream call. The M2-03 loop (below) drives it: only the
-// Shell touches the OS; only the Core talks to the Vendor.
+// adapter (Anthropic + Gemini + OpenAI wired), gated on that Vendor's computer-use
+// capability + key exactly like Reasoning - a missing key (or a Vendor with no adapter)
+// throws a typed not-ready without any upstream call. The M2-03 loop (below) drives it:
+// only the Shell touches the OS; only the Core talks to the Vendor.
 const screenAgentCapability = createScreenAgentCapability({
   getRoutingConfig: () => routingConfigStore.getConfig(),
   adapters: {
     anthropic: createAnthropicComputerUseAdapter(),
     google: createGeminiComputerUseAdapter(),
+    openai: createOpenAiComputerUseAdapter(),
   },
   getApiKey: (vendorId) =>
     credentialStore.getKey(vendorId) ?? process.env[COMPUTER_USE_API_KEY_ENV_BY_VENDOR[vendorId]],

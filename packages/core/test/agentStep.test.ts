@@ -4,6 +4,7 @@ import {
   createScreenAgentCapability,
   createAnthropicComputerUseAdapter,
   createGeminiComputerUseAdapter,
+  createOpenAiComputerUseAdapter,
   ScreenAgentNotReadyError,
   ScreenAgentStepInputError,
   type ComputerUseVendorId,
@@ -100,22 +101,25 @@ function reasoningRouting(vendor: ReasoningVendorId, modelSlot: string): Routing
   };
 }
 
-/** Boots a Screen Agent Capability with both adapters wired and the given per-Vendor keys. */
+/** Boots a Screen Agent Capability with all three adapters wired and the given per-Vendor keys. */
 function bootCapability(options: {
   routingConfig: RoutingConfig;
   anthropicApiKey?: string;
   geminiApiKey?: string;
+  openaiApiKey?: string;
   upstreamFetch: UpstreamFetch;
 }): ScreenAgentCapability {
   const apiKeyByVendorId: Record<ComputerUseVendorId, () => string | undefined> = {
     anthropic: () => options.anthropicApiKey,
     google: () => options.geminiApiKey,
+    openai: () => options.openaiApiKey,
   };
   return createScreenAgentCapability({
     getRoutingConfig: () => options.routingConfig,
     adapters: {
       anthropic: createAnthropicComputerUseAdapter(),
       google: createGeminiComputerUseAdapter(),
+      openai: createOpenAiComputerUseAdapter(),
     },
     getApiKey: (vendorId) => apiKeyByVendorId[vendorId](),
     upstreamFetch: options.upstreamFetch,
@@ -312,23 +316,10 @@ describe("Screen Agent applies the escalate-only Consequence Level floor", () =>
   });
 });
 
-describe("Screen Agent gating for non-computer-use Vendors", () => {
-  // Google is computer-use-capable, so it is NOT here - its gating is on its own key,
-  // covered in the Google suite below. OpenAI is the only advisory-only Reasoning
-  // Vendor in Lune.
-  it("throws not-ready without an upstream call when Reasoning is routed to OpenAI", async () => {
-    const { upstreamFetch, recordedCalls } = makeStubUpstreamFetch([doneResponse("unused")]);
-    const capability = bootCapability({
-      routingConfig: reasoningRouting("openai", "gpt-4o"),
-      anthropicApiKey: "test-anthropic-key",
-      geminiApiKey: "test-gemini-key",
-      upstreamFetch,
-    });
-
-    await expect(capability.step(firstStep("s1"))).rejects.toBeInstanceOf(ScreenAgentNotReadyError);
-    expect(recordedCalls).toHaveLength(0);
-  });
-
+describe("Screen Agent gating when a Vendor cannot act", () => {
+  // All three cloud Reasoning Vendors (Anthropic, Google, OpenAI) are now
+  // computer-use-capable, so gating is on the key (covered per-Vendor in each suite) and
+  // on whether an adapter is wired at all - the remaining not-ready path here.
   it("throws not-ready without an upstream call when no adapter is wired for the routed Vendor", async () => {
     // Anthropic is a computer-use Vendor, but with no adapter registered the Screen
     // Agent still cannot act - not ready, no network.
@@ -494,6 +485,138 @@ describe("Screen Agent routed to the Google (Gemini) computer-use Vendor", () =>
     });
 
     await expect(capability.step(googleFirstStep)).rejects.toBeInstanceOf(ScreenAgentNotReadyError);
+    expect(recordedCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * The OpenAI Vendor drives the same Capability through the same stubbed `UpstreamFetch`,
+ * but its native surface is OpenAI's Responses API (`computer_use_preview`), so these
+ * prove the OpenAI-specific translation over the seam: a `computer_call` becomes the
+ * right canonical Action targeting OpenAI's `/v1/responses` endpoint with Bearer auth,
+ * the follow-up screenshot is fed back as a `computer_call_output` referencing the pending
+ * call, the dedicated computer-use-preview model is used regardless of the advisory Model
+ * Slot, the terminal transition works, and gating is on the OpenAI key. Exhaustive
+ * action-kind translation is a pure unit in `openAiComputerUse.test.ts`.
+ */
+describe("Screen Agent routed to the OpenAI computer-use Vendor", () => {
+  /** An OpenAI Responses response whose output calls the computer tool. */
+  function computerCallResponse(callId: string, action: Record<string, unknown>): string {
+    return JSON.stringify({
+      id: "resp_x",
+      output: [
+        { type: "reasoning", id: "rs_x", summary: [] },
+        { type: "computer_call", id: "cu_x", call_id: callId, action, status: "completed", pending_safety_checks: [] },
+      ],
+    });
+  }
+
+  /** An OpenAI Responses response that only replies with a message (the model is done). */
+  function openAiDoneResponse(text: string): string {
+    return JSON.stringify({
+      id: "resp_x",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+    });
+  }
+
+  const openAiFirstStep: ScreenAgentStepInput = {
+    sessionId: "o1",
+    goal: "open the settings",
+    display: { width: 1440, height: 900 },
+    screenshot: { base64Data: "SCREEN0", mediaType: "image/png" },
+  };
+
+  it("translates a computer_call into the canonical Action, targeting OpenAI's Responses endpoint", async () => {
+    const { upstreamFetch, recordedCalls } = makeStubUpstreamFetch([
+      computerCallResponse("call_1", { type: "click", button: "left", x: 420, y: 300 }),
+    ]);
+    const capability = bootCapability({
+      routingConfig: reasoningRouting("openai", "gpt-4o"),
+      openaiApiKey: "test-openai-key",
+      upstreamFetch,
+    });
+
+    const action = await capability.step(openAiFirstStep);
+    expect(action).toEqual({ kind: "click", x: 420, y: 300, consequence: "benign" });
+
+    expect(recordedCalls).toHaveLength(1);
+    expect(recordedCalls[0].url).toBe("https://api.openai.com/v1/responses");
+    expect(recordedCalls[0].headers["authorization"]).toBe("Bearer test-openai-key");
+    const outbound = recordedCalls[0].body as {
+      model: string;
+      instructions: string;
+      truncation: string;
+      tools: Array<{ type: string; display_width: number; display_height: number }>;
+      input: Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>;
+    };
+    // The Core is the single source of truth for the model id: OpenAI's computer use is a
+    // dedicated model, so the advisory Model Slot ("gpt-4o") is ignored.
+    expect(outbound.model).toBe("computer-use-preview");
+    expect(outbound.truncation).toBe("auto");
+    expect(outbound.tools[0].type).toBe("computer_use_preview");
+    expect(outbound.tools[0].display_width).toBe(1440);
+    expect(outbound.tools[0].display_height).toBe(900);
+    expect(outbound.instructions.length).toBeGreaterThan(0);
+    expect(outbound.input[0].role).toBe("user");
+    expect(outbound.input[0].content?.[0]).toEqual({ type: "input_text", text: "open the settings" });
+    expect(outbound.input[0].content?.[1]).toMatchObject({ type: "input_image" });
+  });
+
+  it("advances one conversation across Steps, feeding the follow-up screenshot as a computer_call_output", async () => {
+    const { upstreamFetch, recordedCalls } = makeStubUpstreamFetch([
+      computerCallResponse("call_1", { type: "click", button: "left", x: 10, y: 20 }),
+      computerCallResponse("call_2", { type: "type", text: "thanks!" }),
+    ]);
+    const capability = bootCapability({
+      routingConfig: reasoningRouting("openai", "gpt-4o"),
+      openaiApiKey: "test-openai-key",
+      upstreamFetch,
+    });
+
+    await capability.step(openAiFirstStep);
+    const secondAction = await capability.step(followUpStep("o1", "SCREEN1"));
+    expect(secondAction).toEqual({ kind: "type", text: "thanks!", consequence: "benign" });
+
+    // The second request carries the whole conversation: the original user turn, the
+    // model's echoed output items, then the follow-up screenshot as a computer_call_output
+    // referencing that exact call_id.
+    expect(recordedCalls).toHaveLength(2);
+    const secondOutbound = recordedCalls[1].body as {
+      input: Array<Record<string, unknown>>;
+    };
+    const callOutput = secondOutbound.input.find((item) => item.type === "computer_call_output") as
+      | { call_id: string; output: { image_url: string } }
+      | undefined;
+    expect(callOutput?.call_id).toBe("call_1");
+    expect(callOutput?.output.image_url).toBe("data:image/png;base64,SCREEN1");
+  });
+
+  it("returns the terminal done Action and ends the Session", async () => {
+    const { upstreamFetch } = makeStubUpstreamFetch([openAiDoneResponse("Opened settings for you.")]);
+    const capability = bootCapability({
+      routingConfig: reasoningRouting("openai", "gpt-4o"),
+      openaiApiKey: "test-openai-key",
+      upstreamFetch,
+    });
+
+    const doneAction = await capability.step(openAiFirstStep);
+    expect(doneAction.kind).toBe("done");
+    expect(doneAction.kind === "done" && doneAction.finalText).toBe("Opened settings for you.");
+
+    await expect(capability.step(followUpStep("o1", "SCREEN1"))).rejects.toBeInstanceOf(
+      ScreenAgentStepInputError,
+    );
+  });
+
+  it("throws not-ready without an upstream call when the OpenAI key is absent", async () => {
+    const { upstreamFetch, recordedCalls } = makeStubUpstreamFetch([openAiDoneResponse("unused")]);
+    const capability = bootCapability({
+      routingConfig: reasoningRouting("openai", "gpt-4o"),
+      openaiApiKey: undefined,
+      upstreamFetch,
+    });
+
+    await expect(capability.step(openAiFirstStep)).rejects.toBeInstanceOf(ScreenAgentNotReadyError);
     expect(recordedCalls).toHaveLength(0);
   });
 });

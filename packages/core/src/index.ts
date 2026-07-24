@@ -186,8 +186,8 @@ export {
 // the routed computer-use Vendor's adapter, returns exactly one canonical,
 // vendor-independent Action (or terminal done), and applies the escalate-only
 // Consequence Level floor. Gated on the routed Vendor's computer-use capability + key
-// (typed not-ready, no upstream call, otherwise). Anthropic + Gemini adapters are
-// wired; the Electron main process injects `fetch` + the per-Vendor keys, and a test
+// (typed not-ready, no upstream call, otherwise). Anthropic + Gemini + OpenAI adapters
+// are wired; the Electron main process injects `fetch` + the per-Vendor keys, and a test
 // injects stubs. Only the Shell touches the OS; only the Core talks to the Vendor.
 export {
   createScreenAgentCapability,
@@ -228,6 +228,9 @@ export {
 export {
   createGeminiComputerUseAdapter,
 } from "./agent/geminiComputerUse.js";
+export {
+  createOpenAiComputerUseAdapter,
+} from "./agent/openAiComputerUse.js";
 export {
   AGENT_SYSTEM_PROMPT,
 } from "./agent/agentSystemPrompt.js";

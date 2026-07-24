@@ -31,7 +31,7 @@
  */
 import type { AgentAction, ConsequenceLevel } from "./agentAction.js";
 import { escalateConsequence } from "./agentAction.js";
-import { readStringArg, readScrollDirectionArg } from "./agentArgReaders.js";
+import { readKeyComboArg, readStringArg, readScrollDirectionArg } from "./agentArgReaders.js";
 import { AGENT_SYSTEM_PROMPT } from "./agentSystemPrompt.js";
 import {
   throwIfStepResponseNotOk,
@@ -181,7 +181,7 @@ function translateFunctionCall(
       };
     }
     case "key_combination": {
-      return { kind: "key", combo: readKeyCombination(args.keys), consequence };
+      return { kind: "key", combo: readKeyComboArg(args.keys), consequence };
     }
     case "scroll_at": {
       return {
@@ -298,15 +298,4 @@ function denormalizeCoordinate(value: unknown, extent: number): number {
 /** Reads a scroll magnitude, defaulting to the standard amount when absent. */
 function readAmount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_SCROLL_AMOUNT;
-}
-
-/** Reads a key combination, accepting either a "ctrl+c" string or an array of keys. */
-function readKeyCombination(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.filter((key): key is string => typeof key === "string").join("+");
-  }
-  return "";
 }

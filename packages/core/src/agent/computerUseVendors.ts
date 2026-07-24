@@ -6,10 +6,11 @@
  * actually act and how to talk to their native computer-use surface. It is the single
  * place that answers "is acting available for the currently-routed Vendor?".
  *
- * Both Anthropic (computer-use tool) and Google/Gemini (computer-use model) are
- * computer-use-capable; OpenAI is not and stays advisory (OpenAI's computer-use
- * adapter is new Lune work, a later M2 ticket). Adding a Vendor is a table entry here
- * plus its adapter, mirroring how the OpenAI-compatible Reasoning Vendor table grew.
+ * Anthropic (computer-use tool), Google/Gemini (computer-use model), and OpenAI
+ * (computer_use_preview over the Responses API) are all computer-use-capable. OpenAI's
+ * adapter is new Lune work (v1 had OpenAI advisory-only). Adding a Vendor is a table
+ * entry here plus its adapter, mirroring how the OpenAI-compatible Reasoning Vendor
+ * table grew.
  *
  * Carried from v1's Sidecar (`agent/computerUseVendors.ts`); the only change is that
  * lookups are keyed off the Core's `ReasoningVendorId` rather than v1's `ProviderId`.
@@ -17,7 +18,7 @@
 import type { ReasoningVendorId } from "../reasoning/cloudReasoningVendors.js";
 
 /** The Reasoning Vendors that can be flagged computer-use-capable. */
-export type ComputerUseVendorId = "anthropic" | "google";
+export type ComputerUseVendorId = "anthropic" | "google" | "openai";
 
 /** One computer-use-capable Vendor's parameters for driving its native surface. */
 export interface ComputerUseVendor {
@@ -45,10 +46,11 @@ export interface ComputerUseVendor {
 }
 
 /**
- * The wired computer-use Vendors. Anthropic and Google/Gemini both act; their native
- * computer-use response shapes and conversation protocols differ (Gemini uses
- * normalised coordinates and a `computerUse` tool over `generateContent`), so each has
- * its own adapter, not just a table row.
+ * The wired computer-use Vendors. Anthropic, Google/Gemini, and OpenAI all act; their
+ * native computer-use response shapes and conversation protocols differ (Gemini uses
+ * normalised coordinates and a `computerUse` tool over `generateContent`; OpenAI uses a
+ * `computer_use_preview` tool over the Responses API), so each has its own adapter, not
+ * just a table row.
  */
 export const COMPUTER_USE_VENDORS: Partial<Record<ComputerUseVendorId, ComputerUseVendor>> = {
   anthropic: {
@@ -71,15 +73,25 @@ export const COMPUTER_USE_VENDORS: Partial<Record<ComputerUseVendorId, ComputerU
     // use this dedicated model regardless of the config's advisory Model Slot.
     computerUseModelIsDedicated: true,
   },
+  openai: {
+    id: "openai",
+    displayName: "OpenAI",
+    // OpenAI's computer use runs on the dedicated computer-use-preview model over the
+    // Responses API - a distinct model from the advisory gpt-* chat models.
+    defaultModel: "computer-use-preview",
+    // The advisory gpt-* chat model cannot drive computer use; acting must use the
+    // dedicated computer-use-preview model regardless of the config's advisory Model Slot.
+    computerUseModelIsDedicated: true,
+  },
 };
 
 /**
- * Whether the given Reasoning Vendor is a computer-use Vendor wired for acting. A
- * Vendor that is not in the table (OpenAI) stays advisory: the Screen Agent is simply
- * not offered.
+ * Whether the given Reasoning Vendor is a computer-use Vendor wired for acting. All
+ * three cloud Reasoning Vendors now act; a Vendor absent from the table would stay
+ * advisory (the Screen Agent simply not offered), but the guard is exhaustive today.
  */
 export function findComputerUseVendor(vendorId: ReasoningVendorId): ComputerUseVendor | undefined {
-  if (vendorId === "anthropic" || vendorId === "google") {
+  if (vendorId === "anthropic" || vendorId === "google" || vendorId === "openai") {
     return COMPUTER_USE_VENDORS[vendorId];
   }
   return undefined;

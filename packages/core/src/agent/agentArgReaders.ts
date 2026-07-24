@@ -26,3 +26,18 @@ export function readScrollDirectionArg(value: unknown): ScrollDirection {
   }
   return "down";
 }
+
+/**
+ * Reads a key combination, accepting either a `"ctrl+c"` string (as-is) or an array of
+ * keys joined with `+` (e.g. `["cmd", "s"] -> "cmd+s"`). Vendors express key presses
+ * both ways (Gemini's `key_combination`, OpenAI's `keypress`), so the coercion is shared.
+ */
+export function readKeyComboArg(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.filter((key): key is string => typeof key === "string").join("+");
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return "";
+}
