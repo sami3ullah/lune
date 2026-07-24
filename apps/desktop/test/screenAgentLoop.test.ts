@@ -55,6 +55,10 @@ interface Harness {
   spoken: string[];
   confirmRequests: ConfirmGateRequest[];
   decideInputs: ScreenAgentStepInput[];
+  /** The Actions the loop asked to fly the cursor to (M2-05), in order. */
+  shownTargets: AgentAction[];
+  /** An interleaved log of the show/confirm/execute seams, to assert their ordering. */
+  order: string[];
 }
 
 /**
@@ -75,6 +79,8 @@ function makeHarness(options: {
   const spoken: string[] = [];
   const confirmRequests: ConfirmGateRequest[] = [];
   const decideInputs: ScreenAgentStepInput[] = [];
+  const shownTargets: AgentAction[] = [];
+  const order: string[] = [];
 
   const scenes = options.scenes ?? [scene("a"), scene("b"), scene("c"), scene("d"), scene("e")];
   let captureIndex = 0;
@@ -98,12 +104,18 @@ function makeHarness(options: {
       decideIndex += 1;
       return action;
     },
+    showActionTarget: async (action) => {
+      shownTargets.push(action);
+      order.push("show");
+    },
     execute: async (action) => {
       options.onExecute?.(action);
       executed.push(action);
+      order.push("execute");
     },
     confirm: async (request) => {
       confirmRequests.push(request);
+      order.push("confirm");
       return innerConfirm(request);
     },
     speak: (finalText) => {
@@ -115,7 +127,7 @@ function makeHarness(options: {
     signal: options.signal,
   };
 
-  return { deps, executed, spoken, confirmRequests, decideInputs };
+  return { deps, executed, spoken, confirmRequests, decideInputs, shownTargets, order };
 }
 
 describe("screen agent loop - advisory -> act boundary", () => {
@@ -402,5 +414,58 @@ describe("screen agent loop - clean stop on error", () => {
 
     expect(result.reason).toBe("error");
     expect((result.error as Error).message).toBe("capture blew up");
+  });
+});
+
+describe("screen agent loop - the cursor acts the part (M2-05)", () => {
+  it("flies the cursor to every executed Action, before it executes", async () => {
+    const harness = makeHarness({
+      actions: [CLICK_BENIGN, { kind: "type", text: "hi", consequence: "benign" }, DONE],
+      scenes: [scene("a"), scene("b"), scene("c")],
+    });
+    await runScreenAgentLoop(harness.deps);
+
+    // Both executed Actions were shown first; the terminal `done` is not (nothing to act on).
+    expect(harness.shownTargets).toEqual([
+      CLICK_BENIGN,
+      { kind: "type", text: "hi", consequence: "benign" },
+    ]);
+    // Every `execute` is immediately preceded by a `show` for that Action.
+    expect(harness.order.filter((step) => step !== "confirm")).toEqual([
+      "show",
+      "execute",
+      "show",
+      "execute",
+    ]);
+  });
+
+  it("shows the cursor at the target before the confirm gate (so a gate waits at the target)", async () => {
+    const harness = makeHarness({ actions: [CLICK_CONSEQUENTIAL, DONE], scenes: [scene("a"), scene("b")] });
+    await runScreenAgentLoop(harness.deps);
+
+    // The very first thing is the flight, then the gate (cursor waiting there), then execute.
+    expect(harness.order).toEqual(["show", "confirm", "execute"]);
+  });
+
+  it("an advisory (first-step done) never flies the cursor", async () => {
+    const harness = makeHarness({ actions: [DONE] });
+    await runScreenAgentLoop(harness.deps);
+
+    expect(harness.shownTargets).toHaveLength(0);
+    expect(harness.order).toHaveLength(0);
+  });
+
+  it("does not execute if a barge-in lands during the cursor flight", async () => {
+    const controller = new AbortController();
+    const harness = makeHarness({ actions: [CLICK_BENIGN], signal: controller.signal });
+    // The flight is where the barge-in happens: abort during the show, before any gate/execute.
+    harness.deps.showActionTarget = async () => {
+      controller.abort();
+    };
+    const result = await runScreenAgentLoop(harness.deps);
+
+    expect(result.reason).toBe("cancelled");
+    expect(harness.executed).toHaveLength(0);
+    expect(harness.confirmRequests).toHaveLength(0); // never even prompted the gate
   });
 });

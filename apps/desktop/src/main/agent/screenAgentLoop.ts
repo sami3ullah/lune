@@ -125,6 +125,13 @@ export interface ScreenAgentLoopDependencies {
   decideStep: (input: ScreenAgentStepInput) => Promise<AgentAction>;
   /** Performs one Action as real OS input, remapping via the capture's geometry. */
   execute: (action: AgentAction, geometry: AgentDisplayGeometry) => Promise<void>;
+  /**
+   * Flies the playful Overlay cursor to the Action's on-screen target and resolves once it
+   * has landed, so the user sees where Lune is about to act *before* it acts - and a gated
+   * Action shows the cursor waiting at the target while the gate is pending (M2-05). Called
+   * for every executed Action, before the confirm gate; a no-op for Actions with no target.
+   */
+  showActionTarget: (action: AgentAction, geometry: AgentDisplayGeometry) => Promise<void>;
   /** Asks the user to confirm before an OS touch; resolves `true` to proceed. */
   confirm: (request: ConfirmGateRequest) => Promise<boolean>;
   /** Speaks the model's final text when the run completes (or advises). */
@@ -190,6 +197,7 @@ export async function runScreenAgentLoop(
     captureScene,
     decideStep,
     execute,
+    showActionTarget,
     confirm,
     speak,
     guardrails,
@@ -250,6 +258,17 @@ export async function runScreenAgentLoop(
         const advisory = stepIndex === 0;
         await speak(action.finalText);
         return { reason: "completed", stepsExecuted: stepIndex, finalText: action.finalText, advisory };
+      }
+
+      // Fly the playful cursor to where this Action will act, so the user sees Lune's target
+      // before anything happens - and a gated Action shows the cursor already waiting there
+      // while the gate is pending (M2-05). A no-op for Actions with no on-screen target.
+      await showActionTarget(action, scene.geometry);
+
+      // A barge-in can land during the flight's settle; honour it before the gate or any OS
+      // touch, so a cancelled run neither prompts a gate nor executes the Action it decided.
+      if (isAborted(signal)) {
+        return stop("cancelled", stepIndex, false);
       }
 
       // Confirm if needed: confirm-to-start before the first OS touch, and the irreversible

@@ -16,6 +16,11 @@ import {
   type OverlaySuspender,
 } from "./agentSceneCapture";
 import type { SyntheticInputExecutor } from "./syntheticInputExecutor";
+import type { AxSignalProvider } from "./axSignalProvider";
+import {
+  createAgentCursorPresenter,
+  type AgentCursorOverlay,
+} from "./agentCursorPresenter";
 
 // Composes the Screen Agent loop (M2-03) for the Electron main process: it wires the loop's
 // injected seams to the real edges - the Core's step (`ScreenAgentCapability`), the
@@ -63,6 +68,19 @@ export interface ScreenAgentServiceDependencies {
   executor: SyntheticInputExecutor;
   /** Suspends/resumes Lune's overlay windows around each capture (overlay exclusion). */
   overlay: OverlaySuspender;
+  /**
+   * Reads the accessibility target signal each capture (M2-05), feeding the Core's
+   * Consequence floor so a click on a "Send"/hyperlink element escalates to a Confirm Gate.
+   * Optional: without it, captures carry no target signal and the floor simply never
+   * escalates (the pre-M2-05 behaviour), so tests and headless runs can omit it.
+   */
+  axProvider?: AxSignalProvider;
+  /**
+   * Flies the playful Overlay cursor to each Action's target before it executes (M2-05), so
+   * the user sees where Lune is about to act. Optional: without it the loop's
+   * `showActionTarget` is a no-op, so a headless run acts without the animation.
+   */
+  overlayCursor?: AgentCursorOverlay;
   /** Speaks the model's final text when a run completes (or advises). */
   speak: (finalText: string) => void | Promise<void>;
   /** Mints a Session id for each run (injected so tests are deterministic). */
@@ -95,6 +113,8 @@ export function createScreenAgentService(
     capability,
     executor,
     overlay,
+    axProvider,
+    overlayCursor,
     speak,
     generateSessionId,
     confirm,
@@ -109,19 +129,35 @@ export function createScreenAgentService(
     // then re-capture that same display each Step.
     const displayId = resolveActiveDisplayId();
 
-    return runScreenAgentLoop({
-      goal: options.goal,
-      sessionId: generateSessionId(),
-      captureScene: () => captureAgentScene(displayId, overlay),
-      decideStep: (input) => capability.step(input),
-      execute: (action, geometry) => executor.execute(action, geometry),
-      confirm: confirmGate,
-      speak,
-      guardrails: createScreenAgentGuardrails(guardrailConfig),
-      hashScreenshot,
-      now,
-      signal: options.signal,
-    });
+    // The cursor presenter is per-run: it flies the Overlay cursor on the bound display and
+    // remembers the previous target to time each hop. Without an overlay cursor edge (a
+    // headless run), `showActionTarget` is a no-op so the loop acts without the animation.
+    const presenter =
+      overlayCursor !== undefined
+        ? createAgentCursorPresenter({ overlay: overlayCursor, displayId })
+        : null;
+    const showActionTarget = presenter?.showActionTarget ?? (async () => {});
+
+    try {
+      return await runScreenAgentLoop({
+        goal: options.goal,
+        sessionId: generateSessionId(),
+        captureScene: () => captureAgentScene(displayId, overlay, axProvider),
+        decideStep: (input) => capability.step(input),
+        execute: (action, geometry) => executor.execute(action, geometry),
+        showActionTarget,
+        confirm: confirmGate,
+        speak,
+        guardrails: createScreenAgentGuardrails(guardrailConfig),
+        hashScreenshot,
+        now,
+        signal: options.signal,
+      });
+    } finally {
+      // However the run ended (done, declined, cancelled, guardrail, error), release the
+      // cursor so it flies back to the mouse rather than freezing at the last target.
+      presenter?.finish();
+    }
   }
 
   return { run };

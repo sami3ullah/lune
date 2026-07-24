@@ -109,6 +109,8 @@ import {
 } from "./agent/screenAgentService";
 import { createConfirmGateController } from "./agent/confirmGateController";
 import { ConfirmGateWindow } from "./confirmGateWindow";
+import { createDesktopAxSignalProvider } from "./agent/axSignalProvider";
+import type { AgentCursorOverlay } from "./agent/agentCursorPresenter";
 import {
   resolveWhisperServerBinaryPath,
   WHISPER_SERVER_PATH_ENV,
@@ -1187,6 +1189,26 @@ void app.whenReady().then(() => {
     executor: syntheticInputExecutor,
     // Assigned at the top of `whenReady`, above; non-null by the time the service is built.
     overlay: overlayManager!,
+    // The AX target signal (M2-05): read each capture so the Consequence floor can escalate a
+    // click on a "Send"/hyperlink element to a Confirm Gate. Best-effort - a poor
+    // accessibility tree degrades to no signal (no escalation), never an error.
+    axProvider: createDesktopAxSignalProvider(),
+    // The cursor "acts the part" (M2-05): fly the playful Overlay cursor to each Action's
+    // target before it executes, reusing the same `point` event the chat overlay flies on, so
+    // the user sees where Lune is about to act and a gated Action shows the cursor waiting.
+    overlayCursor: {
+      pointCursorAt: (displayId, target) => {
+        overlayManager?.sendToDisplay(displayId, {
+          type: "point",
+          point: { localX: target.localX, localY: target.localY, label: target.label },
+        });
+      },
+      endPointing: (displayId) => {
+        // End the interaction so the cursor flies back to the real mouse and resumes
+        // following once the run is over (the same signal the chat overlay ends a turn with).
+        overlayManager?.sendToDisplay(displayId, { type: "activity-end" });
+      },
+    } satisfies AgentCursorOverlay,
     speak: (text) => {
       void speakLine(text);
     },

@@ -2,6 +2,8 @@ import { desktopCapturer, screen } from "electron";
 import type { AgentDisplay, AgentScreenshot } from "@lune/core";
 import type { AgentDisplayGeometry } from "./agentCoordinateRemap";
 import type { SceneCapture } from "./screenAgentLoop";
+import type { AxSignalProvider } from "./axSignalProvider";
+import { buildAgentTargetSignal } from "./agentTargetSignal";
 
 // The Screen Agent's scene capture (M2-03): the overlay-excluded, single-active-display
 // screenshot the loop reasons about each Step. It is the agent sibling of the chat turn's
@@ -104,12 +106,19 @@ export interface OverlaySuspender {
  * The returned `display` and `geometry.captured*` are the captured pixel size: the Core
  * sizes the computer tool to it, the Vendor returns coordinates in it, and the executor
  * remaps them back to the display's global logical bounds - one consistent coordinate space
- * end to end. The target signal (the AX hit-test elements) is left unset here; wiring it is
- * M2-05's concern, and the Core simply applies no floor escalation without it.
+ * end to end.
+ *
+ * The accessibility target signal (M2-05) is read *after* the screenshot and outside the
+ * overlay-suspend bracket - the AX read doesn't photograph the screen, so there is no reason
+ * to keep Lune's cursor hidden through its (bounded) latency, and the overlay never takes
+ * focus so it can't shift the frontmost app the read walks. The read is best-effort: a `null`
+ * or empty signal (no `axProvider`, no accessibility, a timeout) simply yields no floor
+ * escalation, so a poor accessibility tree degrades gracefully (acceptance #3).
  */
 export async function captureAgentScene(
   displayId: number,
   overlay: OverlaySuspender,
+  axProvider?: AxSignalProvider,
 ): Promise<SceneCapture> {
   const displays = screen.getAllDisplays();
   const boundDisplay = displays.find((display) => display.id === displayId);
@@ -117,6 +126,7 @@ export async function captureAgentScene(
     throw new AgentSceneCaptureError("The Screen Agent's active display is no longer connected");
   }
 
+  let scene: SceneCapture;
   overlay.suspendFollowing();
   try {
     const sources = await desktopCapturer.getSources({
@@ -147,8 +157,22 @@ export async function captureAgentScene(
     };
     const display: AgentDisplay = { width, height };
 
-    return { screenshot, geometry, display };
+    scene = { screenshot, geometry, display };
   } finally {
     overlay.resumeFollowing();
   }
+
+  // Read the AX target signal for the Consequence floor. `capture()` never rejects, but guard
+  // anyway so a reader bug can never turn a good screenshot into a failed scene - the run
+  // continues with no signal (no escalation) rather than stopping.
+  if (axProvider !== undefined) {
+    try {
+      const raw = await axProvider.capture();
+      scene.targetSignal = buildAgentTargetSignal(raw, scene.geometry);
+    } catch {
+      scene.targetSignal = undefined;
+    }
+  }
+
+  return scene;
 }
