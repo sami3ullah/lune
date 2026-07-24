@@ -3,14 +3,18 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { app, BrowserWindow, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
+  createAnthropicComputerUseAdapter,
   createConversationManager,
+  createGeminiComputerUseAdapter,
   createReasoningCapability,
+  createScreenAgentCapability,
   describeCore,
   findReasoningVendor,
   parseAnswerPointTag,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
   validateReasoningKey,
+  type ComputerUseVendorId,
   type ReasoningVendorId,
   type SpeechCapability,
 } from "@lune/core";
@@ -97,6 +101,11 @@ import {
   runSyntheticInputDevTrigger,
 } from "./agent/syntheticInputService";
 import type { SyntheticInputExecutor } from "./agent/syntheticInputExecutor";
+import {
+  createScreenAgentService,
+  runScreenAgentDevTrigger,
+  type ScreenAgentService,
+} from "./agent/screenAgentService";
 import {
   resolveWhisperServerBinaryPath,
   WHISPER_SERVER_PATH_ENV,
@@ -210,6 +219,31 @@ const reasoningCapability = createReasoningCapability({
   getApiKey: (vendorId) => credentialStore.getKey(vendorId) ?? process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
   upstreamFetch: (url, requestInit) => fetch(url, requestInit),
   downscaleScreenshot: nativeImageDownscale,
+});
+
+// The dev-only env fallback for each computer-use Vendor's key, mirroring the Reasoning
+// fallback: the Screen Agent reuses Reasoning's Vendor selection + keys, so a keyed
+// Anthropic/Gemini Vendor can act with no extra credential.
+const COMPUTER_USE_API_KEY_ENV_BY_VENDOR: Record<ComputerUseVendorId, string> = {
+  anthropic: API_KEY_ENV_BY_VENDOR.anthropic,
+  google: API_KEY_ENV_BY_VENDOR.google,
+};
+
+// The Core's Screen Agent Capability (M2-01): the server-side half of the Shell-driven
+// agent loop. It advances one Session by one Step against the routed computer-use Vendor's
+// adapter (Anthropic + Gemini wired), gated on that Vendor's computer-use capability + key
+// exactly like Reasoning - a non-computer-use Vendor (OpenAI) or a missing key throws a
+// typed not-ready without any upstream call. The M2-03 loop (below) drives it: only the
+// Shell touches the OS; only the Core talks to the Vendor.
+const screenAgentCapability = createScreenAgentCapability({
+  getRoutingConfig: () => routingConfigStore.getConfig(),
+  adapters: {
+    anthropic: createAnthropicComputerUseAdapter(),
+    google: createGeminiComputerUseAdapter(),
+  },
+  getApiKey: (vendorId) =>
+    credentialStore.getKey(vendorId) ?? process.env[COMPUTER_USE_API_KEY_ENV_BY_VENDOR[vendorId]],
+  upstreamFetch: (url, requestInit) => fetch(url, requestInit),
 });
 
 // The Settings service (ticket 13): composes the config-file store, the OS-encrypted
@@ -326,6 +360,13 @@ let transcription: DesktopTranscription | null = null;
 // Accessibility grant. Assigned once the app is ready. The Screen Agent loop (a later M2
 // ticket) will drive it; until then only the env-gated dev trigger exercises it.
 let syntheticInputExecutor: SyntheticInputExecutor | null = null;
+
+// The Screen Agent service (M2-03): the Shell-driven agent loop over the real edges - the
+// Core step, the synthetic input executor, the overlay-excluded scene capture, and the
+// confirm gate. Assigned once the app is ready (it needs the executor + overlay). No
+// production consumer drives it yet (the advisory->act auto-routing is a later concern);
+// the env-gated dev trigger below runs one bounded session end to end.
+let screenAgentService: ScreenAgentService | null = null;
 
 // The Speech Capability (ticket 09): on-device Kokoro synthesis, gated on the Kokoro
 // weights being provisioned. Assigned once the app is ready (it needs the Provisioning
@@ -500,6 +541,28 @@ async function announceNoSpeech(): Promise<{ spoke: boolean }> {
   });
   await speechTurn.finish(nudge);
   return { spoke: true };
+}
+
+/**
+ * Speaks one line through the same Kokoro path a turn uses - the Screen Agent's voice when
+ * a run completes (or advises). A no-op when there is nothing to say, or when Kokoro isn't
+ * ready / the Pill is gone, so the run still ends cleanly in text-only mode without hanging.
+ */
+async function speakLine(text: string): Promise<void> {
+  if (text.trim().length === 0) {
+    return;
+  }
+  if (!speechCapability?.isReady() || pillWindow === null || pillWindow.isDestroyed()) {
+    return;
+  }
+  const speechTurn = createSpeechTurnPlayer({
+    speech: speechCapability,
+    turnId: randomUUID(),
+    sendEvent: sendSpeechEvent,
+    encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+    includeCaption: settingsStore.getStreamingText(),
+  });
+  await speechTurn.finish(text);
 }
 
 /**
@@ -1073,6 +1136,23 @@ void app.whenReady().then(() => {
   // below is the only caller for now.
   syntheticInputExecutor = createDesktopSyntheticInputExecutor();
 
+  // Screen Agent loop (M2-03): compose the Shell-driven agent loop over the real edges -
+  // the Core step, the executor above, and the overlay-excluded scene capture (the overlay
+  // manager suspends its own windows around each capture so Lune never photographs itself).
+  // The confirm gate defaults to the auto-approve placeholder until M2-04 wires the real
+  // chip/voice/hotkey UX; `speak` uses the same Kokoro path as a turn. The env-gated dev
+  // trigger below is the only caller for now (the advisory->act auto-routing is later work).
+  screenAgentService = createScreenAgentService({
+    capability: screenAgentCapability,
+    executor: syntheticInputExecutor,
+    // Assigned at the top of `whenReady`, above; non-null by the time the service is built.
+    overlay: overlayManager!,
+    speak: (text) => {
+      void speakLine(text);
+    },
+    generateSessionId: () => randomUUID(),
+  });
+
   // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the
   // hotkey live from the routing config (editable in Settings, ticket 13), records
   // through the Pill, transcribes on release via whisper, and answers the transcript as
@@ -1221,6 +1301,16 @@ void app.whenReady().then(() => {
     // If Accessibility is missing it routes to the pane (acceptance #3), never a silent no-op.
     await runSyntheticInputDevTrigger(syntheticInputExecutor!, {
       routeToAccessibilityPane: openAccessibilitySettings,
+    });
+    // Run one full Screen Agent session end to end (M2-03 acceptance #1) from the goal in
+    // LUNE_AGENT_LOOP_DEV; a no-op on a normal launch. Barge-in is real: the session's abort
+    // handle is registered with the voice loop, so a push-to-talk press cancels it mid-run
+    // (acceptance #4), and a missing Accessibility grant routes to the pane (never a silent
+    // no-op).
+    await runScreenAgentDevTrigger(screenAgentService!, {
+      routeToAccessibilityPane: openAccessibilitySettings,
+      registerBargeIn: (abort) => voiceController?.noteExternalTurnStarted(abort),
+      unregisterBargeIn: (abort) => voiceController?.noteTurnEnded(abort),
     });
   })().catch((error) => {
     console.error("[lune] provisioning/transcription/speech boot failed:", error);
