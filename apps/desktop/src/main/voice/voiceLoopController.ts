@@ -82,6 +82,15 @@ export class VoiceLoopController {
    * set (a Barge-in removes it, so its late completion cannot reset a newer interaction).
    */
   private readonly activeTurnAborts = new Set<AbortController>();
+  /**
+   * While a Screen Agent Confirm Gate is open, the spoken answer is routed here instead of
+   * being run as a turn (M2-04). When set, the push-to-talk key answers the gate - hold to
+   * speak "yes"/"no" - and never barges in the run the gate guards. Cleared when the gate
+   * closes.
+   */
+  private gateAnswer: ((transcript: string) => void) | null = null;
+  /** The id of the in-flight gate-answer recording, distinct from a turn recording. */
+  private gateRecordingId: string | null = null;
 
   constructor(private readonly dependencies: VoiceLoopControllerDependencies) {}
 
@@ -119,6 +128,30 @@ export class VoiceLoopController {
     }
   }
 
+  /**
+   * Opens Confirm Gate voice capture (M2-04): while this is active, the push-to-talk key
+   * answers the open gate - hold to speak, release to transcribe - and the recognized text
+   * is handed to `deliver` (which the gate classifies into yes/no/unclear) instead of being
+   * run as a conversation turn. Crucially, a press does NOT barge-in the Screen Agent run
+   * the gate guards, so the user can answer by voice without cancelling the run. Returns a
+   * disposer that closes capture and stops any in-flight gate recording; call it when the
+   * gate resolves.
+   */
+  openConfirmGateCapture(deliver: (transcript: string) => void): () => void {
+    this.gateAnswer = deliver;
+    return () => {
+      if (this.gateAnswer !== deliver) {
+        return;
+      }
+      this.gateAnswer = null;
+      if (this.gateRecordingId !== null) {
+        this.dependencies.sendRecordCommand({ type: "stop", turnId: this.gateRecordingId });
+        this.dependencies.overlayListenEnd();
+        this.gateRecordingId = null;
+      }
+    };
+  }
+
   /** Handles one recording event from the Pill (live level, finished clip, or capture error). */
   handleRecordEvent(event: VoiceRecordEvent): void {
     // Ignore events from a recording the loop has already moved past (a Barge-in
@@ -129,15 +162,29 @@ export class VoiceLoopController {
     switch (event.type) {
       case "level":
         // Only feed the waveform while actually listening; a level that races past the
-        // release must not re-show the waveform after it has ended.
-        if (this.machine.phase === "listening") {
+        // release must not re-show the waveform after it has ended. A gate-answer recording
+        // is a second "listening" state the turn machine doesn't model, so show it too.
+        if (this.machine.phase === "listening" || this.gateRecordingId !== null) {
           this.dependencies.overlayListenLevel(event.level);
         }
         return;
       case "clip":
-        void this.transcribeAndAnswer(event.audioBase64);
+        // A gate-answer clip goes to the open Confirm Gate; any other clip is a turn.
+        if (this.gateRecordingId !== null && event.turnId === this.gateRecordingId) {
+          void this.transcribeForGate(event.audioBase64);
+        } else {
+          void this.transcribeAndAnswer(event.audioBase64);
+        }
         return;
       case "silent":
+        // A silent gate-answer hold is an unclear reply: hand the gate an empty transcript,
+        // which it treats as ambiguous and re-prompts (never a proceed).
+        if (this.gateRecordingId !== null && event.turnId === this.gateRecordingId) {
+          this.gateRecordingId = null;
+          this.dependencies.overlayListenEnd();
+          this.gateAnswer?.("");
+          return;
+        }
         // The hold held no discernible speech: nudge the user instead of transcribing a
         // hallucination. Settle the machine as a no-speech turn, then announce.
         this.machine.transcribed(false);
@@ -160,6 +207,14 @@ export class VoiceLoopController {
   }
 
   private onHotkeyPressed(): void {
+    // A Confirm Gate is open: the key answers it (hold to speak) rather than running a turn
+    // or barging in the run it guards. Bypasses the turn machine entirely so no in-flight
+    // Screen Agent run is aborted while the user is deciding.
+    if (this.gateAnswer !== null) {
+      this.startGateAnswerRecording();
+      return;
+    }
+
     const plan = this.machine.hotkeyPressed();
     if (plan.bargeIn) {
       // Interrupt every in-flight turn and silence any playback before the new recording,
@@ -181,11 +236,61 @@ export class VoiceLoopController {
   }
 
   private onHotkeyReleased(): void {
+    // Releasing a gate-answer hold stops that recording; the clip transcribes to the gate.
+    // The turn machine never saw the press, so it must not see this release either.
+    if (this.gateRecordingId !== null) {
+      this.dependencies.sendRecordCommand({ type: "stop", turnId: this.gateRecordingId });
+      this.dependencies.overlayListenEnd();
+      return;
+    }
+
     const plan = this.machine.hotkeyReleased();
     if (plan.stopRecording && this.currentRecordingId !== null) {
       this.dependencies.sendRecordCommand({ type: "stop", turnId: this.currentRecordingId });
       this.dependencies.setPillActivity("thinking");
       this.dependencies.overlayListenEnd();
+    }
+  }
+
+  /** Starts a gate-answer recording (Confirm Gate voice capture), separate from a turn recording. */
+  private startGateAnswerRecording(): void {
+    // Bump the generation so any in-flight turn transcription is discarded (as a barge-in
+    // would), then record through the Pill on a distinct id the clip handler routes to the gate.
+    this.generation += 1;
+    const recordingId = this.dependencies.generateId();
+    this.gateRecordingId = recordingId;
+    this.currentRecordingId = recordingId;
+    this.dependencies.sendRecordCommand({ type: "start", turnId: recordingId });
+    this.dependencies.overlayListenStart();
+  }
+
+  /** Transcribes a released gate-answer clip and hands the text to the open gate. */
+  private async transcribeForGate(audioBase64: string): Promise<void> {
+    const deliver = this.gateAnswer;
+    this.gateRecordingId = null;
+    this.dependencies.overlayListenEnd();
+    if (deliver === null) {
+      return;
+    }
+    if (!this.dependencies.isTranscriptionReady()) {
+      // whisper isn't ready: treat as an unclear reply so the gate re-prompts, never proceeds.
+      deliver("");
+      return;
+    }
+    try {
+      const transcript = (
+        await this.dependencies.transcribe(this.dependencies.decodeBase64(audioBase64))
+      ).trim();
+      // Only answer if the same gate is still open (it may have been resolved by the chip or
+      // hotkey, or closed, while transcription ran).
+      if (this.gateAnswer === deliver) {
+        deliver(transcript);
+      }
+    } catch (error) {
+      console.error("[lune] gate-answer transcription failed:", error);
+      if (this.gateAnswer === deliver) {
+        deliver("");
+      }
     }
   }
 

@@ -63,6 +63,13 @@ import {
   type SpeechEvent,
 } from "../ipc/speechPlayback";
 import {
+  CONFIRM_GATE_ANSWER_CHANNEL,
+  CONFIRM_GATE_EVENT_CHANNEL,
+  ConfirmGateEventSchema,
+  type ConfirmGateAnswerValue,
+  type ConfirmGateEvent,
+} from "../ipc/confirmGate";
+import {
   MIC_OPEN_SETTINGS_CHANNEL,
   MIC_PERMISSION_REQUEST_CHANNEL,
   MIC_PERMISSION_STATUS_CHANNEL,
@@ -216,6 +223,29 @@ const luneBridge = {
     /** Tells the main process this Overlay has faded out and its window can be hidden. */
     signalIdle(): void {
       ipcRenderer.send(OVERLAY_IDLE_CHANNEL);
+    },
+  },
+  confirmGate: {
+    /**
+     * Subscribes the gate window to open/close events, validating each against the shared
+     * codec before it renders (no untyped shape crosses in). Only the Confirm Gate window
+     * subscribes. Returns an unsubscribe function.
+     */
+    onEvent(listener: (event: ConfirmGateEvent) => void): () => void {
+      const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
+        const parsedEvent = ConfirmGateEventSchema.safeParse(rawEvent);
+        if (parsedEvent.success) {
+          listener(parsedEvent.data);
+        } else {
+          console.error("[lune] dropping malformed confirm-gate event:", parsedEvent.error.message);
+        }
+      };
+      ipcRenderer.on(CONFIRM_GATE_EVENT_CHANNEL, forwardValidatedEvent);
+      return () => ipcRenderer.removeListener(CONFIRM_GATE_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+    /** Reports the chip's Approve/Cancel button press to the main process. */
+    answer(answer: ConfirmGateAnswerValue): void {
+      ipcRenderer.send(CONFIRM_GATE_ANSWER_CHANNEL, answer);
     },
   },
   speech: {

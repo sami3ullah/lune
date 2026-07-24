@@ -25,9 +25,11 @@ import type { SyntheticInputExecutor } from "./syntheticInputExecutor";
 // synthetic-input services.
 //
 // The confirm gate is a seam here on purpose: M2-03 owns *when* the loop confirms
-// (confirm-to-start + the irreversible guard); the chip/voice/hotkey UX behind it is
-// M2-04. Until then the default gate {@link autoApproveConfirmGate} approves so a run can
-// be exercised end to end, and swapping it for the real gate is a one-line change.
+// (confirm-to-start + the irreversible guard); the chip/voice/hotkey UX behind it is M2-04,
+// injected by the composition root (`createConfirmGateController` wired to the gate window,
+// the Enter/Escape hotkey, and push-to-talk voice). The {@link autoApproveConfirmGate}
+// default remains only so a run can be exercised in isolation (tests / a headless dev
+// trigger) where no gate UX is mounted; the real app always passes the real gate.
 
 /** A confirm gate: decide whether the loop may proceed with the Action it is about to run. */
 export type ConfirmGate = (request: ConfirmGateRequest) => Promise<boolean>;

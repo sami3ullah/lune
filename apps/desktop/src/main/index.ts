@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { app, BrowserWindow, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, globalShortcut, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
   createAnthropicComputerUseAdapter,
   createConversationManager,
@@ -107,6 +107,8 @@ import {
   runScreenAgentDevTrigger,
   type ScreenAgentService,
 } from "./agent/screenAgentService";
+import { createConfirmGateController } from "./agent/confirmGateController";
+import { ConfirmGateWindow } from "./confirmGateWindow";
 import {
   resolveWhisperServerBinaryPath,
   WHISPER_SERVER_PATH_ENV,
@@ -351,6 +353,30 @@ let lastCaptureProducedContent: boolean | null = null;
 // click-through window per display. Assigned once the app is ready (it creates
 // windows); a chat turn only runs after the UI is up, so it is always set by then.
 let overlayManager: OverlayWindowManager | null = null;
+
+// The Screen Agent Confirm Gate window (M2-04): the focusable on-screen chip that asks the
+// user to approve/decline before Lune touches the OS. Created lazily on first gate; held
+// here so it can be disposed on quit.
+let confirmGateWindow: ConfirmGateWindow | null = null;
+
+/** Registers a global accelerator, swallowing a malformed/taken-key failure (returns success). */
+function registerGlobalShortcutSafely(accelerator: string, handler: () => void): boolean {
+  try {
+    return globalShortcut.register(accelerator, handler);
+  } catch (error) {
+    console.error(`[lune] could not register global shortcut ${accelerator}:`, error);
+    return false;
+  }
+}
+
+/** Unregisters a global accelerator, swallowing any failure so teardown never throws. */
+function unregisterGlobalShortcutSafely(accelerator: string): void {
+  try {
+    globalShortcut.unregister(accelerator);
+  } catch (error) {
+    console.error(`[lune] could not unregister global shortcut ${accelerator}:`, error);
+  }
+}
 
 // The Transcription lifecycle (ticket 10): the supervised whisper.cpp child + its Core
 // Capability. Held at module scope so app-quit and abrupt-exit teardown can reach it to
@@ -967,6 +993,11 @@ app.on("before-quit", () => {
   void transcription?.shutdown();
   // Release the global keyboard hook so the native uiohook thread stops cleanly (ticket 11).
   voiceController?.stop();
+  // Release any Confirm Gate resources (a gate open at quit would still hold Enter/Escape;
+  // unregister just those, not every accelerator, and dispose the gate window).
+  unregisterGlobalShortcutSafely("Enter");
+  unregisterGlobalShortcutSafely("Escape");
+  confirmGateWindow?.dispose();
 });
 process.on("exit", () => {
   transcription?.killSync();
@@ -1087,6 +1118,10 @@ void app.whenReady().then(() => {
   overlayManager = new OverlayWindowManager();
   overlayManager.start();
 
+  // The Screen Agent Confirm Gate window (M2-04): the on-screen chip. Kept hidden until a
+  // gate opens; the controller below drives it alongside the hotkey and voice modalities.
+  confirmGateWindow = new ConfirmGateWindow();
+
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createPillWindow();
@@ -1142,9 +1177,11 @@ void app.whenReady().then(() => {
   // Screen Agent loop (M2-03): compose the Shell-driven agent loop over the real edges -
   // the Core step, the executor above, and the overlay-excluded scene capture (the overlay
   // manager suspends its own windows around each capture so Lune never photographs itself).
-  // The confirm gate defaults to the auto-approve placeholder until M2-04 wires the real
-  // chip/voice/hotkey UX; `speak` uses the same Kokoro path as a turn. The env-gated dev
-  // trigger below is the only caller for now (the advisory->act auto-routing is later work).
+  // The confirm gate (M2-04) is the real chip/voice/hotkey UX: the controller reconciles the
+  // three modalities, the chip is the focusable gate window, the hotkey is Enter/Escape
+  // registered only while a gate is open, and voice reuses push-to-talk (diverted to the
+  // gate so a spoken answer never barges in the run). `speak` uses the same Kokoro path as a
+  // turn. The env-gated dev trigger below is the only caller for now (advisory->act is later).
   screenAgentService = createScreenAgentService({
     capability: screenAgentCapability,
     executor: syntheticInputExecutor,
@@ -1153,6 +1190,38 @@ void app.whenReady().then(() => {
     speak: (text) => {
       void speakLine(text);
     },
+    confirm: createConfirmGateController({
+      speak: (text) => {
+        void speakLine(text);
+      },
+      showChip: (view) => {
+        confirmGateWindow?.open(view);
+        return () => confirmGateWindow?.close();
+      },
+      armAnswerCapture: (deliver) => {
+        // The chip's Approve/Cancel buttons.
+        const offChip =
+          confirmGateWindow?.onAnswer((intent) => deliver({ source: "chip", intent })) ?? (() => {});
+        // The hotkey: while the gate is open, Enter approves and Escape cancels from
+        // anywhere. Registered only for the gate's lifetime and released on resolve. Guarded
+        // so that if a key can't be registered (already held, or rejected on a platform), the
+        // chip and voice modalities still answer the gate rather than the whole arm failing.
+        registerGlobalShortcutSafely("Enter", () => deliver({ source: "hotkey", intent: "approve" }));
+        registerGlobalShortcutSafely("Escape", () => deliver({ source: "hotkey", intent: "cancel" }));
+        // Voice: push-to-talk answers the gate (hold to speak "yes"/"no") instead of barging
+        // in the run the gate guards.
+        const offVoice =
+          voiceController?.openConfirmGateCapture((transcript) =>
+            deliver({ source: "voice", transcript }),
+          ) ?? (() => {});
+        return () => {
+          offChip();
+          unregisterGlobalShortcutSafely("Enter");
+          unregisterGlobalShortcutSafely("Escape");
+          offVoice();
+        };
+      },
+    }),
     generateSessionId: () => randomUUID(),
   });
 

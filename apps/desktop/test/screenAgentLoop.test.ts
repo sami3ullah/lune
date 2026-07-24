@@ -307,6 +307,58 @@ describe("screen agent loop - barge-in cancellation", () => {
     expect(result.reason).toBe("cancelled");
     expect(harness.executed).toHaveLength(0); // approved, but cancelled before the OS touch
   });
+
+  it("classifies a barge-in that ends the gate as cancelled, not a decline", async () => {
+    const controller = new AbortController();
+    const harness = makeHarness({
+      actions: [CLICK_BENIGN],
+      // A real gate aborts its own wait on barge-in and resolves not-approved; the loop
+      // must read the aborted signal as a cancellation rather than a user decline.
+      confirm: async (request) => {
+        controller.abort();
+        return request.signal?.aborted === true ? false : true;
+      },
+      signal: controller.signal,
+    });
+    const result = await runScreenAgentLoop(harness.deps);
+
+    expect(result.reason).toBe("cancelled");
+    expect(harness.executed).toHaveLength(0);
+  });
+
+  it("passes the run's barge-in signal into each confirm request", async () => {
+    const controller = new AbortController();
+    const harness = makeHarness({ actions: [CLICK_BENIGN], signal: controller.signal });
+    await runScreenAgentLoop(harness.deps);
+
+    expect(harness.confirmRequests[0]?.signal).toBe(controller.signal);
+  });
+
+  it("honours a barge-in before a benign, non-gated Action executes", async () => {
+    const controller = new AbortController();
+    // Step 0 is gated + approved + executed; step 1 is a benign mid-session Action (no gate).
+    const harness = makeHarness({
+      actions: [CLICK_BENIGN, CLICK_BENIGN],
+      confirm: async () => true,
+      signal: controller.signal,
+    });
+    // A push-to-talk barge-in lands while the model is deciding the second (benign) step -
+    // between the decide and the execute, where no confirm gate would catch it.
+    let decideCalls = 0;
+    const realDecide = harness.deps.decideStep;
+    harness.deps.decideStep = async (input) => {
+      decideCalls += 1;
+      if (decideCalls === 2) {
+        controller.abort();
+      }
+      return realDecide(input);
+    };
+    const result = await runScreenAgentLoop(harness.deps);
+
+    expect(result.reason).toBe("cancelled");
+    // Only step 0 ran; the benign step 1 was abandoned before touching the OS.
+    expect(harness.executed).toHaveLength(1);
+  });
 });
 
 describe("screen agent loop - clean stop on error", () => {

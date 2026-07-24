@@ -68,6 +68,13 @@ export interface ConfirmGateRequest {
   goal: string;
   /** The 0-based index of the Action this gate precedes. */
   stepIndex: number;
+  /**
+   * The run's barge-in signal, so a gate waiting on the user can stop waiting the instant
+   * the session is cancelled (a push-to-talk press) instead of hanging for an answer that
+   * will never come. The loop still re-checks the signal after the gate resolves, so a
+   * barge-in during a gate ends the run as `cancelled` (not `declined`).
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -254,14 +261,21 @@ export async function runScreenAgentLoop(
             ? "irreversible"
             : null;
       if (gateKind !== null) {
-        const approved = await confirm({ kind: gateKind, action, goal, stepIndex });
+        const approved = await confirm({ kind: gateKind, action, goal, stepIndex, signal });
+        // A barge-in can land while the user is answering the gate. Honour it first, so a
+        // cancelled run is reported as `cancelled` rather than misread as a `declined` gate
+        // (the gate resolves not-approved when its wait is aborted).
+        if (isAborted(signal)) {
+          return stop("cancelled", stepIndex, false);
+        }
         if (!approved) {
           return stop("declined", stepIndex, false);
         }
       }
 
-      // A barge-in can land during the confirm await; honour it before any OS touch so a
-      // cancelled run never executes the Action the gate just approved.
+      // Honour a barge-in before any OS touch, unconditionally - covers both the gated path
+      // (a press during the confirm await) and the benign, non-gated path (a press during the
+      // preceding decide await). A cancelled run must never execute the Action it just decided.
       if (isAborted(signal)) {
         return stop("cancelled", stepIndex, false);
       }
