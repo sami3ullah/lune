@@ -15,6 +15,7 @@
   },
   "//deps": "Only the deps externalized from the main/preload bundles (native addons + zod, which the bundled @lune/shared/@lune/core require at runtime) ship in node_modules. Everything else - the two workspace packages and the renderer libs (react, framer-motion, ...) - is bundled into out/ by electron-vite, so it is a build-time (dev) dependency as far as packaging is concerned. This keeps the installer lean (ticket 15 acceptance #3) and keeps electron-builder from trying to pack the pnpm workspace symlinks.",
   "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "onnxruntime-node": "^1.27.0",
     "phonemizer": "^1.2.1",
     "uiohook-napi": "^1.5.5",

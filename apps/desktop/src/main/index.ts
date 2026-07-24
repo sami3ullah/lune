@@ -93,6 +93,11 @@ import {
   type DesktopTranscription,
 } from "./transcription/transcriptionService";
 import {
+  createDesktopSyntheticInputExecutor,
+  runSyntheticInputDevTrigger,
+} from "./agent/syntheticInputService";
+import type { SyntheticInputExecutor } from "./agent/syntheticInputExecutor";
+import {
   resolveWhisperServerBinaryPath,
   WHISPER_SERVER_PATH_ENV,
   WHISPER_SERVER_RESOURCE_NAME,
@@ -316,6 +321,12 @@ let overlayManager: OverlayWindowManager | null = null;
 // is ready and Provisioning readiness is known.
 let transcription: DesktopTranscription | null = null;
 
+// The synthetic input executor (M2-02): the Shell's hands for the Screen Agent - performs
+// canonical Actions as real OS input via the nut.js native backend, gated on the M1
+// Accessibility grant. Assigned once the app is ready. The Screen Agent loop (a later M2
+// ticket) will drive it; until then only the env-gated dev trigger exercises it.
+let syntheticInputExecutor: SyntheticInputExecutor | null = null;
+
 // The Speech Capability (ticket 09): on-device Kokoro synthesis, gated on the Kokoro
 // weights being provisioned. Assigned once the app is ready (it needs the Provisioning
 // readiness + models directory). A chat turn only runs after the UI is up, so it is set
@@ -355,6 +366,19 @@ function isAccessibilityTrusted(prompt: boolean): boolean {
     return true;
   }
   return systemPreferences.isTrustedAccessibilityClient(prompt);
+}
+
+/**
+ * Opens System Settings straight to the Accessibility pane (a no-op off macOS). The
+ * `x-apple.systempreferences:` URL is the same one the onboarding open-settings channel
+ * uses; kept in one helper so the accessibility IPC handler and the Screen Agent's
+ * degrade path (M2-02: route to the Accessibility pane when synthetic input is refused)
+ * route to the same place.
+ */
+function openAccessibilitySettings(): void {
+  if (process.platform === "darwin") {
+    void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+  }
 }
 
 /**
@@ -965,9 +989,7 @@ ipcMain.handle(ACCESSIBILITY_PERMISSION_REQUEST_CHANNEL, () => {
   return AccessibilityPermissionStateSchema.parse(deriveAccessibilityPermissionState(trusted));
 });
 ipcMain.on(ACCESSIBILITY_OPEN_SETTINGS_CHANNEL, () => {
-  if (process.platform === "darwin") {
-    void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
-  }
+  openAccessibilitySettings();
 });
 
 // The Pill's recording events (live level, finished clip, capture error) drive the voice
@@ -1044,6 +1066,12 @@ void app.whenReady().then(() => {
     getRoutingConfig: () => routingConfigStore.getConfig(),
     isKokoroReady: () => provisioning.capability.isRuntimeReady("kokoro"),
   });
+
+  // Synthetic input executor (M2-02): the Screen Agent's hands. Built over the nut.js
+  // native backend + Electron clipboard, reusing the M1 Accessibility grant. No consumer
+  // drives it yet (the Screen Agent loop is a later M2 ticket); the env-gated dev trigger
+  // below is the only caller for now.
+  syntheticInputExecutor = createDesktopSyntheticInputExecutor();
 
   // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the
   // hotkey live from the routing config (editable in Settings, ticket 13), records
@@ -1188,6 +1216,12 @@ void app.whenReady().then(() => {
     // Exercise the Kokoro native edges (onnxruntime-node + espeak) in dev once the
     // weights are provisioned (ticket 09 acceptance #3); a no-op on a normal launch.
     await runSpeechDevTrigger(speechCapability!);
+    // Exercise the synthetic input executor end to end (M2-02 acceptance #1) via the
+    // nut.js native edge; env-gated on LUNE_AGENT_INPUT_DEV, so a no-op on a normal launch.
+    // If Accessibility is missing it routes to the pane (acceptance #3), never a silent no-op.
+    await runSyntheticInputDevTrigger(syntheticInputExecutor!, {
+      routeToAccessibilityPane: openAccessibilitySettings,
+    });
   })().catch((error) => {
     console.error("[lune] provisioning/transcription/speech boot failed:", error);
   });
