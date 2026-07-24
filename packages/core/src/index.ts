@@ -181,6 +181,64 @@ export {
   type ChildRuntimeState,
 } from "./transcription/childRuntimeSupervisor.js";
 
+// The Screen Agent Capability: the Core's half of the Shell-driven agent loop (M2,
+// DECISIONS #14-15), ported from v1. It advances one Agent Session by one Step against
+// the routed computer-use Vendor's adapter, returns exactly one canonical,
+// vendor-independent Action (or terminal done), and applies the escalate-only
+// Consequence Level floor. Gated on the routed Vendor's computer-use capability + key
+// (typed not-ready, no upstream call, otherwise). Anthropic + Gemini adapters are
+// wired; the Electron main process injects `fetch` + the per-Vendor keys, and a test
+// injects stubs. Only the Shell touches the OS; only the Core talks to the Vendor.
+export {
+  createScreenAgentCapability,
+  ScreenAgentNotReadyError,
+  ScreenAgentStepInputError,
+  type ScreenAgentCapability,
+  type ScreenAgentCapabilityDependencies,
+  type ScreenAgentStepInput,
+} from "./agent/screenAgentCapability.js";
+export type {
+  AgentAction,
+  ClickAction,
+  TypeAction,
+  KeyAction,
+  ScrollAction,
+  CopyAction,
+  ObserveAction,
+  DoneAction,
+  ConsequenceLevel,
+  ScrollDirection,
+} from "./agent/agentAction.js";
+export { escalateConsequence } from "./agent/agentAction.js";
+export {
+  applyConsequenceFloor,
+  resolveConsequenceFloor,
+  type AgentTargetSignal,
+  type TargetElement,
+} from "./agent/consequenceFloor.js";
+export {
+  findComputerUseVendor,
+  COMPUTER_USE_VENDORS,
+  type ComputerUseVendor,
+  type ComputerUseVendorId,
+} from "./agent/computerUseVendors.js";
+export {
+  createAnthropicComputerUseAdapter,
+} from "./agent/anthropicComputerUse.js";
+export {
+  createGeminiComputerUseAdapter,
+} from "./agent/geminiComputerUse.js";
+export {
+  AGENT_SYSTEM_PROMPT,
+} from "./agent/agentSystemPrompt.js";
+export type {
+  AgentScreenshot,
+  AgentDisplay,
+  ComputerUseVendorAdapter,
+  ComputerUseStepInput,
+  ComputerUseStepResult,
+} from "./agent/computerUseAdapter.js";
+
 // The conversation model: the Core-owned multi-turn history the Chat Panel renders,
 // and the manager that advances it one turn at a time through the Reasoning Capability.
 export {
