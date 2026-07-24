@@ -54,6 +54,7 @@ describe("buildOpenAiChatRequest", () => {
       request: SAMPLE_REQUEST,
       downscaledScreenshots: downscaled,
       modelSlot: "gpt-4o",
+      tokenLimitField: "max_completion_tokens",
     });
 
     expect(openAiRequest.model).toBe("gpt-4o");
@@ -73,6 +74,7 @@ describe("buildOpenAiChatRequest", () => {
       request: SAMPLE_REQUEST,
       downscaledScreenshots: downscaled,
       modelSlot: "gpt-4o",
+      tokenLimitField: "max_completion_tokens",
     });
 
     const parts = openAiRequest.messages[3].content as OpenAiContentPart[];
@@ -97,6 +99,7 @@ describe("buildOpenAiChatRequest", () => {
       request: SAMPLE_REQUEST,
       downscaledScreenshots: downscaled,
       modelSlot: "gpt-4o",
+      tokenLimitField: "max_completion_tokens",
     });
 
     const parts = openAiRequest.messages[3].content as OpenAiContentPart[];
@@ -111,7 +114,42 @@ describe("buildOpenAiChatRequest", () => {
       request: { messages: [{ role: "user", content: "hi" }] },
       downscaledScreenshots: [],
       modelSlot: "gpt-4o",
+      tokenLimitField: "max_completion_tokens",
     });
     expect(openAiRequest.messages[0]).toEqual({ role: "system", content: CANONICAL_SYSTEM_PROMPT });
+  });
+
+  it("carries the completion limit under the Vendor's token-limit field, and only that one", () => {
+    // OpenAI's reasoning families reject `max_tokens` and require `max_completion_tokens`;
+    // Gemini's OpenAI-compatible surface still speaks `max_tokens`. Exactly one is set.
+    const openAiRequest = buildOpenAiChatRequest({
+      request: { messages: [{ role: "user", content: "hi" }], maxTokens: 777 },
+      downscaledScreenshots: [],
+      modelSlot: "gpt-5.4-mini",
+      tokenLimitField: "max_completion_tokens",
+    });
+    expect(openAiRequest.max_completion_tokens).toBe(777);
+    expect(openAiRequest.max_tokens).toBeUndefined();
+
+    const geminiRequest = buildOpenAiChatRequest({
+      request: { messages: [{ role: "user", content: "hi" }], maxTokens: 777 },
+      downscaledScreenshots: [],
+      modelSlot: "gemini-3.5-flash-lite",
+      tokenLimitField: "max_tokens",
+    });
+    expect(geminiRequest.max_tokens).toBe(777);
+    expect(geminiRequest.max_completion_tokens).toBeUndefined();
+  });
+
+  it("defaults the completion budget high enough to cover a reasoning model's hidden tokens", () => {
+    // With no stated limit, a reasoning model's reasoning tokens plus the short spoken
+    // answer must fit, so the default is generous rather than sized for the answer alone.
+    const openAiRequest = buildOpenAiChatRequest({
+      request: { messages: [{ role: "user", content: "hi" }] },
+      downscaledScreenshots: [],
+      modelSlot: "gpt-5.4-mini",
+      tokenLimitField: "max_completion_tokens",
+    });
+    expect(openAiRequest.max_completion_tokens).toBeGreaterThanOrEqual(4096);
   });
 });

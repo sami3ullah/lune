@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSettingsStore } from "./settingsStore";
+import { Combobox } from "./Combobox";
 import type { ReadinessRow, SettingsCatalog, SettingsValues, SettingsVendorId } from "../ipc/settings";
 import { displayHotkeyToken, validateHotkeyToken } from "../ipc/hotkey";
 
@@ -68,14 +69,7 @@ export function Settings() {
           catalog={catalog}
           values={values}
           keyedVendors={keyedVendors}
-          onSelectVendor={(vendor) => {
-            const defaultModel =
-              catalog.vendors.find((candidate) => candidate.id === vendor)?.defaultModel ?? "";
-            applyValues({ reasoning: { vendor, modelSlot: defaultModel } });
-          }}
-          onSetModelSlot={(modelSlot) =>
-            applyValues({ reasoning: { vendor: values.reasoning.vendor, modelSlot } })
-          }
+          onSelectModel={(vendor, modelSlot) => applyValues({ reasoning: { vendor, modelSlot } })}
         />
 
         <VoiceSection
@@ -94,8 +88,6 @@ export function Settings() {
             onChange={(streamingText) => applyValues({ streamingText })}
           />
         </Section>
-
-        <ApiKeysSection catalog={catalog} keyedVendors={keyedVendors} />
       </div>
     </Shell>
   );
@@ -104,7 +96,7 @@ export function Settings() {
 /** The window chrome: draggable header + close, matching the Chat Panel. */
 function Shell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden border border-white/10 bg-neutral-900/90 text-neutral-100 backdrop-blur-md">
+    <div className="flex h-screen w-screen flex-col overflow-hidden border border-white/10 bg-neutral-900 text-neutral-100">
       <header className="app-drag flex items-center justify-between border-b border-white/10 px-4 py-2.5">
         <span className="text-xs font-medium tracking-wide text-neutral-200">Settings</span>
         <button
@@ -164,81 +156,229 @@ function StatusDot({ state }: { state: ReadinessRow["state"] }) {
   return <span className={`inline-block h-2 w-2 rounded-full ${color}`} aria-hidden />;
 }
 
-/** Vendor picker (unkeyed disabled) + Model Slot (shortlist via datalist + free text). */
+/**
+ * The Reasoning section: one card per Vendor, each holding its secure key entry and -
+ * once keyed - a live model picker right below the key (so choosing a model never means
+ * scrolling to a separate section). Adding a key is live-validated with a cheap test call
+ * (the same check onboarding runs); picking a model both routes to that Vendor and sets
+ * its Model Slot, so the model list you see always belongs to the Vendor you're editing.
+ * The one active Vendor is the one Lune answers with.
+ */
 function ReasoningSection({
   catalog,
   values,
   keyedVendors,
-  onSelectVendor,
-  onSetModelSlot,
+  onSelectModel,
 }: {
   catalog: SettingsCatalog;
   values: SettingsValues;
   keyedVendors: SettingsVendorId[];
-  onSelectVendor: (vendor: SettingsVendorId) => void;
-  onSetModelSlot: (modelSlot: string) => void;
+  /** Route to `vendor` and answer with `modelSlot` from the next turn on. */
+  onSelectModel: (vendor: SettingsVendorId, modelSlot: string) => void;
 }) {
-  const activeVendor = catalog.vendors.find((vendor) => vendor.id === values.reasoning.vendor);
-  const [modelDraft, setModelDraft] = useState(values.reasoning.modelSlot);
-  // Keep the draft in sync when the applied model changes (e.g. switching Vendor resets it).
-  useEffect(() => setModelDraft(values.reasoning.modelSlot), [values.reasoning.modelSlot]);
-
   return (
     <Section title="Reasoning">
-      <div className="flex flex-wrap gap-1.5">
-        {catalog.vendors.map((vendor) => {
-          const keyed = keyedVendors.includes(vendor.id);
-          const active = vendor.id === values.reasoning.vendor;
-          return (
-            <button
-              key={vendor.id}
-              type="button"
-              disabled={!keyed}
-              title={keyed ? undefined : "Add this Vendor's API key below to enable it."}
-              onClick={() => onSelectVendor(vendor.id)}
-              className={`app-no-drag rounded-lg border px-2.5 py-1.5 text-xs transition ${
-                active
-                  ? "border-white/25 bg-white/15 text-neutral-100"
-                  : keyed
-                    ? "cursor-pointer border-white/10 text-neutral-300 hover:bg-white/10"
-                    : "border-white/5 text-neutral-600"
-              }`}
-            >
-              {vendor.displayName}
-            </button>
-          );
-        })}
+      <p className="text-[11px] text-neutral-500">
+        Lune thinks with your own API key, stored in your OS keychain (never in a file). Connect a Vendor, then pick
+        the model Lune should answer with - the active Vendor is the one it uses.
+      </p>
+      <div className="space-y-2.5">
+        {catalog.vendors.map((vendor) => (
+          <VendorCard
+            key={vendor.id}
+            vendor={vendor}
+            keyed={keyedVendors.includes(vendor.id)}
+            active={vendor.id === values.reasoning.vendor}
+            activeModelSlot={values.reasoning.modelSlot}
+            onSelectModel={(modelSlot) => onSelectModel(vendor.id, modelSlot)}
+          />
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * One Vendor's card: display name + status, secure key entry (live-validated on save,
+ * clearable), and - once keyed - the live model picker. Picking a model here makes this
+ * Vendor active with that model.
+ */
+function VendorCard({
+  vendor,
+  keyed,
+  active,
+  activeModelSlot,
+  onSelectModel,
+}: {
+  vendor: SettingsCatalog["vendors"][number];
+  keyed: boolean;
+  active: boolean;
+  activeModelSlot: string;
+  onSelectModel: (modelSlot: string) => void;
+}) {
+  const validateKey = useSettingsStore((state) => state.validateKey);
+  const clearKey = useSettingsStore((state) => state.clearKey);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    const value = draft.trim();
+    if (value.length === 0 || busy) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await validateKey(vendor.id, value);
+      if (result.ok) {
+        setDraft("");
+      } else {
+        setError(result.reason);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clear() {
+    setBusy(true);
+    setError(null);
+    try {
+      await clearKey(vendor.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className={`rounded-xl border p-3 transition ${
+        active ? "border-white/25 bg-white/[0.06]" : "border-white/10 bg-black/20"
+      }`}
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <span className="text-sm text-neutral-200">{vendor.displayName}</span>
+        {active ? (
+          <span className="rounded-full bg-emerald-400/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-300/90">
+            Active
+          </span>
+        ) : keyed ? (
+          <button
+            type="button"
+            onClick={() => onSelectModel(vendor.defaultModel)}
+            className="app-no-drag cursor-pointer rounded-full border border-white/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-neutral-300 transition hover:bg-white/10"
+          >
+            Use
+          </button>
+        ) : (
+          <span className="text-[10px] uppercase tracking-wider text-neutral-600">No key</span>
+        )}
       </div>
 
-      <label className="block">
-        <span className="mb-1 block text-[11px] text-neutral-500">Model</span>
+      <div className="flex items-center gap-2">
         <input
-          list="reasoning-model-shortlist"
-          value={modelDraft}
-          onChange={(event) => setModelDraft(event.target.value)}
-          onBlur={() => {
-            const trimmed = modelDraft.trim();
-            if (trimmed.length > 0 && trimmed !== values.reasoning.modelSlot) {
-              onSetModelSlot(trimmed);
-            } else {
-              setModelDraft(values.reasoning.modelSlot);
-            }
+          type="password"
+          value={draft}
+          disabled={busy}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setError(null);
           }}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
-              event.currentTarget.blur();
+              void submit();
             }
           }}
-          placeholder={activeVendor?.defaultModel}
-          className="app-no-drag w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-neutral-100 placeholder:text-neutral-600 focus:border-white/25 focus:outline-none"
+          placeholder={keyed ? "Enter a new key to replace" : "Paste API key"}
+          className="app-no-drag flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-neutral-100 placeholder:text-neutral-600 focus:border-white/25 focus:outline-none"
         />
-        <datalist id="reasoning-model-shortlist">
-          {(activeVendor?.modelShortlist ?? []).map((model) => (
-            <option key={model} value={model} />
-          ))}
-        </datalist>
-      </label>
-    </Section>
+        <button
+          type="button"
+          onClick={() => void submit()}
+          disabled={busy || draft.trim().length === 0}
+          className="app-no-drag cursor-pointer rounded-lg bg-white/15 px-3 py-2 text-xs text-neutral-100 transition hover:bg-white/25 disabled:cursor-default disabled:opacity-40"
+        >
+          {busy ? "Checking…" : keyed ? "Replace" : "Connect"}
+        </button>
+        {keyed && (
+          <button
+            type="button"
+            onClick={() => void clear()}
+            disabled={busy}
+            className="app-no-drag cursor-pointer rounded-lg border border-white/10 px-3 py-2 text-xs text-neutral-400 transition hover:bg-white/10"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+      {error !== null && <p className="mt-2 text-[11px] leading-snug text-amber-300/90">{error}</p>}
+
+      {keyed && (
+        <VendorModelPicker
+          vendor={vendor}
+          selectedModel={active ? activeModelSlot : vendor.defaultModel}
+          onSelectModel={onSelectModel}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The per-Vendor model picker: a free-text field whose suggestions are the Vendor's live
+ * models, fetched from the Vendor's API when the card first shows (so the list tracks what
+ * the Vendor currently serves rather than a hardcoded shortlist). Free text is still
+ * allowed for a model not in the list; committing a value routes to this Vendor.
+ */
+function VendorModelPicker({
+  vendor,
+  selectedModel,
+  onSelectModel,
+}: {
+  vendor: SettingsCatalog["vendors"][number];
+  selectedModel: string;
+  onSelectModel: (modelSlot: string) => void;
+}) {
+  const models = useSettingsStore((state) => state.models[vendor.id]);
+  const fetchModels = useSettingsStore((state) => state.fetchModels);
+
+  // Load the Vendor's live models once the card is shown; refetch on an explicit retry.
+  useEffect(() => {
+    if (models === undefined) {
+      void fetchModels(vendor.id);
+    }
+  }, [models, fetchModels, vendor.id]);
+
+  // The live list when available, else the curated shortlist (offline / not-yet-fetched).
+  const modelIds = models?.list.length ? models.list : [...vendor.modelShortlist];
+  const options = modelIds.map((id) => ({ value: id, label: id }));
+
+  return (
+    <div className="mt-2.5">
+      <p className="mb-1 text-[11px] text-neutral-500">Model</p>
+      <Combobox
+        value={selectedModel}
+        options={options}
+        onCommit={onSelectModel}
+        placeholder={vendor.defaultModel}
+        allowCustom
+        hint={models?.loading === true ? "Loading models…" : undefined}
+        emptyLabel="No matching model - type a model id to use it"
+      />
+      {models?.error != null && (
+        <p className="mt-1 text-[11px] leading-snug text-amber-300/90">
+          {models.error}{" "}
+          <button
+            type="button"
+            onClick={() => void fetchModels(vendor.id)}
+            className="app-no-drag cursor-pointer text-sky-300/90 underline-offset-2 transition hover:text-sky-200 hover:underline"
+          >
+            Retry
+          </button>
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -307,17 +447,11 @@ function VoiceSection({
     });
   return (
     <Section title="Voice">
-      <select
+      <Combobox
         value={voice}
-        onChange={(event) => onSelectVoice(event.target.value)}
-        className="app-no-drag w-full cursor-pointer rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-neutral-100 focus:border-white/25 focus:outline-none"
-      >
-        {orderedVoices.map(({ code, label }) => (
-          <option key={code} value={code} className="bg-neutral-900">
-            {label}
-          </option>
-        ))}
-      </select>
+        options={orderedVoices.map(({ code, label }) => ({ value: code, label }))}
+        onCommit={onSelectVoice}
+      />
     </Section>
   );
 }
@@ -433,103 +567,3 @@ function ToggleRow({
   );
 }
 
-/** Per-Vendor secure key entry: enter to save, clear to remove. Never shows a stored key. */
-function ApiKeysSection({
-  catalog,
-  keyedVendors,
-}: {
-  catalog: SettingsCatalog;
-  keyedVendors: SettingsVendorId[];
-}) {
-  return (
-    <Section title="API keys">
-      <p className="text-[11px] text-neutral-500">
-        Stored in your OS keychain, never in a file. A Vendor unlocks once its key is saved.
-      </p>
-      <div className="space-y-2">
-        {catalog.vendors.map((vendor) => (
-          <ApiKeyRow key={vendor.id} vendorId={vendor.id} displayName={vendor.displayName} keyed={keyedVendors.includes(vendor.id)} />
-        ))}
-      </div>
-    </Section>
-  );
-}
-
-function ApiKeyRow({
-  vendorId,
-  displayName,
-  keyed,
-}: {
-  vendorId: SettingsVendorId;
-  displayName: string;
-  keyed: boolean;
-}) {
-  const setKey = useSettingsStore((state) => state.setKey);
-  const [draft, setDraft] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  async function submit() {
-    const value = draft.trim();
-    if (value.length === 0 || busy) {
-      return;
-    }
-    setBusy(true);
-    try {
-      await setKey(vendorId, value);
-      setDraft("");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function clear() {
-    setBusy(true);
-    try {
-      await setKey(vendorId, "");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div>
-      <div className="mb-1 flex items-center justify-between">
-        <span className="text-xs text-neutral-300">{displayName}</span>
-        {keyed && <span className="text-[10px] uppercase tracking-wider text-emerald-400/90">Saved</span>}
-      </div>
-      <div className="flex items-center gap-2">
-        <input
-          type="password"
-          value={draft}
-          disabled={busy}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              void submit();
-            }
-          }}
-          placeholder={keyed ? "Enter a new key to replace" : "Paste API key"}
-          className="app-no-drag flex-1 rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-neutral-100 placeholder:text-neutral-600 focus:border-white/25 focus:outline-none"
-        />
-        <button
-          type="button"
-          onClick={() => void submit()}
-          disabled={busy || draft.trim().length === 0}
-          className="app-no-drag cursor-pointer rounded-lg bg-white/15 px-3 py-2 text-xs text-neutral-100 transition hover:bg-white/25 disabled:cursor-default disabled:opacity-40"
-        >
-          Save
-        </button>
-        {keyed && (
-          <button
-            type="button"
-            onClick={() => void clear()}
-            disabled={busy}
-            className="app-no-drag cursor-pointer rounded-lg border border-white/10 px-3 py-2 text-xs text-neutral-400 transition hover:bg-white/10"
-          >
-            Clear
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}

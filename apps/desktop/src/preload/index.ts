@@ -29,19 +29,27 @@ import {
 } from "../ipc/conversations";
 import {
   SETTINGS_GET_CHANNEL,
+  SETTINGS_LIST_MODELS_CHANNEL,
   SETTINGS_READINESS_CHANNEL,
   SETTINGS_REPAIR_CHANNEL,
   SETTINGS_SAVE_CHANNEL,
   SETTINGS_SET_KEY_CHANNEL,
   SETTINGS_TOGGLE_CHANNEL,
+  SETTINGS_VALIDATE_KEY_CHANNEL,
+  ListModelsResponseSchema,
   ReadinessRowSchema,
   SettingsSnapshotSchema,
   SettingsStateSchema,
+  ValidateKeyResponseSchema,
+  type ListModelsRequest,
+  type ListModelsResponse,
   type ReadinessRow,
   type SetApiKeyRequest,
   type SettingsSnapshot,
   type SettingsState,
   type SettingsValues,
+  type ValidateKeyRequest,
+  type ValidateKeyResponse,
 } from "../ipc/settings";
 import {
   OVERLAY_EVENT_CHANNEL,
@@ -101,10 +109,7 @@ import {
   ONBOARDING_START_DOWNLOAD_CHANNEL,
   ONBOARDING_VALIDATE_KEY_CHANNEL,
   OnboardingDownloadStatusSchema,
-  ValidateKeyResponseSchema,
   type OnboardingDownloadStatusValue,
-  type ValidateKeyRequest,
-  type ValidateKeyResponse,
 } from "../ipc/onboarding";
 import type { SettingsVendorId } from "../ipc/settings";
 
@@ -159,6 +164,18 @@ const luneBridge = {
     /** Sets (non-empty) or clears (empty) one Vendor's API key; resolves with new state. */
     async setKey(request: SetApiKeyRequest): Promise<SettingsState> {
       return SettingsStateSchema.parse(await ipcRenderer.invoke(SETTINGS_SET_KEY_CHANNEL, request));
+    },
+    /**
+     * Live-validates a candidate Vendor key with a cheap test call and, on success, stores
+     * it (routing the Vendor when the currently-routed one has no key) - the same flow the
+     * onboarding key step uses. Resolves with the verdict and the resulting Settings state.
+     */
+    async validateKey(request: ValidateKeyRequest): Promise<ValidateKeyResponse> {
+      return ValidateKeyResponseSchema.parse(await ipcRenderer.invoke(SETTINGS_VALIDATE_KEY_CHANNEL, request));
+    },
+    /** Lists a Vendor's live models (using its stored key) for the model picker. */
+    async listModels(request: ListModelsRequest): Promise<ListModelsResponse> {
+      return ListModelsResponseSchema.parse(await ipcRenderer.invoke(SETTINGS_LIST_MODELS_CHANNEL, request));
     },
     /** Re-runs/repairs Provisioning; resolves with the state (readiness reflects the run). */
     async repair(): Promise<SettingsState> {

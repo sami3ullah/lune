@@ -1,29 +1,24 @@
-import { findReasoningVendor, type ProvisioningStatus } from "@lune/core";
-import type {
-  KeyValidationResultValue,
-  OnboardingDownloadStatusValue,
-  ValidateKeyRequest,
-} from "../../ipc/onboarding";
-import type { SettingsState } from "../../ipc/settings";
-import type { SettingsVendorId } from "../../ipc/settings";
-import { SecureStorageUnavailableError } from "../settings/credentialStore";
+import { type ProvisioningStatus } from "@lune/core";
+import type { OnboardingDownloadStatusValue } from "../../ipc/onboarding";
+import type { KeyValidationResultValue, SettingsState, ValidateKeyRequest } from "../../ipc/settings";
 import type { SettingsService } from "../settings/settingsService";
 import { deriveOnboardingDownloadStatus } from "./onboardingDownloadStatus";
 import type { OnboardingStore } from "./onboardingStore";
 
 // The onboarding main-process composition (ticket 14): it sits between the typed
 // onboarding IPC handlers and the seams the flow needs - the Settings service (which
-// owns key storage + Vendor routing + readiness), the cheap key validator, the one
-// Provisioning run, and the completion flag - so the handlers stay thin and the flow
-// logic lives in one place. The pure logic it leans on (key validation, download-status
-// derivation) is unit-tested in the Core and here; this layer is the glue.
+// owns key storage + Vendor routing + readiness + the shared validate-and-save-key
+// flow), the one Provisioning run, and the completion flag - so the handlers stay thin
+// and the flow logic lives in one place. The pure logic it leans on (download-status
+// derivation) is unit-tested; this layer is the glue.
 
 /** The injected boundaries the onboarding service composes. */
 export interface OnboardingServiceDependencies {
-  /** The Settings service: stores keys, gates/routes Vendors, and reports readiness. */
+  /**
+   * The Settings service: stores keys, gates/routes Vendors, reports readiness, and owns
+   * the shared validate-and-save-key flow the onboarding key step delegates to.
+   */
   settingsService: SettingsService;
-  /** The cheap key-validation call (Core `validateReasoningKey` with `fetch` injected). */
-  validateKey: (vendorId: SettingsVendorId, key: string) => Promise<KeyValidationResultValue>;
   /** The live Provisioning run snapshot (phase, progress bytes, preflight). */
   provisioningStatus: () => ProvisioningStatus;
   /** Whether every pinned Runtime's weights are verified and ready. */
@@ -51,46 +46,13 @@ export interface OnboardingService {
 }
 
 export function createOnboardingService(dependencies: OnboardingServiceDependencies): OnboardingService {
-  const { settingsService, validateKey, provisioningStatus, isAllProvisioned, startProvisioning, onboardingStore } =
-    dependencies;
-
-  /** The current Settings state, without the static catalog. */
-  function currentState(): SettingsState {
-    const { catalog: _catalog, ...state } = settingsService.snapshot();
-    return state;
-  }
+  const { settingsService, provisioningStatus, isAllProvisioned, startProvisioning, onboardingStore } = dependencies;
 
   return {
-    validateAndSaveKey: async ({ vendor, key }) => {
-      const result = await validateKey(vendor, key);
-      if (!result.ok) {
-        return { result, state: currentState() };
-      }
-
-      try {
-        // The key works: store it (this gates the Vendor selectable), then route to it
-        // when the currently-routed Vendor still has no key, so a user who supplies only
-        // (say) an Anthropic key lands on a working Vendor rather than the unkeyed Gemini
-        // default. When the routed Vendor is already keyed (e.g. the default Gemini), its
-        // selection is kept - Gemini stays the preferred default.
-        let state = settingsService.setKey({ vendor, key });
-        if (!state.keyedVendors.includes(state.values.reasoning.vendor)) {
-          state = settingsService.save({
-            ...state.values,
-            reasoning: { vendor, modelSlot: findReasoningVendor(vendor).defaultModel },
-          });
-        }
-        return { result, state };
-      } catch (error) {
-        // The key is valid but could not be stored (an unavailable OS keychain). Report
-        // it as an actionable failure rather than letting the step advance with no key.
-        const reason =
-          error instanceof SecureStorageUnavailableError
-            ? "Your key is valid, but Lune couldn't save it to your OS keychain. Check that your login keychain is unlocked and try again."
-            : "Your key is valid, but Lune couldn't save it. Please try again.";
-        return { result: { ok: false, reason }, state: currentState() };
-      }
-    },
+    // The validate-store-and-route flow lives in the Settings service (the shared home for
+    // key management), so the onboarding key step and the Settings key entry behave
+    // identically. This is a thin delegation.
+    validateAndSaveKey: (request) => settingsService.validateAndSaveKey(request),
 
     startDownload: () => {
       // Idempotent: the controller no-ops a re-trigger while running and resumes partial

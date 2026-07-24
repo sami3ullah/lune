@@ -212,16 +212,18 @@ export function createScreenAgentCapability(
       goal = undefined;
     }
 
-    // Resolve the computer-use model. When the Vendor's computer use needs a dedicated
-    // model (Google), always use it - the config's advisory Model Slot selects a chat
-    // model that cannot drive computer use. Otherwise (Anthropic) the advisory Model
-    // Slot doubles as the computer-use model, so it stays the source of truth, falling
-    // back to the Vendor default only when unset.
-    const model = vendor.computerUseModelIsDedicated
-      ? vendor.defaultModel
-      : (reasoningSelection.modelSlot.trim().length > 0
+    // Resolve the acting model, asking the *adapter* (not the Vendor) which model it
+    // drives - two adapters for one Vendor can differ (OpenAI's dedicated computer-use
+    // adapter vs its vision-driven one). When the adapter acts on the advisory Model Slot
+    // (Anthropic's computer-use tool, or any vision-driven adapter), that chat slot stays
+    // the source of truth, falling back to the Vendor default only when unset. Otherwise
+    // the adapter needs a dedicated model (Google/OpenAI computer-use), so the config's
+    // advisory Model Slot - which selects a chat model that cannot drive it - is ignored.
+    const model = adapter.usesAdvisoryModelSlot
+      ? (reasoningSelection.modelSlot.trim().length > 0
           ? reasoningSelection.modelSlot
-          : vendor.defaultModel);
+          : vendor.defaultModel)
+      : vendor.defaultModel;
 
     // Advance the Vendor's conversation by one Step behind the adapter seam. An upstream
     // failure throws out of here, ending the Session cleanly for the Shell to surface.

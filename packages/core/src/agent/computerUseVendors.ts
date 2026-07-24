@@ -27,22 +27,14 @@ export interface ComputerUseVendor {
   /** Human-readable name, for logs and error messages. */
   displayName: string;
   /**
-   * The Vendor's default computer-use-capable model id.
+   * The Vendor's default computer-use-capable model id, used by the adapters that need a
+   * *dedicated* acting model (Google's `gemini-*-computer-use-*`, OpenAI's
+   * `computer-use-preview`) and as the fallback when the advisory Model Slot is unset.
+   * Whether a given adapter uses this or the advisory chat slot is the adapter's own
+   * `usesAdvisoryModelSlot` flag, not a Vendor-wide fact - the vision-driven adapter acts
+   * on the chat slot for the very same Vendor.
    */
   defaultModel: string;
-  /**
-   * Whether this Vendor's computer use requires a *dedicated* model distinct from the
-   * advisory chat model. When true, an Agent Step always uses `defaultModel` and
-   * ignores the config's advisory Reasoning Model Slot (which selects a chat model that
-   * cannot drive computer use). When false, the advisory Model Slot doubles as the
-   * computer-use model (Anthropic's Claude models support the computer-use tool), so
-   * the config's Model Slot is used - keeping the chat "single source of truth" for
-   * that Vendor.
-   *
-   * Google's computer use is a separate `gemini-*-computer-use-*` model from its
-   * advisory `gemini-*-flash` vision models, so it is dedicated; Anthropic's is not.
-   */
-  computerUseModelIsDedicated: boolean;
 }
 
 /**
@@ -59,9 +51,6 @@ export const COMPUTER_USE_VENDORS: Partial<Record<ComputerUseVendorId, ComputerU
     // Computer use requires a capable Claude model; this is the advisory default
     // too, so a user who keyed Anthropic can act without changing their Model Slot.
     defaultModel: "claude-sonnet-4-6",
-    // Claude chat models support the computer-use tool, so the advisory Model Slot
-    // doubles as the computer-use model.
-    computerUseModelIsDedicated: false,
   },
   google: {
     id: "google",
@@ -69,19 +58,14 @@ export const COMPUTER_USE_VENDORS: Partial<Record<ComputerUseVendorId, ComputerU
     // Gemini's dedicated computer-use model (a distinct model from the advisory
     // Gemini vision model), used only when Reasoning is routed to Google for acting.
     defaultModel: "gemini-2.5-computer-use-preview-10-2025",
-    // The advisory gemini-*-flash vision model cannot drive computer use; acting must
-    // use this dedicated model regardless of the config's advisory Model Slot.
-    computerUseModelIsDedicated: true,
   },
   openai: {
     id: "openai",
     displayName: "OpenAI",
-    // OpenAI's computer use runs on the dedicated computer-use-preview model over the
-    // Responses API - a distinct model from the advisory gpt-* chat models.
+    // OpenAI's dedicated computer-use-preview model over the Responses API - a distinct
+    // model from the advisory gpt-* chat models. Used by the dedicated OpenAI computer-use
+    // adapter; the vision-driven OpenAI adapter instead acts on the gpt-* chat slot.
     defaultModel: "computer-use-preview",
-    // The advisory gpt-* chat model cannot drive computer use; acting must use the
-    // dedicated computer-use-preview model regardless of the config's advisory Model Slot.
-    computerUseModelIsDedicated: true,
   },
 };
 

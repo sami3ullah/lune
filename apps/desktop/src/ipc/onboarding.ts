@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { SettingsStateSchema, SettingsVendorIdSchema } from "./settings";
 
 // The Shell's own renderer <-> main IPC for the onboarding surface (ticket 14). Like the
 // settings and permission channels, these never reach the Core: opening the onboarding
@@ -38,35 +37,17 @@ export const ONBOARDING_COMPLETE_CHANNEL = "lune:onboarding:complete";
 /** Renderer -> main (send): open one Vendor's "get a key" page in the default browser. */
 export const ONBOARDING_OPEN_GET_KEY_CHANNEL = "lune:onboarding:open-get-key";
 
-/**
- * The verdict of a cheap key-validation call: usable, or an explained rejection. This is
- * the wire codec mirroring the Core's `KeyValidationResult` (which the Core owns as a
- * plain type, since @lune/core carries no zod); the two are kept in the same shape so the
- * Core verdict crosses this boundary unchanged.
- */
-export const KeyValidationResultSchema = z.union([
-  z.object({ ok: z.literal(true) }),
-  z.object({ ok: z.literal(false), reason: z.string().min(1) }),
-]);
-export type KeyValidationResultValue = z.infer<typeof KeyValidationResultSchema>;
-
-/** Renderer -> main payload to validate (and, on success, store) one Vendor's key. */
-export const ValidateKeyRequestSchema = z.object({
-  vendor: SettingsVendorIdSchema,
-  key: z.string(),
-});
-export type ValidateKeyRequest = z.infer<typeof ValidateKeyRequestSchema>;
-
-/**
- * The reply to a validate-key call: the verdict plus the resulting Settings state (so a
- * successful save immediately reflects the newly-keyed - and possibly newly-routed -
- * Vendor without a second round-trip).
- */
-export const ValidateKeyResponseSchema = z.object({
-  result: KeyValidationResultSchema,
-  state: SettingsStateSchema,
-});
-export type ValidateKeyResponse = z.infer<typeof ValidateKeyResponseSchema>;
+// The key-validation codec (verdict + request + reply) is shared with the Settings
+// surface, so it lives in the settings contract and is re-exported here - both surfaces
+// validate keys through one shape (the Core verdict crosses either boundary unchanged).
+export {
+  KeyValidationResultSchema,
+  ValidateKeyRequestSchema,
+  ValidateKeyResponseSchema,
+  type KeyValidationResultValue,
+  type ValidateKeyRequest,
+  type ValidateKeyResponse,
+} from "./settings";
 
 /** The onboarding download step's view of the one Provisioning run. */
 export const OnboardingDownloadStatusSchema = z.object({

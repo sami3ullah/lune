@@ -26,10 +26,24 @@ export interface OpenAiChatMessage {
   content: string | OpenAiContentPart[];
 }
 
-/** The OpenAI-compatible chat-completion request POSTed to the Vendor. */
+/**
+ * The completion-length field name. OpenAI's own models retired `max_tokens` on the
+ * chat-completions endpoint for the reasoning families (o-series, GPT-5+) - they
+ * reject the request unless the limit is given as `max_completion_tokens` - while
+ * Gemini's OpenAI-compatible surface still speaks `max_tokens`. So the field name is
+ * per-Vendor, not a constant (see `cloudReasoningVendors`).
+ */
+export type TokenLimitField = "max_tokens" | "max_completion_tokens";
+
+/**
+ * The OpenAI-compatible chat-completion request POSTed to the Vendor. The completion
+ * limit is carried under whichever of the two field names the Vendor accepts - only
+ * one is ever set on a given request.
+ */
 export interface OpenAiChatRequest {
   model: string;
   stream: true;
   messages: OpenAiChatMessage[];
   max_tokens?: number;
+  max_completion_tokens?: number;
 }

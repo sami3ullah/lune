@@ -15,7 +15,24 @@
 import { CANONICAL_SYSTEM_PROMPT } from "./canonicalSystemPrompt.js";
 import { prepareMessages, type PreparedContentBlock } from "./messagePreparation.js";
 import type { CoreChatRequest, DownscaledScreenshot } from "./chatTypes.js";
-import type { OpenAiChatMessage, OpenAiChatRequest, OpenAiContentPart } from "./openAiWire.js";
+import type {
+  OpenAiChatMessage,
+  OpenAiChatRequest,
+  OpenAiContentPart,
+  TokenLimitField,
+} from "./openAiWire.js";
+
+/**
+ * The default completion budget when the request states none. It must cover a
+ * reasoning model's hidden reasoning tokens *plus* the visible answer, because those
+ * count against the same limit: a budget sized only for the (deliberately short,
+ * one-or-two-sentence) spoken answer would be spent entirely on reasoning, and the
+ * model would return an empty completion - a silent no-reply. The visible answer
+ * stays short regardless (the canonical prompt caps its length), so a generous limit
+ * costs nothing for non-reasoning models while giving reasoning models the headroom
+ * they need.
+ */
+const DEFAULT_COMPLETION_TOKENS = 4096;
 
 /** Maps one normalized content block onto its OpenAI wire shape. */
 function toOpenAiContentPart(block: PreparedContentBlock): OpenAiContentPart {
@@ -37,8 +54,10 @@ export function buildOpenAiChatRequest(options: {
   request: CoreChatRequest;
   downscaledScreenshots: DownscaledScreenshot[];
   modelSlot: string;
+  /** Which completion-limit field this Vendor accepts (OpenAI vs Gemini differ). */
+  tokenLimitField: TokenLimitField;
 }): OpenAiChatRequest {
-  const { request, downscaledScreenshots, modelSlot } = options;
+  const { request, downscaledScreenshots, modelSlot, tokenLimitField } = options;
 
   const messages: OpenAiChatMessage[] = [
     { role: "system", content: request.system ?? CANONICAL_SYSTEM_PROMPT },
@@ -55,7 +74,8 @@ export function buildOpenAiChatRequest(options: {
   return {
     model: modelSlot,
     stream: true,
-    max_tokens: request.maxTokens ?? 1024,
+    // The limit travels under whichever field name the Vendor accepts; the other stays unset.
+    [tokenLimitField]: request.maxTokens ?? DEFAULT_COMPLETION_TOKENS,
     messages,
   };
 }

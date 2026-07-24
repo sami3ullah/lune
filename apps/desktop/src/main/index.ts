@@ -6,11 +6,15 @@ import {
   createAnthropicComputerUseAdapter,
   createConversationManager,
   createGeminiComputerUseAdapter,
-  createOpenAiComputerUseAdapter,
   createReasoningCapability,
   createScreenAgentCapability,
+  createVisionDrivenAgentAdapter,
+  VISION_DRIVEN_VENDORS,
+  ComputerUseUpstreamError,
   describeCore,
   findReasoningVendor,
+  listReasoningModels,
+  parseAnswerActTag,
   parseAnswerPointTag,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
@@ -43,16 +47,22 @@ import { getChatPanelWebContents, toggleChatPanelWindow } from "./chatPanelWindo
 import { toggleSettingsWindow } from "./settingsWindow";
 import {
   SETTINGS_GET_CHANNEL,
+  SETTINGS_LIST_MODELS_CHANNEL,
   SETTINGS_READINESS_CHANNEL,
   SETTINGS_REPAIR_CHANNEL,
   SETTINGS_SAVE_CHANNEL,
   SETTINGS_SET_KEY_CHANNEL,
   SETTINGS_TOGGLE_CHANNEL,
+  SETTINGS_VALIDATE_KEY_CHANNEL,
+  ListModelsRequestSchema,
+  ListModelsResponseSchema,
   ReadinessRowSchema,
   SetApiKeyRequestSchema,
   SettingsSnapshotSchema,
   SettingsStateSchema,
   SettingsValuesSchema,
+  ValidateKeyRequestSchema,
+  ValidateKeyResponseSchema,
 } from "../ipc/settings";
 import { VENDOR_GET_KEY_URLS, SettingsVendorIdSchema } from "../ipc/settings";
 import { SettingsStore } from "./settings/settingsStore";
@@ -65,8 +75,6 @@ import {
   ONBOARDING_START_DOWNLOAD_CHANNEL,
   ONBOARDING_VALIDATE_KEY_CHANNEL,
   OnboardingDownloadStatusSchema,
-  ValidateKeyRequestSchema,
-  ValidateKeyResponseSchema,
 } from "../ipc/onboarding";
 import { OnboardingStore } from "./onboarding/onboardingStore";
 import { createOnboardingService, type OnboardingService } from "./onboarding/onboardingService";
@@ -107,9 +115,9 @@ import {
   runScreenAgentDevTrigger,
   type ScreenAgentService,
 } from "./agent/screenAgentService";
+import type { ScreenAgentRunResult } from "./agent/screenAgentLoop";
 import { createConfirmGateController } from "./agent/confirmGateController";
 import { ConfirmGateWindow } from "./confirmGateWindow";
-import { createDesktopAxSignalProvider } from "./agent/axSignalProvider";
 import type { AgentCursorOverlay } from "./agent/agentCursorPresenter";
 import {
   resolveWhisperServerBinaryPath,
@@ -246,7 +254,12 @@ const screenAgentCapability = createScreenAgentCapability({
   adapters: {
     anthropic: createAnthropicComputerUseAdapter(),
     google: createGeminiComputerUseAdapter(),
-    openai: createOpenAiComputerUseAdapter(),
+    // OpenAI acts through the vision-driven adapter (M2-07), not the dedicated
+    // computer_use_preview tool: that tool is org-verification-gated (the M2-06 field
+    // blocker), whereas the vision-driven path runs on the user's ordinary gpt-* chat
+    // Model Slot, so acting works the moment their OpenAI key does. The dedicated
+    // `createOpenAiComputerUseAdapter` stays available as an optional high-fidelity mode.
+    openai: createVisionDrivenAgentAdapter(VISION_DRIVEN_VENDORS.openai),
   },
   getApiKey: (vendorId) =>
     credentialStore.getKey(vendorId) ?? process.env[COMPUTER_USE_API_KEY_ENV_BY_VENDOR[vendorId]],
@@ -597,6 +610,105 @@ async function speakLine(text: string): Promise<void> {
 }
 
 /**
+ * A friendly, spoken explanation of a Screen Agent run's `error` cause. When the failure is
+ * a typed upstream error, the HTTP status tells the user - in plain language, not a status
+ * code - what actually happened and what to do (quota used up, a bad key, a model their key
+ * can't reach, the Vendor being down). Anything else falls back to a generic apology.
+ */
+function describeScreenAgentError(error: unknown): string {
+  if (error instanceof ComputerUseUpstreamError) {
+    const vendor = error.vendorDisplayName.toLowerCase();
+    if (error.status === 429) {
+      return `looks like your ${vendor} api quota is used up right now, so i can't act on your screen. you may need to check your plan and billing, or try again in a little while.`;
+    }
+    if (error.status === 401 || error.status === 403) {
+      return `${vendor} wouldn't accept your api key for controlling the computer - it might be invalid or missing access. you can update it in settings.`;
+    }
+    if (error.status === 404) {
+      return `your ${vendor} key doesn't have access to the model i need to control the computer. you might need to enable it on your account, or switch to another vendor in settings.`;
+    }
+    if (error.status >= 500) {
+      return `${vendor} had a server problem just now, so i couldn't finish. try again in a bit.`;
+    }
+    return `${vendor} turned down the request to act on your screen. try again, or check your account.`;
+  }
+  return "something went wrong while i was doing that, sorry.";
+}
+
+/**
+ * Speaks a short degrade line for a Screen Agent run that could not complete on its own,
+ * so acting never fails silently. `completed` (the loop already spoke its summary) and the
+ * user-initiated stops (`declined` at the gate, `cancelled` by barge-in) deliberately say
+ * nothing - the user already knows the outcome.
+ */
+async function announceScreenAgentOutcome(result: ScreenAgentRunResult): Promise<void> {
+  switch (result.reason) {
+    case "accessibility":
+      // Route to the pane (the same degrade path the dev trigger uses) and say why, rather
+      // than a silent no-op (the epic's Accessibility rule).
+      openAccessibilitySettings();
+      await speakLine(
+        "i need accessibility permission to control your computer. i've opened the settings for you - turn lune on there and ask me again.",
+      );
+      break;
+    case "not-ready":
+      await speakLine(
+        "i can't act on your screen with the model you're using right now. pick one that supports computer control in settings.",
+      );
+      break;
+    case "unavailable":
+      await speakLine("i can't control the computer right now, sorry.");
+      break;
+    case "step-cap":
+    case "timeout":
+    case "no-progress":
+      await speakLine("i got stuck on that one and stopped. want to try again a different way?");
+      break;
+    case "error":
+      // Turn the underlying cause into a plain-language spoken line (quota, bad key, model
+      // access, vendor down) rather than one opaque "something went wrong".
+      await speakLine(describeScreenAgentError(result.error));
+      break;
+    case "completed":
+    case "declined":
+    case "cancelled":
+      // Nothing to add: the loop spoke its own summary, or the user stopped it themselves.
+      break;
+  }
+}
+
+/**
+ * The advisory->act handoff (DECISIONS #14): when an ordinary turn's answer carried an
+ * `[ACT: goal]` tag, the user asked Lune to actually do something on screen, so hand the
+ * distilled goal to the Screen Agent and run it to a terminal outcome. Confirm-to-start
+ * (M2-04) gates the first OS touch, and the run shares the turn's barge-in `signal` so a
+ * push-to-talk press cancels it mid-run. Never throws - the loop resolves every failure to
+ * a typed reason {@link announceScreenAgentOutcome} surfaces.
+ */
+async function runActHandoff(goal: string, signal: AbortSignal | undefined): Promise<boolean> {
+  if (screenAgentService === null || signal?.aborted === true) {
+    return false;
+  }
+  console.log(`[lune] screen agent: starting run for goal "${goal}"`);
+  const result = await screenAgentService.run({ goal, signal });
+  console.log(
+    `[lune] screen agent: run ended (${result.reason}) after ${result.stepsExecuted} step(s)`,
+  );
+  if (result.error !== undefined) {
+    // The underlying cause (an upstream HTTP status + the Vendor's error body, a capture
+    // failure, a bad step input) - logged in full so a failed run is diagnosable rather
+    // than hidden behind the spoken "something went wrong".
+    console.error("[lune] screen agent: run error:", result.error);
+  }
+  await announceScreenAgentOutcome(result);
+  // Report whether the run queued speech (its summary, or a spoken degrade line) so the
+  // caller knows whether Kokoro playback owns the Pill's return to idle. A user-stopped run
+  // (declined/cancelled) and an unready Kokoro both say nothing.
+  const outcomeSpeaks = result.reason !== "declined" && result.reason !== "cancelled";
+  return outcomeSpeaks && speechCapability?.isReady() === true;
+}
+
+/**
  * Captures the screen(s) for one turn, or returns nothing so the turn falls back to
  * text-only. Capture is attempted only when the turn opted in AND access is granted;
  * a capture failure never fails the turn (the user still gets an answer, just without
@@ -691,6 +803,10 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
   // tag-only answer (nothing to speak) reports `spoke: false` and the caller idles the Pill.
   let speechEngaged = false;
   let spoke = false;
+  // The advisory->act goal this turn carried, if any (parsed from the completed answer's
+  // trailing [ACT: goal] tag). When present, the Screen Agent runs it after the advisory
+  // answer, so the ordinary turn escalates to acting (DECISIONS #14).
+  let actGoal: string | null = null;
 
   // The streaming-text toggle (ticket 13): read once at the turn's start so a change
   // takes effect on the next turn. When off, the Overlay cursor still flies and points,
@@ -766,7 +882,11 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
           // Stream the answer into the Overlay bubble, but only the clean human text, and
           // only when the streaming-text toggle is on.
           if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
-            const { displayText } = parseAnswerPointTag(accumulatedAnswer);
+            // Strip both trailing tags (the Act Tag, then the Point Tag) so neither ever
+            // flashes in the response bubble - only the spoken human text is shown.
+            const { displayText } = parseAnswerPointTag(
+              parseAnswerActTag(accumulatedAnswer).displayText,
+            );
             if (displayText.length > sentCleanLength) {
               overlayManager.sendToDisplay(cursorDisplayId, {
                 type: "answer-delta",
@@ -783,7 +903,13 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
             messageId: coreEvent.messageId,
           });
           {
-            const { directive, displayText } = parseAnswerPointTag(accumulatedAnswer);
+            // Read the trailing Act Tag first (the acting goal, if any), then the Point
+            // Tag on the remainder - so both are stripped from the display text and the
+            // acting goal is captured to hand the Screen Agent once the turn commits.
+            const { displayText: actStripped, actGoal: parsedActGoal } =
+              parseAnswerActTag(accumulatedAnswer);
+            actGoal = parsedActGoal;
+            const { directive, displayText } = parseAnswerPointTag(actStripped);
             if (overlayManager && cursorDisplayId !== undefined) {
               // The full answer has streamed, so its trailing Point Tag (if any) is now
               // complete. The planner turns the parsed directive + capture geometry into
@@ -809,6 +935,17 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     // or aborted turn throws above and never reaches here, matching the Core's rollback.
     conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
     notifyConversationsChanged(webContents);
+
+    // Advisory->act (DECISIONS #14): the answer asked Lune to actually do something on
+    // screen, so hand the distilled goal to the Screen Agent now that the advisory answer
+    // has been spoken. Awaited so the caller's Pill-idle bookkeeping covers the whole run
+    // (the run speaks its own summary), and it shares this turn's barge-in signal.
+    if (actGoal !== null) {
+      // If the run queued speech, the same Kokoro-playback path a spoken turn uses owns the
+      // Pill's return to idle; otherwise leave `spoke` as the advisory answer set it.
+      const handoffSpoke = await runActHandoff(actGoal, signal);
+      spoke = spoke || handoffSpoke;
+    }
   } catch (error) {
     // Safety net: if the turn threw before the capture completed, following is still
     // suspended - resume it so the cursor doesn't stay frozen/hidden. Idempotent.
@@ -830,7 +967,10 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
       conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
       notifyConversationsChanged(webContents);
     } else {
-      // A genuine failure: clear any audio already queued for this turn and surface it.
+      // A genuine failure: log it in the main process (the renderer-facing error event
+      // alone left upstream failures - a rejected model, a bad request - invisible in
+      // every console), clear any audio already queued for this turn, and surface it.
+      console.error("[lune] conversation turn failed:", error);
       if (speechTurn !== null) {
         sendSpeechEvent({ type: "stop" });
       }
@@ -881,6 +1021,18 @@ ipcMain.handle(SETTINGS_SAVE_CHANNEL, (_event, rawValues: unknown) => {
 ipcMain.handle(SETTINGS_SET_KEY_CHANNEL, (_event, rawRequest: unknown) => {
   const request = SetApiKeyRequestSchema.parse(rawRequest);
   return SettingsStateSchema.parse(requireSettingsService().setKey(request));
+});
+// Adding a key from Settings live-validates it (like onboarding) before storing, so a
+// bad key gives instant, specific feedback rather than silently failing on the next turn.
+ipcMain.handle(SETTINGS_VALIDATE_KEY_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = ValidateKeyRequestSchema.parse(rawRequest);
+  return ValidateKeyResponseSchema.parse(await requireSettingsService().validateAndSaveKey(request));
+});
+// List a Vendor's live models (using its stored key) for the Settings model picker, so
+// the offered models track what the Vendor currently serves.
+ipcMain.handle(SETTINGS_LIST_MODELS_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = ListModelsRequestSchema.parse(rawRequest);
+  return ListModelsResponseSchema.parse(await requireSettingsService().listModels(request.vendor));
 });
 ipcMain.handle(SETTINGS_REPAIR_CHANNEL, () => SettingsStateSchema.parse(requireSettingsService().repair()));
 ipcMain.handle(SETTINGS_READINESS_CHANNEL, () =>
@@ -1189,10 +1341,14 @@ void app.whenReady().then(() => {
     executor: syntheticInputExecutor,
     // Assigned at the top of `whenReady`, above; non-null by the time the service is built.
     overlay: overlayManager!,
-    // The AX target signal (M2-05): read each capture so the Consequence floor can escalate a
-    // click on a "Send"/hyperlink element to a Confirm Gate. Best-effort - a poor
-    // accessibility tree degrades to no signal (no escalation), never an error.
-    axProvider: createDesktopAxSignalProvider(),
+    // The AX target signal (M2-05) is deliberately NOT wired: its only implementation reads
+    // the tree by driving System Events through `osascript`, which pops macOS's Automation
+    // permission prompt - a fourth permission v1 never needed (v1 read AX natively via
+    // `AXUIElementCopyElementAtPosition`, Accessibility-only). Rather than regress the
+    // permission story, the target signal is omitted, so the Consequence floor gets no
+    // AX-based click escalation. Confirm-to-start still gates the first OS touch, so a run
+    // never begins acting unconfirmed. Re-enable behind a real native AX addon (no Apple
+    // Events, no Automation prompt), the seam `axSignalProvider` was built for.
     // The cursor "acts the part" (M2-05): fly the playful Overlay cursor to each Action's
     // target before it executes, reusing the same `point` event the chat overlay flies on, so
     // the user sees where Lune is about to act and a gated Action shows the cursor waiting.
@@ -1333,6 +1489,9 @@ void app.whenReady().then(() => {
   // IPC handlers call. Readiness reads the Provisioning run's live status + per-Runtime
   // verified state; Repair re-downloads every pinned Runtime, then reconciles the
   // whisper child once the run settles so a repaired Transcription comes back healthy.
+  // Key validation + live model listing are the cheap Core calls with the platform
+  // `fetch` injected; the Settings service owns the validate-and-save-key flow the
+  // onboarding key step also delegates to.
   settingsService = createSettingsService({
     settingsStore,
     credentialStore,
@@ -1345,20 +1504,26 @@ void app.whenReady().then(() => {
     reloadRouting: () => {
       routingConfigStore.reload();
     },
-  });
-
-  // Onboarding (ticket 14): now that the Settings service + Provisioning exist, wire the
-  // service the onboarding IPC calls. Key validation is the cheap Core test call with the
-  // platform `fetch` injected; the download is the one shared Provisioning run (started
-  // silently at the welcome screen, resumed on a re-launched onboarding).
-  onboardingService = createOnboardingService({
-    settingsService,
     validateKey: (vendorId, key) =>
       validateReasoningKey({
         vendor: findReasoningVendor(vendorId),
         apiKey: key,
         upstreamFetch: (url, requestInit) => fetch(url, requestInit),
       }),
+    listModels: (vendorId, key) =>
+      listReasoningModels({
+        vendor: findReasoningVendor(vendorId),
+        apiKey: key,
+        upstreamFetch: (url, requestInit) => fetch(url, requestInit),
+      }),
+  });
+
+  // Onboarding (ticket 14): now that the Settings service + Provisioning exist, wire the
+  // service the onboarding IPC calls. The key step delegates validation to the Settings
+  // service; the download is the one shared Provisioning run (started silently at the
+  // welcome screen, resumed on a re-launched onboarding).
+  onboardingService = createOnboardingService({
+    settingsService,
     provisioningStatus: () => provisioning.capability.status(),
     isAllProvisioned: () => REPAIR_RUNTIME_IDS.every((runtimeId) => provisioning.capability.isRuntimeReady(runtimeId)),
     startProvisioning: () => {

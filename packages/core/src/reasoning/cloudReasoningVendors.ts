@@ -23,9 +23,20 @@ import { buildOpenAiChatRequest } from "./openAiRequestTranslation.js";
 import { buildAnthropicChatRequest } from "./anthropicRequestTranslation.js";
 import { iterateAnthropicTextDeltas, iterateOpenAiContentDeltas } from "./sseTextDeltas.js";
 import type { CoreChatRequest, DownscaledScreenshot } from "./chatTypes.js";
+import type { TokenLimitField } from "./openAiWire.js";
 
 /** The cloud Reasoning Vendors Lune can be routed to. */
 export type ReasoningVendorId = "anthropic" | "openai" | "google";
+
+/**
+ * The OpenAI-compatible chat-completions endpoints. Named here as the single source of
+ * truth because two callers hit them: the advisory Reasoning path (below) and the Screen
+ * Agent's vision-driven adapter (`agent/visionDrivenAgent.ts`), which drives the same
+ * surface non-streamed. Keeping one constant each stops the two from drifting apart.
+ */
+export const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+export const GEMINI_CHAT_COMPLETIONS_URL =
+  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 /** The Core-side stable order of Vendors, e.g. for iterating the table. */
 export const REASONING_VENDOR_IDS: readonly ReasoningVendorId[] = ["anthropic", "openai", "google"];
@@ -69,6 +80,13 @@ export interface ReasoningVendor {
   buildUpstreamRequest(input: BuildUpstreamRequestInput): UpstreamRequest;
   /** Reduces the Vendor's SSE response body to a stream of raw answer-text deltas. */
   streamTextDeltas(responseBody: ReadableStream<Uint8Array>): AsyncGenerator<string>;
+  /**
+   * Shapes the Vendor's native "list available models" GET request (URL + auth
+   * headers), so the Settings picker can offer the Vendor's live model catalogue rather
+   * than a hardcoded shortlist. All three Vendors expose an OpenAI-shaped `{ data:
+   * [{ id }] }` list at this endpoint, so {@link listReasoningModels} parses one shape.
+   */
+  buildListModelsRequest(apiKey: string): { url: string; headers: Record<string, string> };
 }
 
 /**
@@ -80,8 +98,16 @@ function createOpenAiCompatibleVendor(parameters: {
   id: Extract<ReasoningVendorId, "openai" | "google">;
   displayName: string;
   chatCompletionsUrl: string;
+  /** The Vendor's OpenAI-shaped "list models" endpoint (sibling of chat/completions). */
+  listModelsUrl: string;
   defaultModel: string;
   modelShortlist: readonly string[];
+  /**
+   * The completion-limit field this Vendor accepts. OpenAI's reasoning families
+   * (o-series, GPT-5+) reject `max_tokens` and require `max_completion_tokens`; Gemini's
+   * OpenAI-compatible surface still speaks `max_tokens`. So it is set per-Vendor here.
+   */
+  tokenLimitField: TokenLimitField;
 }): ReasoningVendor {
   return {
     id: parameters.id,
@@ -94,9 +120,20 @@ function createOpenAiCompatibleVendor(parameters: {
         "content-type": "application/json",
         authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(buildOpenAiChatRequest({ request, downscaledScreenshots, modelSlot })),
+      body: JSON.stringify(
+        buildOpenAiChatRequest({
+          request,
+          downscaledScreenshots,
+          modelSlot,
+          tokenLimitField: parameters.tokenLimitField,
+        }),
+      ),
     }),
     streamTextDeltas: iterateOpenAiContentDeltas,
+    buildListModelsRequest: (apiKey) => ({
+      url: parameters.listModelsUrl,
+      headers: { authorization: `Bearer ${apiKey}` },
+    }),
   };
 }
 
@@ -116,6 +153,10 @@ const ANTHROPIC_VENDOR: ReasoningVendor = {
     body: JSON.stringify(buildAnthropicChatRequest({ request, downscaledScreenshots, modelSlot })),
   }),
   streamTextDeltas: iterateAnthropicTextDeltas,
+  buildListModelsRequest: (apiKey) => ({
+    url: "https://api.anthropic.com/v1/models",
+    headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+  }),
 };
 
 /**
@@ -129,18 +170,26 @@ const ANTHROPIC_VENDOR: ReasoningVendor = {
 const GOOGLE_VENDOR: ReasoningVendor = createOpenAiCompatibleVendor({
   id: "google",
   displayName: "Google Gemini",
-  chatCompletionsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+  chatCompletionsUrl: GEMINI_CHAT_COMPLETIONS_URL,
+  listModelsUrl: "https://generativelanguage.googleapis.com/v1beta/openai/models",
   defaultModel: "gemini-3.5-flash-lite",
   modelShortlist: ["gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.5-flash", "gemini-pro-latest"],
+  // Gemini's OpenAI-compatible surface takes the classic `max_tokens`.
+  tokenLimitField: "max_tokens",
 });
 
 /** OpenAI over its chat-completions endpoint. */
 const OPENAI_VENDOR: ReasoningVendor = createOpenAiCompatibleVendor({
   id: "openai",
   displayName: "OpenAI",
-  chatCompletionsUrl: "https://api.openai.com/v1/chat/completions",
+  chatCompletionsUrl: OPENAI_CHAT_COMPLETIONS_URL,
+  listModelsUrl: "https://api.openai.com/v1/models",
   defaultModel: "gpt-4o",
   modelShortlist: ["gpt-4o", "gpt-4o-mini", "gpt-4.1"],
+  // OpenAI's reasoning families (o-series, GPT-5+) reject `max_tokens` on chat
+  // completions and require `max_completion_tokens`; it is accepted by the older
+  // models too, so it is the one field name that works for every OpenAI model.
+  tokenLimitField: "max_completion_tokens",
 });
 
 /** The wired cloud Reasoning Vendors, keyed by id. */

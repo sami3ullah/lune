@@ -44,11 +44,17 @@ function createSettingsWindow(): BrowserWindow {
     height: SETTINGS_SIZE.height,
     show: false,
     frame: false,
-    transparent: true,
+    // Opaque, not transparent: the surface is a full-rectangle panel (no rounded window
+    // corners to preserve), and a native `<select>`/`<datalist>` popup - the Voice and
+    // per-Vendor model pickers - crashes the GPU process when opened inside a transparent
+    // frameless window on macOS. An opaque window renders the popups natively and safely;
+    // the dark backgroundColor also avoids a white flash before the renderer paints.
+    transparent: false,
+    backgroundColor: "#171717",
     resizable: false,
     // Draggable by a CSS app-region on its header, like the Pill and Chat Panel.
     movable: true,
-    hasShadow: false,
+    hasShadow: true,
     // A background companion: no taskbar/dock entry (developer story 40).
     skipTaskbar: true,
     fullscreenable: false,

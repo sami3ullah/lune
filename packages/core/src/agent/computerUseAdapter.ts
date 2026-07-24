@@ -73,6 +73,20 @@ export interface ComputerUseVendorAdapter {
   /** Which Vendor this adapter drives; matches the routing config's Vendor. */
   readonly vendorId: ComputerUseVendorId;
   /**
+   * Which model this adapter drives an Agent Step with. `true` means the config's
+   * advisory Reasoning Model Slot doubles as the acting model (Anthropic's Claude models
+   * drive their computer-use tool; the vision-driven adapter acts on the ordinary vision
+   * chat model); `false` means acting needs a *dedicated* model distinct from the
+   * advisory chat slot (Google's `gemini-*-computer-use-*`, OpenAI's `computer-use-preview`),
+   * so the Capability uses the Vendor default and ignores the (chat) Model Slot.
+   *
+   * The decision lives on the adapter, not the Vendor, because it is the adapter that
+   * actually issues the request: two adapters for the *same* Vendor can differ here - the
+   * dedicated OpenAI computer-use adapter needs `computer-use-preview` (`false`), while the
+   * vision-driven OpenAI adapter runs on the user's ordinary `gpt-*` chat slot (`true`).
+   */
+  readonly usesAdvisoryModelSlot: boolean;
+  /**
    * Advance the Session one Step: build and issue the Vendor request (through the
    * injected `upstreamFetch`), then translate the response into a canonical Action
    * plus the state to persist. Throws on an upstream failure so the Capability can
@@ -82,10 +96,34 @@ export interface ComputerUseVendorAdapter {
 }
 
 /**
- * Throws a descriptive error when a Vendor's step response is not OK, so each
- * adapter's `step` can fail identically and the Capability stops the Session cleanly.
- * Includes the Vendor's own error body, which carries the actual reason (bad model
- * id, auth, rate limit) a bare status code would hide.
+ * A computer-use Vendor's step call came back not-OK. Carries the HTTP `status` and the
+ * Vendor's name and error body separately (not just baked into the message) so the Shell
+ * can classify the failure - a quota/rate-limit 429, an auth 401/403, a model-access 404,
+ * a vendor-side 5xx - and tell the user in plain language what to do, rather than surfacing
+ * one opaque "something went wrong". The full message still includes the body for logs.
+ */
+export class ComputerUseUpstreamError extends Error {
+  /** The HTTP status the Vendor returned (e.g. 429 for quota exhausted). */
+  readonly status: number;
+  /** The Vendor's human-readable name (for the spoken explanation). */
+  readonly vendorDisplayName: string;
+  /** The Vendor's raw error body, carrying the actual reason (kept for logs/diagnostics). */
+  readonly body: string;
+
+  constructor(vendorDisplayName: string, status: number, body: string) {
+    super(`${vendorDisplayName} agent step failed: HTTP ${status}${body ? ` - ${body}` : ""}`);
+    this.name = "ComputerUseUpstreamError";
+    this.status = status;
+    this.vendorDisplayName = vendorDisplayName;
+    this.body = body;
+  }
+}
+
+/**
+ * Throws a {@link ComputerUseUpstreamError} when a Vendor's step response is not OK, so
+ * each adapter's `step` fails identically and the Capability stops the Session cleanly.
+ * The typed error carries the status + the Vendor's own error body, which together hold
+ * the actual reason (bad model id, auth, rate limit) a bare status code would hide.
  */
 export async function throwIfStepResponseNotOk(
   response: Response,
@@ -95,7 +133,5 @@ export async function throwIfStepResponseNotOk(
     return;
   }
   const errorBody = await response.text().catch(() => "");
-  throw new Error(
-    `${vendorDisplayName} agent step failed: HTTP ${response.status}${errorBody ? ` - ${errorBody}` : ""}`,
-  );
+  throw new ComputerUseUpstreamError(vendorDisplayName, response.status, errorBody);
 }

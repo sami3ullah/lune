@@ -230,6 +230,8 @@ interface GeminiAdapterState {
 export function createGeminiComputerUseAdapter(): ComputerUseVendorAdapter {
   return {
     vendorId: "google",
+    // Gemini's computer use is a dedicated model, distinct from the advisory chat slot.
+    usesAdvisoryModelSlot: false,
     async step(input: ComputerUseStepInput): Promise<ComputerUseStepResult> {
       const priorState = input.priorState as GeminiAdapterState | undefined;
 

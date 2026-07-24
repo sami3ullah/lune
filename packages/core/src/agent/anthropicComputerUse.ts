@@ -259,6 +259,9 @@ interface AnthropicAdapterState {
 export function createAnthropicComputerUseAdapter(): ComputerUseVendorAdapter {
   return {
     vendorId: "anthropic",
+    // Claude chat models drive the computer-use tool, so the advisory Model Slot doubles
+    // as the acting model - no dedicated model needed.
+    usesAdvisoryModelSlot: true,
     async step(input: ComputerUseStepInput): Promise<ComputerUseStepResult> {
       const priorState = input.priorState as AnthropicAdapterState | undefined;
 

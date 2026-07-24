@@ -47,14 +47,18 @@ const ROTATION_EASE_TIME_CONSTANT_SECONDS = 0.1;
  */
 const POINT_HOLD_MIN_MS = 1200;
 const POINT_HOLD_MAX_MS = 2100;
-/** The little orbit the cursor traces around the target while holding (the "goes around"). */
-const ORBIT_MIN_RADIUS_PX = 8;
-const ORBIT_MAX_RADIUS_PX = 22;
-/** How many loops it makes around the target across the hold (randomized direction). */
-const ORBIT_MIN_REVOLUTIONS = 0.75;
-const ORBIT_MAX_REVOLUTIONS = 1.6;
+/**
+ * The little arc the cursor traces around the target while holding (the "goes around").
+ * Kept small and under a full loop so it reads as a gentle settle at the target, not a
+ * cursor wandering off on its own.
+ */
+const ORBIT_MIN_RADIUS_PX = 5;
+const ORBIT_MAX_RADIUS_PX = 11;
+/** How far around the target it drifts across the hold (< 1 = a partial arc, never a loop). */
+const ORBIT_MIN_REVOLUTIONS = 0.35;
+const ORBIT_MAX_REVOLUTIONS = 0.7;
 /** A gentle size pulse while orbiting, so the hold breathes rather than sitting frozen. */
-const ORBIT_SCALE_PULSE = 0.08;
+const ORBIT_SCALE_PULSE = 0.06;
 /** How long after an answer ends the bubble lingers before clearing (then plain following). */
 const INACTIVITY_CLEAR_MS = 1100;
 /** How quickly the buddy fades in/out as the cursor enters/leaves this display. */
@@ -111,34 +115,38 @@ function randomBetween(min: number, max: number): number {
 }
 
 /**
- * How often a pointing flight gets the showy "flourish" - a pronounced curve, a twirl,
- * and a little orbit around the target. The rest of the time it's a calm arc-and-hold, so
- * the cursor mostly moves gently and only occasionally shows off (kept unpredictable).
+ * How often a pointing flight gets the showy "flourish" - a slightly bolder curve, a small
+ * twirl, and a little arc around the target. Kept rare on purpose: the everyday movement
+ * should be a calm, pretty arc-and-hold, with the cursor only occasionally showing off, so
+ * it feels alive without wandering or doing too much.
  */
-const FLOURISH_PROBABILITY = 0.35;
+const FLOURISH_PROBABILITY = 0.12;
 
 /**
- * A fresh, randomized arc shape for one flight. A `flourish` flight bows boldly (sometimes
- * the "wrong" way) with a varied crest; a calm flight bows gently upward with only slight
- * variation, so the everyday movement is smooth and unshowy.
+ * A fresh, randomized arc shape for one flight. A `flourish` flight bows a little more (and
+ * occasionally the "wrong" way) with a varied crest; a calm flight bows gently upward with
+ * only slight variation, so the everyday movement is smooth, moderate, and unshowy.
  */
 function randomArcShaping(flourish: boolean): ArcShaping {
   if (!flourish) {
-    return { perpendicular: -randomBetween(0.7, 1.1), lateral: randomBetween(-0.2, 0.2) };
+    return { perpendicular: -randomBetween(0.45, 0.7), lateral: randomBetween(-0.1, 0.1) };
   }
-  const bowsUp = Math.random() < 0.7;
+  const bowsUp = Math.random() < 0.8;
   return {
-    perpendicular: (bowsUp ? -1 : 1) * randomBetween(0.7, 1.7),
-    lateral: randomBetween(-0.6, 0.6),
+    perpendicular: (bowsUp ? -1 : 1) * randomBetween(0.6, 1.1),
+    lateral: randomBetween(-0.35, 0.35),
   };
 }
 
-/** A random extra twirl (degrees) for a flourish flight; calm flights don't twirl at all. */
+/**
+ * A small extra twirl (degrees) for a flourish flight; calm flights don't twirl at all.
+ * Kept modest - a gentle turn, never a full spin - so it reads as playful, not frantic.
+ */
 function randomSpinDegrees(flourish: boolean): number {
   if (!flourish) {
     return 0;
   }
-  return (Math.random() < 0.5 ? -1 : 1) * randomBetween(90, 240);
+  return (Math.random() < 0.5 ? -1 : 1) * randomBetween(30, 90);
 }
 
 /** Smoothstep easing on `[0,1]`, so a layered twirl accelerates in and settles out. */
@@ -584,22 +592,45 @@ export function Overlay() {
 /** The fixed line width (px) the cursor caption fills before it clears (see CaptionReveal). */
 const OVERLAY_CAPTION_WIDTH_PX = 260;
 
+/** The gap between the cursor and the caption chip, in pixels. */
+const CAPTION_GAP_PX = 14;
+/** The chip's full width (text line + horizontal padding), used to decide which side fits. */
+const CAPTION_BUBBLE_WIDTH_PX = OVERLAY_CAPTION_WIDTH_PX + 24;
+/** A rough chip height used only to decide whether to flip above the cursor near the bottom. */
+const CAPTION_EST_HEIGHT_PX = 40;
+
 /**
  * The spoken reply shown just beside the following cursor, revealed word by word in step
  * with the voice (this is now the only place the reply text appears - the Pill just shows
  * the waveform). A compact chip that fills one fixed-width line book-style, sitting close
- * to the cursor and clamped so it never runs off-screen. Keyed on the sentence id so a new
- * sentence restarts the reveal.
+ * to the cursor. It is screen-aware: it flips to whichever side has room - left of the
+ * cursor near the right edge, above it near the bottom - so it never runs off-screen or
+ * covers the cursor. Anchoring by the near edge (right/bottom when flipped) keeps it placed
+ * correctly whatever the wrapped text height. Keyed on the sentence id so a new sentence
+ * restarts the reveal.
  */
 function CaptionBubble({ caption, anchor }: { caption: CaptionData; anchor: CursorFrame }) {
-  // Sit close to the right-and-below of the cursor, clamped so it never runs off-screen.
-  const left = Math.min(Math.max(anchor.x + 12, 6), window.innerWidth - (OVERLAY_CAPTION_WIDTH_PX + 24));
-  const top = Math.min(Math.max(anchor.y + 10, 6), window.innerHeight - 40);
+  // Flip to the side with room: left when the chip would overflow the right edge, above
+  // when it would overflow the bottom. The everyday case (cursor mid-screen) stays
+  // down-and-right of the cursor, as before.
+  const placeLeft = anchor.x + CAPTION_GAP_PX + CAPTION_BUBBLE_WIDTH_PX > window.innerWidth;
+  const placeAbove = anchor.y + CAPTION_GAP_PX + CAPTION_EST_HEIGHT_PX > window.innerHeight;
+
+  // Anchor by the near edge on the flipped axis so the chip grows away from the cursor and
+  // stays on-screen regardless of its rendered size; a final max() keeps it off the edge.
+  const horizontal = placeLeft
+    ? { right: Math.max(6, window.innerWidth - (anchor.x - CAPTION_GAP_PX)) }
+    : { left: Math.max(6, anchor.x + CAPTION_GAP_PX) };
+  const vertical = placeAbove
+    ? { bottom: Math.max(6, window.innerHeight - (anchor.y - CAPTION_GAP_PX)) }
+    : { top: Math.max(6, anchor.y + CAPTION_GAP_PX) };
+
   return (
     <motion.div
       className="absolute rounded-full bg-neutral-950/95 px-2.5 py-1 shadow-lg shadow-black/50"
-      style={{ left, top }}
-      initial={{ opacity: 0, x: -6 }}
+      style={{ ...horizontal, ...vertical }}
+      // Slide in from the cursor's side (toward where the chip sits) for a natural feel.
+      initial={{ opacity: 0, x: placeLeft ? 6 : -6 }}
       animate={{ opacity: 1, x: 0 }}
       transition={{ duration: 0.22, ease: "easeOut" }}
     >

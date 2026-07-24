@@ -132,8 +132,22 @@ export function Pill() {
             exit={{ opacity: 0, y: -10, scale: 0.9 }}
             transition={{ type: "spring", stiffness: 520, damping: 24, mass: 0.8 }}
           >
-            <MenuButton label="Chat Panel" onClick={() => window.lune.chatPanel.toggle()} />
-            <MenuButton label="Settings" onClick={() => window.lune.settings.toggle()} />
+            {/* Opening a window collapses the menu behind it, so the Settings/Chat Panel
+                surface never sits atop a leftover pill menu. */}
+            <MenuButton
+              label="Chat Panel"
+              onClick={() => {
+                setMenuOpen(false);
+                window.lune.chatPanel.toggle();
+              }}
+            />
+            <MenuButton
+              label="Settings"
+              onClick={() => {
+                setMenuOpen(false);
+                window.lune.settings.toggle();
+              }}
+            />
             <MenuButton label="Quit Lune" onClick={() => window.lune.pill.quit()} />
             <ScreenAccessSection />
             <MicAccessSection />

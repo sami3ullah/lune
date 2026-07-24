@@ -7,16 +7,20 @@ import {
   type ProvisioningStatus,
 } from "@lune/core";
 import type {
+  KeyValidationResultValue,
+  ListModelsResponse,
   ReadinessRow,
   SetApiKeyRequest,
   SettingsCatalog,
   SettingsSnapshot,
   SettingsState,
   SettingsValues,
+  SettingsVendorId,
+  ValidateKeyRequest,
 } from "../../ipc/settings";
 import { deriveReadinessRows } from "./readiness";
 import { validateHotkeyToken } from "../../ipc/hotkey";
-import type { CredentialStore } from "./credentialStore";
+import { SecureStorageUnavailableError, type CredentialStore } from "./credentialStore";
 import type { AppSettings, SettingsStore } from "./settingsStore";
 
 // The Settings service (ticket 13): the main-process composition that turns the
@@ -41,6 +45,10 @@ export interface SettingsServiceDependencies {
   startRepair: () => void;
   /** Reloads the Core routing config after a save so the next turn uses it (no restart). */
   reloadRouting: () => void;
+  /** The cheap key-validation call (Core `validateReasoningKey` with `fetch` injected). */
+  validateKey: (vendor: SettingsVendorId, key: string) => Promise<KeyValidationResultValue>;
+  /** Fetches a Vendor's live models (Core `listReasoningModels` with `fetch` injected). */
+  listModels: (vendor: SettingsVendorId, key: string) => Promise<ListModelsResponse>;
 }
 
 /** The Settings operations the IPC handlers call. */
@@ -51,6 +59,15 @@ export interface SettingsService {
   save(values: SettingsValues): SettingsState;
   /** Sets or clears one Vendor's API key in OS-encrypted storage; returns the new state. */
   setKey(request: SetApiKeyRequest): SettingsState;
+  /**
+   * Live-validates a candidate key and, if it works, stores it - routing the newly-keyed
+   * Vendor when the currently-routed one has none, so a user who supplies only (say) an
+   * OpenAI key lands on a working Vendor. Returns the verdict and the resulting state.
+   * Shared by the onboarding key step and the Settings key entry.
+   */
+  validateAndSaveKey(request: ValidateKeyRequest): Promise<{ result: KeyValidationResultValue; state: SettingsState }>;
+  /** Lists one Vendor's live models using its stored key (for the Settings model picker). */
+  listModels(vendor: SettingsVendorId): Promise<ListModelsResponse>;
   /** Re-runs/repairs Provisioning; returns the state (readiness now reflects the run). */
   repair(): SettingsState;
   /** Just the live readiness rows (for polling the download percentage). */
@@ -76,8 +93,16 @@ function buildCatalog(): SettingsCatalog {
 }
 
 export function createSettingsService(dependencies: SettingsServiceDependencies): SettingsService {
-  const { settingsStore, credentialStore, provisioningStatus, isRuntimeReady, startRepair, reloadRouting } =
-    dependencies;
+  const {
+    settingsStore,
+    credentialStore,
+    provisioningStatus,
+    isRuntimeReady,
+    startRepair,
+    reloadRouting,
+    validateKey,
+    listModels,
+  } = dependencies;
 
   const catalog = buildCatalog();
 
@@ -117,34 +142,82 @@ export function createSettingsService(dependencies: SettingsServiceDependencies)
     };
   }
 
+  /**
+   * Persists edited values and reloads routing, returning the new state. Shared by the
+   * public `save` and by `validateAndSaveKey` (which re-routes to a newly-keyed Vendor).
+   */
+  function persistValues(values: SettingsValues): SettingsState {
+    // Sanitize the hotkey defensively: the wire schema only fixes it as a non-empty
+    // string, but the ordering / at-least-two-modifiers rules live in
+    // validateHotkeyToken. An invalid combo keeps the previously-persisted hotkey
+    // rather than corrupting it (the editor already rejects invalid combos before
+    // Save is offered).
+    const current = settingsStore.read();
+    const hotkeyValidation = validateHotkeyToken(values.hotkey);
+    const next: AppSettings = {
+      reasoning: { vendor: values.reasoning.vendor, modelSlot: values.reasoning.modelSlot },
+      speech: { voice: values.speech.voice },
+      streamingText: values.streamingText,
+      hotkey: hotkeyValidation.ok ? hotkeyValidation.token : current.hotkey,
+    };
+    settingsStore.write(next);
+    // The Core watches the same file, but the default userData path may have had no
+    // watcher (first run before the file existed), so reload explicitly - the next
+    // turn then routes to the new Vendor/Model/Voice with no restart.
+    reloadRouting();
+    return state();
+  }
+
   return {
     snapshot: () => ({ catalog, ...state() }),
 
-    save: (values) => {
-      // Sanitize the hotkey defensively: the wire schema only fixes it as a non-empty
-      // string, but the ordering / at-least-two-modifiers rules live in
-      // validateHotkeyToken. An invalid combo keeps the previously-persisted hotkey
-      // rather than corrupting it (the editor already rejects invalid combos before
-      // Save is offered).
-      const current = settingsStore.read();
-      const hotkeyValidation = validateHotkeyToken(values.hotkey);
-      const next: AppSettings = {
-        reasoning: { vendor: values.reasoning.vendor, modelSlot: values.reasoning.modelSlot },
-        speech: { voice: values.speech.voice },
-        streamingText: values.streamingText,
-        hotkey: hotkeyValidation.ok ? hotkeyValidation.token : current.hotkey,
-      };
-      settingsStore.write(next);
-      // The Core watches the same file, but the default userData path may have had no
-      // watcher (first run before the file existed), so reload explicitly - the next
-      // turn then routes to the new Vendor/Model/Voice with no restart.
-      reloadRouting();
-      return state();
-    },
+    save: (values) => persistValues(values),
 
     setKey: (request) => {
       credentialStore.setKey(request.vendor, request.key);
       return state();
+    },
+
+    validateAndSaveKey: async ({ vendor, key }) => {
+      const result = await validateKey(vendor, key);
+      if (!result.ok) {
+        return { result, state: state() };
+      }
+
+      try {
+        // The key works: store it (this gates the Vendor selectable), then route to it
+        // when the currently-routed Vendor still has no key, so a user who supplies only
+        // (say) an OpenAI key lands on a working Vendor rather than the unkeyed default.
+        // When the routed Vendor is already keyed, its selection is kept.
+        credentialStore.setKey(vendor, key);
+        let next = state();
+        if (!next.keyedVendors.includes(next.values.reasoning.vendor)) {
+          next = persistValues({
+            ...next.values,
+            reasoning: { vendor, modelSlot: findReasoningVendor(vendor).defaultModel },
+          });
+        }
+        return { result, state: next };
+      } catch (error) {
+        // The key is valid but could not be stored (an unavailable OS keychain). Report
+        // it as an actionable failure rather than letting the caller advance with no key.
+        const reason =
+          error instanceof SecureStorageUnavailableError
+            ? "Your key is valid, but Lune couldn't save it to your OS keychain. Check that your login keychain is unlocked and try again."
+            : "Your key is valid, but Lune couldn't save it. Please try again.";
+        return { result: { ok: false, reason }, state: state() };
+      }
+    },
+
+    listModels: (vendor) => {
+      const key = credentialStore.getKey(vendor);
+      if (key === undefined) {
+        return Promise.resolve({
+          ok: false,
+          reason: `Add a ${findReasoningVendor(vendor).displayName} key to load its models.`,
+        });
+      }
+      return listModels(vendor, key);
     },
 
     repair: () => {

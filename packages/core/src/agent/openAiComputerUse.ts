@@ -281,6 +281,8 @@ interface OpenAiAdapterState {
 export function createOpenAiComputerUseAdapter(): ComputerUseVendorAdapter {
   return {
     vendorId: "openai",
+    // OpenAI's computer use is the dedicated computer-use-preview model, not the chat slot.
+    usesAdvisoryModelSlot: false,
     async step(input: ComputerUseStepInput): Promise<ComputerUseStepResult> {
       const priorState = input.priorState as OpenAiAdapterState | undefined;
 

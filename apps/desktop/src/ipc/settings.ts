@@ -25,6 +25,22 @@ export const SETTINGS_SAVE_CHANNEL = "lune:settings:save";
 /** Renderer -> main (invoke): set or clear one Vendor's API key in OS-encrypted storage. */
 export const SETTINGS_SET_KEY_CHANNEL = "lune:settings:set-key";
 
+/**
+ * Renderer -> main (invoke): live-validate a candidate Vendor key with a cheap test
+ * call and, if it works, store it (routing the Vendor when the currently-routed one has
+ * no key). The Settings surface uses this in place of a raw {@link SETTINGS_SET_KEY_CHANNEL}
+ * store so adding a key gives the same instant, specific feedback onboarding does; the
+ * set-key channel remains for *clearing* a key (an empty value never needs validating).
+ */
+export const SETTINGS_VALIDATE_KEY_CHANNEL = "lune:settings:validate-key";
+
+/**
+ * Renderer -> main (invoke): list a Vendor's live models (using its stored key), so the
+ * Settings picker offers the models the Vendor currently serves rather than a hardcoded
+ * shortlist that drifts as Vendors add and retire models.
+ */
+export const SETTINGS_LIST_MODELS_CHANNEL = "lune:settings:list-models";
+
 /** Renderer -> main (invoke): re-run/repair Provisioning (re-download broken weights). */
 export const SETTINGS_REPAIR_CHANNEL = "lune:settings:repair";
 
@@ -135,3 +151,50 @@ export const SetApiKeyRequestSchema = z.object({
   key: z.string(),
 });
 export type SetApiKeyRequest = z.infer<typeof SetApiKeyRequestSchema>;
+
+/**
+ * The verdict of a cheap key-validation call: usable, or an explained rejection. This is
+ * the wire codec mirroring the Core's `KeyValidationResult` (which the Core owns as a
+ * plain type, since @lune/core carries no zod). It lives here in the settings contract -
+ * the shared home for key management - and the onboarding contract re-exports it, so both
+ * surfaces validate keys through one shape.
+ */
+export const KeyValidationResultSchema = z.union([
+  z.object({ ok: z.literal(true) }),
+  z.object({ ok: z.literal(false), reason: z.string().min(1) }),
+]);
+export type KeyValidationResultValue = z.infer<typeof KeyValidationResultSchema>;
+
+/** Renderer -> main payload to validate (and, on success, store) one Vendor's key. */
+export const ValidateKeyRequestSchema = z.object({
+  vendor: SettingsVendorIdSchema,
+  key: z.string(),
+});
+export type ValidateKeyRequest = z.infer<typeof ValidateKeyRequestSchema>;
+
+/**
+ * The reply to a validate-key call: the verdict plus the resulting Settings state (so a
+ * successful save immediately reflects the newly-keyed - and possibly newly-routed -
+ * Vendor without a second round-trip).
+ */
+export const ValidateKeyResponseSchema = z.object({
+  result: KeyValidationResultSchema,
+  state: SettingsStateSchema,
+});
+export type ValidateKeyResponse = z.infer<typeof ValidateKeyResponseSchema>;
+
+/** Renderer -> main payload to list one Vendor's live models (uses its stored key). */
+export const ListModelsRequestSchema = z.object({
+  vendor: SettingsVendorIdSchema,
+});
+export type ListModelsRequest = z.infer<typeof ListModelsRequestSchema>;
+
+/**
+ * The reply to a list-models call: the live model ids (featured first), or an explained
+ * failure the picker shows in place of the dropdown. Mirrors the Core's `ModelListResult`.
+ */
+export const ListModelsResponseSchema = z.union([
+  z.object({ ok: z.literal(true), models: z.array(z.string()) }),
+  z.object({ ok: z.literal(false), reason: z.string().min(1) }),
+]);
+export type ListModelsResponse = z.infer<typeof ListModelsResponseSchema>;

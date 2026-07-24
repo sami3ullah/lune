@@ -48,6 +48,14 @@ export {
   type ValidateReasoningKeyInput,
 } from "./reasoning/validateReasoningKey.js";
 
+// The live model-catalogue call the Settings picker uses to offer a Vendor's current
+// models (fetched from the Vendor, not a hardcoded shortlist) over the same fetch seam.
+export {
+  listReasoningModels,
+  type ModelListResult,
+  type ListReasoningModelsInput,
+} from "./reasoning/listReasoningModels.js";
+
 // The routing config: which Vendor + Model Slot answers, Gemini by default.
 export {
   DEFAULT_ROUTING_CONFIG,
@@ -102,6 +110,15 @@ export {
   type ParsedPoint,
   type PointDirective,
 } from "./reasoning/pointTagParser.js";
+
+// The answer Act Tag parser: reads the trailing [ACT: goal] the advisory turn appends
+// when the user wants Lune to perform an on-screen task, so the Shell can hand the goal
+// to the Screen Agent (DECISIONS #14, advisory->act). The acting counterpart of the
+// Point Tag parser above.
+export {
+  parseAnswerActTag,
+  type ParsedActAnswer,
+} from "./reasoning/actTagParser.js";
 
 export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
@@ -232,8 +249,16 @@ export {
   createOpenAiComputerUseAdapter,
 } from "./agent/openAiComputerUse.js";
 export {
+  createVisionDrivenAgentAdapter,
+  VISION_DRIVEN_VENDORS,
+  buildVisionAgentSystemPrompt,
+  parseVisionAgentAction,
+  type VisionDrivenVendorConfig,
+} from "./agent/visionDrivenAgent.js";
+export {
   AGENT_SYSTEM_PROMPT,
 } from "./agent/agentSystemPrompt.js";
+export { ComputerUseUpstreamError } from "./agent/computerUseAdapter.js";
 export type {
   AgentScreenshot,
   AgentDisplay,
