@@ -62,6 +62,17 @@ describe("SpeechSentenceChunker.ingest", () => {
     // No new speakable text arrives as the tag finishes.
     expect(chunker.ingest("There it is. [POINT:1,2:it:screen1]")).toEqual([]);
   });
+
+  it("never speaks the teaching-overlay shape tags", () => {
+    const chunker = new SpeechSentenceChunker();
+    // Shape tags trail the spoken text just like the point tag; everything from the
+    // first "[" onward is held back, so the drawing directives are never synthesized.
+    expect(
+      chunker.ingest(
+        "Circle the save button here. [CIRCLE:640,360,50:save button] [POINT:640,360:save button]",
+      ),
+    ).toEqual(["Circle the save button here."]);
+  });
 });
 
 describe("SpeechSentenceChunker.flushRemaining", () => {
@@ -83,5 +94,13 @@ describe("SpeechSentenceChunker.flushRemaining", () => {
     const chunker = new SpeechSentenceChunker();
     chunker.ingest("Look here. ");
     expect(chunker.flushRemaining("Look here. [POINT:1,1:here:screen1]")).toBeUndefined();
+  });
+
+  it("drops trailing shape tags along with the point tag", () => {
+    const chunker = new SpeechSentenceChunker();
+    chunker.ingest("See this box");
+    expect(
+      chunker.flushRemaining("See this box [RECT:10,10,50,50:the box] [POINT:30,30:the box]"),
+    ).toBe("See this box");
   });
 });

@@ -5,10 +5,12 @@
  * it the accumulated response text as it grows, and it returns each newly-completed
  * sentence exactly once.
  *
- * The `[POINT:...]` tag the model appends at the very end of a response is not
- * speech, so anything from the first "[" onward is held back and never spoken;
- * `flushRemaining` drops it entirely. Carried from v1's `SpeechSentenceChunker.swift`
- * with its behaviour (decimal guard, trailing-tag holdback) intact.
+ * The trailing directive tags the model appends at the very end of a response - the
+ * `[POINT:...]` tag and the teaching-overlay shape tags (`[CIRCLE:...]`, `[ARROW:...]`,
+ * and friends) - are not speech, so anything from the first "[" onward is held back and
+ * never spoken; `flushRemaining` drops it entirely. Carried from v1's
+ * `SpeechSentenceChunker.swift` with its behaviour (decimal guard, trailing-tag
+ * holdback) intact.
  *
  * It lives in the Shell (not the Core) because it is Shell playback plumbing: the
  * Core streams answer text; the Shell decides how to chunk it for the audio player.
@@ -70,8 +72,8 @@ export class SpeechSentenceChunker {
 
   /**
    * Returns whatever speakable text remains after the last complete sentence (a final
-   * sentence with no trailing punctuation, e.g. "See that button"), dropping the point
-   * tag. Call once when the stream is finished.
+   * sentence with no trailing punctuation, e.g. "See that button"), dropping the
+   * trailing directive tags. Call once when the stream is finished.
    */
   flushRemaining(accumulatedText: string): string | undefined {
     const characters = Array.from(accumulatedText);
@@ -90,8 +92,8 @@ export class SpeechSentenceChunker {
 
 /**
  * The end of the speakable region: everything before the first "[", since that may
- * open the trailing "[POINT:...]" tag, which is never spoken. Returns the full length
- * when there is no bracket.
+ * open a trailing directive tag (a point or shape tag), which is never spoken. Returns
+ * the full length when there is no bracket.
  */
 function speakableEndIndex(characters: string[]): number {
   const firstBracketIndex = characters.indexOf("[");

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { adaptTextDeltasToCanonicalStream } from "../src/reasoning/canonicalStreamAdapter";
 import { iterateOpenAiContentDeltas } from "../src/reasoning/sseTextDeltas";
-import { identityRemap, remapForScaleFactor } from "../src/reasoning/pointTagCanonicalizer";
+import { identityRemap, remapForScaleFactor } from "../src/reasoning/coordinateRemap";
 import type { CoreChatStreamEvent } from "../src/reasoning/chatTypes";
 
 /**
@@ -123,5 +123,22 @@ describe("adaptTextDeltasToCanonicalStream", () => {
       "data: [DONE]\n\n",
     ]);
     expect(deltaText(events)).toBe("html stands for hypertext markup language. [POINT:none]");
+  });
+
+  it("repairs and remaps a teaching turn's trailing shape tags, including multi-screen", async () => {
+    // A teaching turn appends drawing tags after the prose; they are held back until
+    // complete, then repaired and remapped just like a Point Tag.
+    const events = await adaptOpenAiStream(
+      [
+        contentDelta("this box feeds into that one. "),
+        contentDelta("[ rect : 10,20,110,120 : the input : dotted ]"),
+        contentDelta(" [ARROW:110,120,300,320:it flows here:screen2]"),
+        "data: [DONE]\n\n",
+      ],
+      remapForScaleFactor(0.5),
+    );
+    expect(deltaText(events)).toBe(
+      "this box feeds into that one. [RECT:20,40,220,240:the input:dotted] [ARROW:220,240,600,640:it flows here:screen2]",
+    );
   });
 });

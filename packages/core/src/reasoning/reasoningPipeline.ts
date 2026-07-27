@@ -18,7 +18,7 @@
  */
 import { adaptTextDeltasToCanonicalStream } from "./canonicalStreamAdapter.js";
 import { extractScreenshots } from "./messagePreparation.js";
-import { remapForScaleFactor } from "./pointTagCanonicalizer.js";
+import { remapForScaleFactor } from "./coordinateRemap.js";
 import type { ReasoningVendor } from "./cloudReasoningVendors.js";
 import type { CoreChatRequest, CoreChatStreamEvent, DownscaleScreenshot } from "./chatTypes.js";
 import type { UpstreamFetch } from "./upstreamFetch.js";

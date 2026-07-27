@@ -9,7 +9,7 @@
  * shape (OpenAI content parts, or Anthropic image/text blocks) - so the "which
  * downscaled bytes go where, and how are the labels rewritten" decision lives in
  * exactly one place rather than being duplicated per Vendor. The inverse remap that
- * scales the model's returned coordinates back up lives in `pointTagCanonicalizer`.
+ * scales the model's returned coordinates back up lives in `coordinateRemap`.
  */
 import type {
   CoreChatRequest,
