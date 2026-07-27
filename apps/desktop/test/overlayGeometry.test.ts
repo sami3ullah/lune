@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveOverlayPointTarget,
+  toDisplayLocalRect,
   type DisplayCaptureGeometry,
 } from "../src/main/overlay/overlayGeometry";
 
@@ -107,5 +108,34 @@ describe("resolveOverlayPointTarget", () => {
       screenX: 0,
       screenY: 0,
     });
+  });
+});
+
+describe("toDisplayLocalRect", () => {
+  // A secondary display offset to the right of the primary, so a wizard on the primary
+  // must not leak onto the secondary's local rect (that would drag the intro card off).
+  const PRIMARY = { x: 0, y: 0, width: 1440, height: 900 };
+  const SECONDARY = { x: 1440, y: 0, width: 1920, height: 1080 };
+  // A 560x640 onboarding window centred on the primary display.
+  const WIZARD = { x: 440, y: 130, width: 560, height: 640 };
+
+  it("converts a wizard on this display into window-local coordinates", () => {
+    expect(toDisplayLocalRect(WIZARD, PRIMARY)).toEqual({ x: 440, y: 130, width: 560, height: 640 });
+  });
+
+  it("subtracts a display's origin so a wizard's local rect is relative to that window", () => {
+    // The same global rect on a display whose origin is offset lands at a shifted local x/y.
+    const onSecondary = { x: 1600, y: 200, width: 400, height: 300 };
+    expect(toDisplayLocalRect(onSecondary, SECONDARY)).toEqual({ x: 160, y: 200, width: 400, height: 300 });
+  });
+
+  it("returns null when the rect isn't on this display (so that window avoids nothing)", () => {
+    expect(toDisplayLocalRect(WIZARD, SECONDARY)).toBeNull();
+  });
+
+  it("clips a rect that straddles two displays to the part on this one", () => {
+    // Straddles the primary/secondary seam at x=1440; only the left half is on the primary.
+    const straddling = { x: 1340, y: 100, width: 200, height: 200 };
+    expect(toDisplayLocalRect(straddling, PRIMARY)).toEqual({ x: 1340, y: 100, width: 100, height: 200 });
   });
 });

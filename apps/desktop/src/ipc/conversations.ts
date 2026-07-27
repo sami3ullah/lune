@@ -32,6 +32,16 @@ export const CONVERSATIONS_RESUME_CHANNEL = "lune:conversations:resume";
 export const CONVERSATIONS_NEW_CHANNEL = "lune:conversations:new";
 
 /**
+ * Renderer -> main (invoke): the *active* conversation's full text history, so the Chat
+ * Panel can render what is already going on the moment it opens - a voice turn taken
+ * while the panel was closed is committed to the Core and persisted, but has never been
+ * streamed to the panel's renderer, so without this the panel would open blank. Purely a
+ * read: unlike {@link CONVERSATIONS_RESUME_CHANNEL} it never changes which conversation
+ * is active. Resolves with the same shape resume does (the active id + its messages).
+ */
+export const CONVERSATIONS_ACTIVE_CHANNEL = "lune:conversations:active";
+
+/**
  * Main -> renderer (send): the persisted set changed (a turn completed, so a new
  * conversation appeared, a title firmed up, or the oldest was pruned). The panel
  * re-reads {@link CONVERSATIONS_LIST_CHANNEL} to refresh its dropdown.

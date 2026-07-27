@@ -16,17 +16,35 @@ import type { DownscaleScreenshot, ScreenCaptureInput } from "@lune/core";
 // so the M7 Windows port needs no change here.
 
 /**
- * Caps each captured screenshot's larger dimension, in pixels. Matches v1's capture
- * cap: enough detail for the model to read the screen, small enough to keep tokens
- * and latency down. The Core then downscales further (see {@link nativeImageDownscale}).
+ * The Vendor-safe ceiling for the screenshot a Reasoning model sees: the largest size
+ * no Vendor's API silently resizes (Anthropic resizes above a 1568px long edge or
+ * ~1.15 megapixels). Staying under it matters more than raw detail: a silent server-side
+ * resize would put the model's coordinates in a space the labels (and the remap) don't
+ * know about - a systematic offset on every mark. Within the ceiling, bigger is better:
+ * the model estimates Point/Shape Tag pixel coordinates from this image, and a 2560-wide
+ * display squeezed to half scale made buttons a few blurry pixels tall - the model's
+ * ±10-15px guess in that space landed marks ~30-60px off on the real screen (the
+ * "drawing in the wrong place" bug). The capture itself is taken at the display's native
+ * resolution and kept for mark refinement + element snapping; only the model's copy is
+ * scaled down to this ceiling.
  */
-const CAPTURE_MAX_DIMENSION = 1280;
+const VENDOR_IMAGE_MAX_LONG_EDGE = 1568;
+const VENDOR_IMAGE_MAX_AREA = 1_150_000;
 
 /** JPEG quality (0-100) for both capture and downscale encodes; 80 matches v1. */
 const JPEG_QUALITY = 80;
 
-/** The uniform factor the captured screenshots are downscaled by before a Vendor sees them. */
-const DOWNSCALE_FACTOR = 0.5;
+/**
+ * The uniform factor the captured screenshots are downscaled by before a Vendor sees
+ * them. Set to 1 (no second downscale): the model estimates Point/Shape Tag pixel
+ * coordinates from this image, and halving the 1280-cap capture to ~640px wide made
+ * buttons a few blurry pixels tall - the model's ±10-15px guess in that space landed
+ * marks ~30px off on the real screen (the "drawing in the wrong place" bug). At the
+ * full 1280 cap (Anthropic's computer-use sweet spot) elements are legible enough to
+ * ground accurately. The remap seam stays: any factor here still round-trips through
+ * the Core's coordinate remap, so lowering it later is a one-line change.
+ */
+const DOWNSCALE_FACTOR = 1;
 
 /**
  * Which connected display the cursor is on, or `null` if the cursor is outside every
@@ -89,6 +107,37 @@ function buildSourceResolver(
 export interface DisplayCaptureResult {
   screens: ScreenCaptureInput[];
   geometry: DisplayCaptureGeometry[];
+  /**
+   * The same capture at the display's native pixel resolution, one per screen in the
+   * same order as {@link screens}. The model never sees these; they stay in the main
+   * process so mark refinement can cut sharp zoomed crops and element snapping can
+   * detect edges at full detail. Like the model's screenshots, they live only as
+   * in-memory base64 for the turn and are never persisted.
+   */
+  nativeCaptures: NativeScreenCapture[];
+}
+
+/** One display's screenshot at native pixel resolution, for Shell-side mark accuracy work. */
+export interface NativeScreenCapture {
+  /** The same 1-based screen number the model's label and {@link DisplayCaptureGeometry} carry. */
+  screenNumber: number;
+  /** Base64-encoded JPEG bytes (no `data:` prefix). */
+  base64Data: string;
+  widthInPixels: number;
+  heightInPixels: number;
+}
+
+/**
+ * How much a native capture must be scaled down (uniformly, in (0, 1]) for the model's
+ * copy to fit the Vendor-safe ceiling - never upscaling a small display.
+ */
+function vendorSafeScale(width: number, height: number): number {
+  if (width <= 0 || height <= 0) {
+    return 1;
+  }
+  const longEdgeScale = VENDOR_IMAGE_MAX_LONG_EDGE / Math.max(width, height);
+  const areaScale = Math.sqrt(VENDOR_IMAGE_MAX_AREA / (width * height));
+  return Math.min(1, longEdgeScale, areaScale);
 }
 
 /**
@@ -104,7 +153,7 @@ export interface DisplayCaptureResult {
 export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> {
   const displays = screen.getAllDisplays();
   if (displays.length === 0) {
-    return { screens: [], geometry: [] };
+    return { screens: [], geometry: [], nativeCaptures: [] };
   }
 
   const displayById = new Map(displays.map((display) => [display.id, display]));
@@ -118,14 +167,27 @@ export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> 
     focusDisplayId,
   );
 
+  // Ask for the focus display's native pixel size (logical bounds x its backing scale).
+  // Electron fits each source's thumbnail within this box preserving aspect, never
+  // upscaling, so the focus display comes back at true native resolution - full detail
+  // for the mark-accuracy work; the model's copy is derived below at the Vendor ceiling.
+  const focusDisplay = displayById.get(focusDisplayId);
+  const nativeThumbnailSize = focusDisplay
+    ? {
+        width: Math.max(1, Math.round(focusDisplay.bounds.width * focusDisplay.scaleFactor)),
+        height: Math.max(1, Math.round(focusDisplay.bounds.height * focusDisplay.scaleFactor)),
+      }
+    : { width: VENDOR_IMAGE_MAX_LONG_EDGE, height: VENDOR_IMAGE_MAX_LONG_EDGE };
+
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
-    thumbnailSize: { width: CAPTURE_MAX_DIMENSION, height: CAPTURE_MAX_DIMENSION },
+    thumbnailSize: nativeThumbnailSize,
   });
   const resolveSource = buildSourceResolver(displays, sources);
 
   const screens: ScreenCaptureInput[] = [];
   const geometry: DisplayCaptureGeometry[] = [];
+  const nativeCaptures: NativeScreenCapture[] = [];
   for (const plan of capturePlans) {
     const source = resolveSource(plan.displayId);
     if (!source || source.thumbnail.isEmpty()) {
@@ -134,13 +196,25 @@ export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> 
       // no geometry either, so the model never sees a screenN the Overlay can't map.
       continue;
     }
-    const { width, height } = source.thumbnail.getSize();
+    const nativeSize = source.thumbnail.getSize();
+    const scale = vendorSafeScale(nativeSize.width, nativeSize.height);
+    const modelImage =
+      scale < 1
+        ? source.thumbnail.resize({ width: Math.max(1, Math.round(nativeSize.width * scale)) })
+        : source.thumbnail;
+    const { width, height } = modelImage.getSize();
     screens.push({
-      base64Data: source.thumbnail.toJPEG(JPEG_QUALITY).toString("base64"),
+      base64Data: modelImage.toJPEG(JPEG_QUALITY).toString("base64"),
       mediaType: "image/jpeg",
       widthInPixels: width,
       heightInPixels: height,
       label: plan.label,
+    });
+    nativeCaptures.push({
+      screenNumber: plan.screenNumber,
+      base64Data: source.thumbnail.toJPEG(JPEG_QUALITY).toString("base64"),
+      widthInPixels: nativeSize.width,
+      heightInPixels: nativeSize.height,
     });
 
     // The same screen number the label carried to the model, paired with the display's
@@ -163,7 +237,7 @@ export async function captureConnectedDisplays(): Promise<DisplayCaptureResult> 
     }
   }
 
-  return { screens, geometry };
+  return { screens, geometry, nativeCaptures };
 }
 
 /**
@@ -195,6 +269,11 @@ export async function screenCaptureProducesContent(): Promise<boolean> {
  * passthrough now that real screenshots flow.
  */
 export const nativeImageDownscale: DownscaleScreenshot = async (screenshot) => {
+  if (DOWNSCALE_FACTOR === 1) {
+    // Passthrough: no resize, and crucially no decode + JPEG re-encode round trip,
+    // which would only soften the text the model reads coordinates from.
+    return { ...screenshot, scaleFactor: 1 };
+  }
   const originalImage = nativeImage.createFromBuffer(Buffer.from(screenshot.base64Data, "base64"));
   const originalWidth = originalImage.getSize().width;
   if (originalWidth <= 0) {

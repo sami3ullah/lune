@@ -1,29 +1,25 @@
 import type { AgentAction } from "@lune/core";
-import type { ConfirmGateViewValue } from "../../ipc/confirmGate";
 import type { ConfirmGateRequest } from "./screenAgentLoop";
 
-// The Confirm Gate's plain-language explanation (M2-04): the words the gate shows on the
-// chip and speaks aloud so the user knows *what* Lune is about to do before they answer.
-// Pure over the request - no chip, speaker, or clock - so it is unit-testable and the
-// controller (`confirmGateController`) just renders/says what this returns.
+// The Confirm Gate's plain-language explanation (M2-04): the words the gate speaks aloud so
+// the user knows *what* Lune is about to do before they answer by voice. Pure over the
+// request - no speaker or clock - so it is unit-testable and the controller
+// (`confirmGateController`) just says what this returns.
 //
-// The gate never shows raw coordinates or Vendor jargon: a click is "click on the screen",
-// a type is the quoted text it will enter. The confirm-to-start gate frames the whole run
-// around the user's spoken goal; the irreversible guard names the single consequential
-// Action and warns it may be hard to undo, matching the two moments the loop gates
-// (DECISIONS #15).
+// The gate never speaks raw coordinates or Vendor jargon: a click is "click on the screen",
+// a type is the quoted text it will enter. Only the consequential (hard-to-undo) guard
+// remains (DECISIONS #15, revised): it names the Action and warns it may be hard to undo,
+// then asks for a plain spoken yes or no. Confirm-to-start was dropped, so there is no
+// "start the run" framing here anymore.
 
 /** The longest a quoted `type` string is shown before it is shortened with an ellipsis. */
 const MAX_TYPED_PREVIEW = 60;
 
-/** The one-line "how to answer" tail shared by both gates' explanations and the re-prompt. */
-const HOW_TO_ANSWER = 'Say "yes" to go ahead, or "no" to stop.';
-
 /** The spoken nudge when a voice reply was too unclear to act on - asks again, never proceeds. */
-export const REPROMPT_LINE = `Sorry, I didn't catch that. ${HOW_TO_ANSWER}`;
+export const REPROMPT_LINE = "sorry, didn't catch that - yes or no?";
 
 /** The spoken acknowledgment when the user declines a gate; the session then ends cleanly. */
-export const DECLINE_ACKNOWLEDGMENT = "Okay, I'll stop.";
+export const DECLINE_ACKNOWLEDGMENT = "no worries, leaving it.";
 
 /** Shortens a typed string to a preview, appending an ellipsis when it was cut. */
 function previewText(text: string): string {
@@ -59,23 +55,11 @@ export function describeGateAction(action: AgentAction): string {
 }
 
 /**
- * What the controller renders on the chip and speaks: the framing, the explanation, the
- * summary. This is exactly the payload sent over the gate IPC, so the type is the one
- * inferred from that zod contract - no parallel shape to drift from it.
+ * Builds the one warm spoken line the gate says before a consequential Action: it names the
+ * Action in plain words, flags that it is hard to undo, and asks for a plain yes or no, in
+ * Lune's casual voice. The model has already acknowledged the task, so this does not
+ * re-narrate the run - it only guards the irreversible step.
  */
-export type ConfirmGateView = ConfirmGateViewValue;
-
-/**
- * Builds the {@link ConfirmGateView} for one gate request. Confirm-to-start frames the run
- * around the user's goal and what the first step will be; the irreversible guard names the
- * consequential Action and warns it may be hard to undo. Both end with how to answer.
- */
-export function buildConfirmGateView(request: ConfirmGateRequest): ConfirmGateView {
-  const actionSummary = describeGateAction(request.action);
-  const explanation =
-    request.kind === "confirm-to-start"
-      ? `I'd like to start working on your screen to ${request.goal}. ` +
-        `I'll begin by trying to ${actionSummary}. ${HOW_TO_ANSWER}`
-      : `I'm about to ${actionSummary}. This could be hard to undo. ${HOW_TO_ANSWER}`;
-  return { kind: request.kind, explanation, actionSummary };
+export function buildGateSpokenLine(request: ConfirmGateRequest): string {
+  return `heads up, i'm about to ${describeGateAction(request.action)} - that one's hard to undo. okay to go ahead? yes or no.`;
 }

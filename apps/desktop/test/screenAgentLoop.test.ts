@@ -156,7 +156,7 @@ describe("screen agent loop - advisory -> act boundary", () => {
 });
 
 describe("screen agent loop - a full multi-step run", () => {
-  it("drives decide -> confirm-to-start -> execute -> capture until done", async () => {
+  it("drives decide -> execute -> capture until done", async () => {
     const harness = makeHarness({
       actions: [CLICK_BENIGN, { kind: "type", text: "hi", consequence: "benign" }, DONE],
       scenes: [scene("a"), scene("b"), scene("c")],
@@ -170,9 +170,9 @@ describe("screen agent loop - a full multi-step run", () => {
       CLICK_BENIGN,
       { kind: "type", text: "hi", consequence: "benign" },
     ]);
-    // Only the first (confirm-to-start) gate fires; the benign type mid-session doesn't.
-    expect(harness.confirmRequests).toHaveLength(1);
-    expect(harness.confirmRequests[0]?.kind).toBe("confirm-to-start");
+    // No confirm-to-start anymore: the explicit command is consent to start, and both steps
+    // are benign, so the run never gates.
+    expect(harness.confirmRequests).toHaveLength(0);
   });
 
   it("the trivial 1-step type-at-cursor case works", async () => {
@@ -187,21 +187,20 @@ describe("screen agent loop - a full multi-step run", () => {
 });
 
 describe("screen agent loop - confirm gates", () => {
-  it("gates a consequential mid-session action (irreversible guard)", async () => {
+  it("gates only the consequential action, letting benign steps run ungated", async () => {
     const harness = makeHarness({
       actions: [CLICK_BENIGN, CLICK_CONSEQUENTIAL, DONE],
       scenes: [scene("a"), scene("b"), scene("c")],
     });
     await runScreenAgentLoop(harness.deps);
 
-    expect(harness.confirmRequests.map((request) => request.kind)).toEqual([
-      "confirm-to-start",
-      "irreversible",
-    ]);
+    // The benign step runs without a gate; only the consequential step is confirmed.
+    expect(harness.confirmRequests).toHaveLength(1);
+    expect(harness.confirmRequests[0]?.action.consequence).toBe("consequential");
   });
 
-  it("a declined confirm-to-start ends the run without any OS touch", async () => {
-    const harness = makeHarness({ actions: [CLICK_BENIGN], confirm: async () => false });
+  it("a declined consequential gate ends the run without that OS touch", async () => {
+    const harness = makeHarness({ actions: [CLICK_CONSEQUENTIAL], confirm: async () => false });
     const result = await runScreenAgentLoop(harness.deps);
 
     expect(result.reason).toBe("declined");
@@ -213,7 +212,7 @@ describe("screen agent loop - confirm gates", () => {
     const harness = makeHarness({
       actions: [CLICK_BENIGN, CLICK_CONSEQUENTIAL],
       scenes: [scene("a"), scene("b"), scene("c")],
-      confirm: async (request) => request.kind === "confirm-to-start",
+      confirm: async () => false,
     });
     const result = await runScreenAgentLoop(harness.deps);
 
@@ -306,7 +305,7 @@ describe("screen agent loop - barge-in cancellation", () => {
   it("does not execute an approved action if a barge-in lands during the confirm", async () => {
     const controller = new AbortController();
     const harness = makeHarness({
-      actions: [CLICK_BENIGN],
+      actions: [CLICK_CONSEQUENTIAL],
       // Barge-in fires while the user is answering the confirm gate.
       confirm: async () => {
         controller.abort();
@@ -323,7 +322,7 @@ describe("screen agent loop - barge-in cancellation", () => {
   it("classifies a barge-in that ends the gate as cancelled, not a decline", async () => {
     const controller = new AbortController();
     const harness = makeHarness({
-      actions: [CLICK_BENIGN],
+      actions: [CLICK_CONSEQUENTIAL],
       // A real gate aborts its own wait on barge-in and resolves not-approved; the loop
       // must read the aborted signal as a cancellation rather than a user decline.
       confirm: async (request) => {
@@ -340,7 +339,7 @@ describe("screen agent loop - barge-in cancellation", () => {
 
   it("passes the run's barge-in signal into each confirm request", async () => {
     const controller = new AbortController();
-    const harness = makeHarness({ actions: [CLICK_BENIGN], signal: controller.signal });
+    const harness = makeHarness({ actions: [CLICK_CONSEQUENTIAL], signal: controller.signal });
     await runScreenAgentLoop(harness.deps);
 
     expect(harness.confirmRequests[0]?.signal).toBe(controller.signal);
@@ -348,10 +347,10 @@ describe("screen agent loop - barge-in cancellation", () => {
 
   it("honours a barge-in before a benign, non-gated Action executes", async () => {
     const controller = new AbortController();
-    // Step 0 is gated + approved + executed; step 1 is a benign mid-session Action (no gate).
+    // Both steps are benign, so neither gates; the barge-in must still be caught between the
+    // second decide and its execute.
     const harness = makeHarness({
       actions: [CLICK_BENIGN, CLICK_BENIGN],
-      confirm: async () => true,
       signal: controller.signal,
     });
     // A push-to-talk barge-in lands while the model is deciding the second (benign) step -

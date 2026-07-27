@@ -34,6 +34,7 @@ function circle(overrides: Partial<ParsedShape> = {}): ParsedShape {
     label: "save button",
     style: { stroke: "solid", filled: false, color: null },
     screenNumber: null,
+    step: null,
     ...overrides,
   };
 }
@@ -50,6 +51,7 @@ describe("resolveOverlayShape", () => {
         radius: 100,
         label: "save button",
         style: { stroke: "solid", filled: false, color: null },
+        step: null,
       },
     });
   });
@@ -65,6 +67,7 @@ describe("resolveOverlayShape", () => {
       label: "from a to b",
       style: { stroke: "dashed", filled: false, color: "red" },
       screenNumber: 2,
+      step: null,
     };
     const resolved = resolveOverlayShape(arrow, TWO_DISPLAY_GEOMETRY);
     // Display 200 is captured 1:1, so local coords equal captured coords (window origin
@@ -80,8 +83,34 @@ describe("resolveOverlayShape", () => {
         radius: null,
         label: "from a to b",
         style: { stroke: "dashed", filled: false, color: "red" },
+        step: null,
       },
     });
+  });
+
+  it("maps every vertex of a polygon and carries its teaching step through", () => {
+    const polygon: ParsedShape = {
+      kind: "polygon",
+      points: [
+        { x: 0, y: 0 },
+        { x: 720, y: 0 },
+        { x: 360, y: 450 },
+      ],
+      radius: null,
+      label: "trace the region",
+      style: { stroke: "dotted", filled: false, color: null },
+      screenNumber: null,
+      step: 2,
+    };
+    const resolved = resolveOverlayShape(polygon, TWO_DISPLAY_GEOMETRY);
+    // Display 100 captured 720x450 -> 1440x900 is a 2x scale on every vertex.
+    expect(resolved!.shape.points).toEqual([
+      { localX: 0, localY: 0 },
+      { localX: 1440, localY: 0 },
+      { localX: 720, localY: 900 },
+    ]);
+    expect(resolved!.shape.step).toBe(2);
+    expect(resolved!.shape.kind).toBe("polygon");
   });
 
   it("clamps an out-of-frame coordinate to the display edge", () => {

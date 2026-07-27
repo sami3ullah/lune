@@ -52,10 +52,14 @@ export interface ArcShaping {
 /** The default bow: straight up and symmetric - the deterministic path the tests pin. */
 export const DEFAULT_ARC_SHAPING: ArcShaping = { perpendicular: -1, lateral: 0 };
 
-/** Flight duration scales with distance, clamped so hops and long flights both read well. */
-const MIN_FLIGHT_MS = 600;
-const MAX_FLIGHT_MS = 1400;
-const MS_PER_PIXEL = 1000 / 800;
+/**
+ * Flight duration scales with distance, clamped so hops and long flights both read well.
+ * Deliberately unhurried: the cursor gliding to its target is the user's cue for where to
+ * look next, so it must be trackable by eye - a fast dart reads as the mark just appearing.
+ */
+const MIN_FLIGHT_MS = 550;
+const MAX_FLIGHT_MS = 1900;
+const MS_PER_PIXEL = 1000 / 850;
 
 /** Clamps `value` into `[min, max]`. */
 function clamp(value: number, min: number, max: number): number {

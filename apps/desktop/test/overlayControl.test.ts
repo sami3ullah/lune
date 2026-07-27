@@ -65,6 +65,24 @@ describe("OverlayEventSchema", () => {
     ).toBe(false);
   });
 
+  it("accepts the intro-video events (a wizard rect to avoid, or null when off-display)", () => {
+    expect(
+      OverlayEventSchema.parse({
+        type: "intro-video-start",
+        avoidRect: { x: 440, y: 130, width: 560, height: 640 },
+      }),
+    ).toEqual({ type: "intro-video-start", avoidRect: { x: 440, y: 130, width: 560, height: 640 } });
+    expect(
+      OverlayEventSchema.parse({ type: "intro-video-start", avoidRect: null }),
+    ).toEqual({ type: "intro-video-start", avoidRect: null });
+    expect(OverlayEventSchema.parse({ type: "intro-video-end" }).type).toBe("intro-video-end");
+    // The avoidRect is required (nullable, not optional), so an incomplete rect is rejected.
+    expect(OverlayEventSchema.safeParse({ type: "intro-video-start" }).success).toBe(false);
+    expect(
+      OverlayEventSchema.safeParse({ type: "intro-video-start", avoidRect: { x: 1, y: 2 } }).success,
+    ).toBe(false);
+  });
+
   it("rejects an unknown event type", () => {
     expect(OverlayEventSchema.safeParse({ type: "explode" }).success).toBe(false);
   });

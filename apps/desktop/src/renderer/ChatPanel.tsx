@@ -34,15 +34,27 @@ export function ChatPanel() {
   // into the store (which ignores events from any superseded turn).
   useEffect(() => window.lune.chat.onChatEvent(applyEvent), [applyEvent]);
 
-  // Load the recent-conversations list on open and refresh it whenever a turn changes
-  // the durable set (a new conversation appeared, a title firmed up, the oldest pruned).
+  // On open, render whatever conversation is already active - a voice turn taken while
+  // the panel was closed is committed to the Core (and persisted) but was never streamed
+  // to this renderer, so without seeding the panel would open blank on top of a live
+  // conversation. We also load the recent-conversations dropdown, then keep only that
+  // dropdown in sync as the durable set changes (re-hydrating messages here would clobber
+  // an in-flight turn's streamed text).
   useEffect(() => {
     async function refreshList() {
       setConversationList(await window.lune.conversations.list());
     }
-    void refreshList();
+    async function hydrate() {
+      const [snapshot, active] = await Promise.all([
+        window.lune.conversations.list(),
+        window.lune.conversations.active(),
+      ]);
+      setConversationList(snapshot);
+      resumeConversation(active);
+    }
+    void hydrate();
     return window.lune.conversations.onChanged(() => void refreshList());
-  }, [setConversationList]);
+  }, [setConversationList, resumeConversation]);
 
   async function resumeSelected(conversationId: string) {
     // The empty value is the "New conversation" placeholder row, not a resumable id.

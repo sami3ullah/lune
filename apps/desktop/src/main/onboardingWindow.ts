@@ -79,3 +79,15 @@ export function closeOnboardingWindow(): void {
     onboardingWindow.close();
   }
 }
+
+/**
+ * The onboarding window's current global-desktop bounds, or `null` when it is closed. Used
+ * to keep the cursor-riding intro video (M3-03) clear of the wizard: the main process
+ * converts these into each Overlay window's local space so the card never covers onboarding.
+ */
+export function getOnboardingWindowBounds(): { x: number; y: number; width: number; height: number } | null {
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+    return onboardingWindow.getBounds();
+  }
+  return null;
+}

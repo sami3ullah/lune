@@ -19,21 +19,23 @@
  *   [HIGHLIGHT:x1,y1,x2,y2:label]       highlighted region between two corners
  *   [ARROW:x1,y1,x2,y2:label]           arrow from (x1,y1) to (x2,y2)
  *   [LINE:x1,y1,x2,y2:label]            line between two points
+ *   [POLYGON:x1,y1,x2,y2,x3,y3,...:label]   closed polygon through >=3 points
  *
- * Any shape may carry style modifiers and a screen, each in its own colon segment
- * after the label, in the canonical order stroke, fill, color, screen:
+ * Any shape may carry style modifiers, a step, and a screen, each in its own colon
+ * segment after the label, in the canonical order stroke, fill, color, step, screen:
  *
- *   [CIRCLE:640,360,50:save button:dotted:filled:red:screen2]
+ *   [CIRCLE:640,360,50:save button:dotted:filled:red:step1:screen2]
  *
  * where the coordinates are integers, `label` contains no `:` or `]`, a stroke is
  * `dotted` or `dashed` (solid is the default and omitted), `filled` appears only when
- * the shape is filled, and a color is a known name or a `#rrggbb`/`#rgb` hex. Pure and
- * transport-agnostic, exactly like the Point Tag canonicalizer.
+ * the shape is filled, a color is a known name or a `#rrggbb`/`#rgb` hex, and `stepN`
+ * groups the shape into an ordered teaching step (the Overlay reveals steps one at a
+ * time). Pure and transport-agnostic, exactly like the Point Tag canonicalizer.
  */
 import type { RemapCoordinate } from "./coordinateRemap.js";
 
 /** The canonical shape keywords the grammar emits, lowercase, in prompt-documented order. */
-const SHAPE_KEYWORDS = ["circle", "rect", "highlight", "arrow", "line"] as const;
+const SHAPE_KEYWORDS = ["circle", "rect", "highlight", "arrow", "line", "polygon"] as const;
 
 /** One shape the grammar understands (the canonical, alias-resolved kind). */
 export type ShapeKind = (typeof SHAPE_KEYWORDS)[number];
@@ -51,6 +53,8 @@ const SHAPE_KEYWORD_ALIASES: Record<string, ShapeKind> = {
   highlight: "highlight",
   arrow: "arrow",
   line: "line",
+  polygon: "polygon",
+  poly: "polygon",
 };
 
 /**
@@ -60,14 +64,22 @@ const SHAPE_KEYWORD_ALIASES: Record<string, ShapeKind> = {
  */
 export const RECOGNIZED_SHAPE_KEYWORDS = Object.keys(SHAPE_KEYWORD_ALIASES);
 
-/** How many leading coordinate numbers each shape carries: a circle is center+radius; the rest are two points. */
+/**
+ * How many leading coordinate numbers each shape carries: a circle is center+radius; the
+ * two-point shapes are four. A polygon has *variable* arity (a run of `x,y` pairs), so its
+ * entry is only the minimum (three points => six numbers) the variable-arity branch enforces.
+ */
 const SHAPE_COORDINATE_ARITY: Record<ShapeKind, number> = {
   circle: 3,
   rect: 4,
   highlight: 4,
   arrow: 4,
   line: 4,
+  polygon: 6,
 };
+
+/** A polygon needs at least this many points (numbers = 2x) to enclose a region. */
+const POLYGON_MIN_POINTS = 3;
 
 // Style vocabularies. A sloppy model may pick any of these; the canonicalizer maps
 // them onto the small canonical set the Overlay renders. Defaults (solid stroke, not
@@ -131,12 +143,21 @@ export interface ShapeStyle {
  */
 export interface ShapeTagBody {
   kind: ShapeKind;
-  /** `[x, y, r]` for a circle; `[x1, y1, x2, y2]` for every other shape. */
+  /**
+   * `[x, y, r]` for a circle; `[x1, y1, x2, y2]` for a two-point shape; a flat run of
+   * `[x1, y1, x2, y2, ...]` pairs (>= 3 points) for a polygon.
+   */
   numbers: number[];
   label: string;
   style: ShapeStyle;
   /** The 1-based screen the shape belongs to, or null for the cursor's screen. */
   screenNumber: number | null;
+  /**
+   * The 1-based teaching step the shape belongs to, or null when it isn't grouped into a
+   * step. The Overlay reveals stepped shapes one step at a time (a guided walkthrough);
+   * shapes with no step draw together in one pass.
+   */
+  step: number | null;
 }
 
 /** Strips a stray leading separator a model might have left before a label word. */
@@ -156,11 +177,17 @@ function cleanLabelPart(part: string): string {
  * recognized in any position (including when the model omits the label entirely). An
  * unrecognized later part is appended to the label, tolerating a label a model split
  * across colons.
+ *
+ * `stepN` deliberately differs from `screenN`: "step 2" is a perfectly plausible *label*
+ * (circling the on-screen text "step 2"), so it is read as a step only *after* the label
+ * position - never at index 0. The prompt always writes the label first and the step as a
+ * later modifier, so this reads real steps while keeping a "step 2" label intact.
  */
 function classifyTrailingParts(afterCoordinates: string): {
   label: string;
   style: ShapeStyle;
   screenNumber: number | null;
+  step: number | null;
 } {
   const parts = afterCoordinates
     .split(":")
@@ -169,16 +196,21 @@ function classifyTrailingParts(afterCoordinates: string): {
 
   const style: ShapeStyle = { stroke: "solid", filled: false, color: null };
   let screenNumber: number | null = null;
+  let step: number | null = null;
   const labelParts: string[] = [];
 
   parts.forEach((part, index) => {
     const lower = part.toLowerCase();
     const screenMatch = lower.match(/^screen\s*(\d+)$/);
+    const stepMatch = lower.match(/^step\s*(\d+)$/);
     if (screenMatch !== null) {
       screenNumber = Number.parseInt(screenMatch[1], 10);
     } else if (index === 0) {
-      // The first non-screen part is the label, verbatim, whatever word it is.
+      // The first non-screen part is the label, verbatim, whatever word it is - including
+      // a natural "step 2" label, which a step modifier (recognized only below) never eats.
       labelParts.push(cleanLabelPart(part));
+    } else if (stepMatch !== null) {
+      step = Number.parseInt(stepMatch[1], 10);
     } else if (STROKE_KEYWORDS.has(lower)) {
       style.stroke = lower as ShapeStyle["stroke"];
     } else if (SOLID_KEYWORDS.has(lower)) {
@@ -198,7 +230,7 @@ function classifyTrailingParts(afterCoordinates: string): {
 
   // The label must not contain ':' or ']' (the Overlay regex forbids them).
   const label = labelParts.join(" ").replace(/[:\]]/g, "").trim();
-  return { label, style, screenNumber };
+  return { label, style, screenNumber, step };
 }
 
 /** Renders the canonical `:stroke:filled:color` suffix, omitting defaulted modifiers. */
@@ -235,10 +267,14 @@ function remapCoordinates(
     const radius = Math.abs(edge.x - center.x);
     return `${center.x},${center.y},${radius}`;
   }
-  const [x1, y1, x2, y2] = numbers;
-  const start = remap(x1, y1);
-  const end = remap(x2, y2);
-  return `${start.x},${start.y},${end.x},${end.y}`;
+  // Every other shape is a flat run of x,y pairs (two for a two-point shape, >= 3 for a
+  // polygon), each remapped the same way.
+  const mapped: number[] = [];
+  for (let i = 0; i + 1 < numbers.length; i += 2) {
+    const point = remap(numbers[i]!, numbers[i + 1]!);
+    mapped.push(point.x, point.y);
+  }
+  return mapped.join(",");
 }
 
 /**
@@ -257,27 +293,47 @@ export function parseShapeTagBody(bracketSegment: string): ShapeTagBody | null {
     return null;
   }
   const kind = SHAPE_KEYWORD_ALIASES[keywordMatch[1].toLowerCase()];
-  const arity = SHAPE_COORDINATE_ARITY[kind];
   const afterKeyword = inner.slice(keywordMatch[0].length);
 
-  // Pull the leading `arity` numbers (comma- or space-separated, floats tolerated) as
-  // the coordinates; everything after them is the label/style/screen tail.
   const number = "-?\\d+(?:\\.\\d+)?";
-  const coordinatePattern = new RegExp(
-    `^\\s*${Array.from({ length: arity }, () => `(${number})`).join("\\s*[\\s,]\\s*")}`,
-  );
-  const coordinateMatch = afterKeyword.match(coordinatePattern);
-  if (coordinateMatch === null) {
-    return null;
+  let numbers: number[];
+  let afterCoordinates: string;
+
+  if (kind === "polygon") {
+    // A polygon's arity is variable: grab the whole leading run of numbers (comma- or
+    // space-separated, floats tolerated), then require at least three points. A dangling
+    // odd coordinate (a model typo) is dropped so the remaining pairs stay valid.
+    const runPattern = new RegExp(`^\\s*(${number}(?:\\s*[\\s,]\\s*${number})*)`);
+    const runMatch = afterKeyword.match(runPattern);
+    if (runMatch === null) {
+      return null;
+    }
+    const all = (runMatch[1].match(new RegExp(number, "g")) ?? []).map((value) =>
+      Math.round(Number.parseFloat(value)),
+    );
+    const evenCount = all.length - (all.length % 2);
+    if (evenCount < POLYGON_MIN_POINTS * 2) {
+      return null;
+    }
+    numbers = all.slice(0, evenCount);
+    afterCoordinates = afterKeyword.slice(runMatch[0].length);
+  } else {
+    // A fixed-arity shape: pull exactly `arity` leading numbers as the coordinates;
+    // everything after them is the label/style/step/screen tail.
+    const arity = SHAPE_COORDINATE_ARITY[kind];
+    const coordinatePattern = new RegExp(
+      `^\\s*${Array.from({ length: arity }, () => `(${number})`).join("\\s*[\\s,]\\s*")}`,
+    );
+    const coordinateMatch = afterKeyword.match(coordinatePattern);
+    if (coordinateMatch === null) {
+      return null;
+    }
+    numbers = coordinateMatch.slice(1, arity + 1).map((value) => Math.round(Number.parseFloat(value)));
+    afterCoordinates = afterKeyword.slice(coordinateMatch[0].length);
   }
 
-  const numbers = coordinateMatch
-    .slice(1, arity + 1)
-    .map((value) => Math.round(Number.parseFloat(value)));
-  const { label, style, screenNumber } = classifyTrailingParts(
-    afterKeyword.slice(coordinateMatch[0].length),
-  );
-  return { kind, numbers, label, style, screenNumber };
+  const { label, style, screenNumber, step } = classifyTrailingParts(afterCoordinates);
+  return { kind, numbers, label, style, screenNumber, step };
 }
 
 /**
@@ -293,6 +349,7 @@ export function canonicalizeShapeBracket(bracketSegment: string, remap: RemapCoo
   }
   const coordinates = remapCoordinates(body.kind, body.numbers, remap);
   const styleSuffix = renderStyleSuffix(body.style);
+  const stepSuffix = body.step !== null ? `:step${body.step}` : "";
   const screenSuffix = body.screenNumber !== null ? `:screen${body.screenNumber}` : "";
-  return `[${body.kind.toUpperCase()}:${coordinates}:${body.label}${styleSuffix}${screenSuffix}]`;
+  return `[${body.kind.toUpperCase()}:${coordinates}:${body.label}${styleSuffix}${stepSuffix}${screenSuffix}]`;
 }

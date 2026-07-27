@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { app, BrowserWindow, globalShortcut, ipcMain, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
+import { constants as osConstants } from "node:os";
+import { app, BrowserWindow, ipcMain, nativeImage, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
+  buildMarkRefinementRequest,
   createAnthropicComputerUseAdapter,
   createConversationManager,
   createGeminiComputerUseAdapter,
@@ -17,11 +19,15 @@ import {
   parseAnswerActTag,
   parseAnswerPointTag,
   parseAnswerShapeTags,
+  parseMarkRefinementReply,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
   validateReasoningKey,
   type ComputerUseVendorId,
+  type ParsedShape,
+  type PointDirective,
   type ReasoningVendorId,
+  type ScreenCaptureInput,
   type SpeechCapability,
 } from "@lune/core";
 import {
@@ -35,7 +41,9 @@ import {
 } from "@lune/shared";
 import { APP_QUIT_CHANNEL, PILL_CAPTION_CHANNEL, PillCaptionSchema } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
+import { formatReasoningCompletion, isReasoningDebugEnabled } from "./reasoningDebugLog";
 import {
+  CONVERSATIONS_ACTIVE_CHANNEL,
   CONVERSATIONS_CHANGED_CHANNEL,
   CONVERSATIONS_LIST_CHANNEL,
   CONVERSATIONS_NEW_CHANNEL,
@@ -73,13 +81,14 @@ import {
   ONBOARDING_COMPLETE_CHANNEL,
   ONBOARDING_DOWNLOAD_STATUS_CHANNEL,
   ONBOARDING_OPEN_GET_KEY_CHANNEL,
+  ONBOARDING_SET_INTRO_VIDEO_CHANNEL,
   ONBOARDING_START_DOWNLOAD_CHANNEL,
   ONBOARDING_VALIDATE_KEY_CHANNEL,
   OnboardingDownloadStatusSchema,
 } from "../ipc/onboarding";
 import { OnboardingStore } from "./onboarding/onboardingStore";
 import { createOnboardingService, type OnboardingService } from "./onboarding/onboardingService";
-import { closeOnboardingWindow, openOnboardingWindow } from "./onboardingWindow";
+import { closeOnboardingWindow, getOnboardingWindowBounds, openOnboardingWindow } from "./onboardingWindow";
 import {
   SCREEN_OPEN_SETTINGS_CHANNEL,
   SCREEN_PERMISSION_REQUEST_CHANNEL,
@@ -91,10 +100,29 @@ import {
   nativeImageDownscale,
   screenCaptureProducesContent,
   type DisplayCaptureResult,
+  type NativeScreenCapture,
 } from "./screenCapture/captureDisplays";
 import { OverlayWindowManager } from "./overlay/overlayWindows";
 import { planCompletionMessages } from "./overlay/overlayPointing";
 import { planShapeMessages } from "./overlay/overlayShapes";
+import { DrawingScrollTracker } from "./overlay/drawingScrollTracker";
+import {
+  luminanceImageFromBitmap,
+  snapPointToElement,
+  snapShapeToElement,
+  type SnapImage,
+} from "./overlay/elementSnap";
+import {
+  applyRefinedBoxToShape,
+  guessBoxForPoint,
+  guessBoxForShape,
+  planMarkCrop,
+  refinedBoxIsPlausible,
+  refinedPointFromBox,
+  type PlannedMarkCrop,
+} from "./overlay/markRefinement";
+import type { DisplayCaptureGeometry } from "./overlay/overlayGeometry";
+import { subscribeGlobalInput } from "./input/globalInputHook";
 import {
   deriveScreenPermissionState,
   type ScreenRecordingAccessStatus,
@@ -119,7 +147,6 @@ import {
 } from "./agent/screenAgentService";
 import type { ScreenAgentRunResult } from "./agent/screenAgentLoop";
 import { createConfirmGateController } from "./agent/confirmGateController";
-import { ConfirmGateWindow } from "./confirmGateWindow";
 import type { AgentCursorOverlay } from "./agent/agentCursorPresenter";
 import {
   resolveWhisperServerBinaryPath,
@@ -128,6 +155,7 @@ import {
 } from "./transcription/whisperServerBinaryPath";
 import { createDesktopSpeech, runSpeechDevTrigger } from "./speech/speechService";
 import { createSpeechTurnPlayer, type SpeechTurnPlayer } from "./speech/speechTurnPlayer";
+import { createFillerClipCache, type FillerClipCache } from "./speech/fillerClipCache";
 import { SPEECH_EVENT_CHANNEL, SpeechEventSchema, type SpeechEvent } from "../ipc/speechPlayback";
 import {
   VOICE_PILL_ACTIVITY_CHANNEL,
@@ -324,20 +352,12 @@ const conversationHistoryStore = new ConversationHistoryStore(
   () => Date.now(),
 );
 
-// The active conversation the next turn belongs to. On boot we resume the most recent
-// one so a restart lands the user back where they left off (and every stored one is in
-// the dropdown); a first run starts a fresh, unpersisted conversation.
-let activeConversationId: string = (() => {
-  const mostRecent = conversationHistoryStore.list()[0];
-  if (mostRecent) {
-    const resumed = conversationHistoryStore.get(mostRecent.id);
-    if (resumed) {
-      conversationManager.loadConversation(resumed.messages);
-      return mostRecent.id;
-    }
-  }
-  return randomUUID();
-})();
+// The active conversation the next turn belongs to. Each app launch starts a fresh,
+// unpersisted conversation (minted here, persisted only once its first turn completes),
+// so a run's turns group into their own conversation rather than accreting forever into
+// whichever one happened to be most recent. Prior conversations stay in the durable
+// last-10 set and are resumable from the Chat Panel's dropdown; the Core begins empty.
+let activeConversationId: string = randomUUID();
 
 /**
  * Tells the Chat Panel its recent-conversations set changed (a turn created a new
@@ -371,29 +391,18 @@ let lastCaptureProducedContent: boolean | null = null;
 // windows); a chat turn only runs after the UI is up, so it is always set by then.
 let overlayManager: OverlayWindowManager | null = null;
 
-// The Screen Agent Confirm Gate window (M2-04): the focusable on-screen chip that asks the
-// user to approve/decline before Lune touches the OS. Created lazily on first gate; held
-// here so it can be disposed on quit.
-let confirmGateWindow: ConfirmGateWindow | null = null;
+// The stale-drawing guard: teaching drawings are anchored to the screenshot their turn
+// captured, so a global scroll clears a visible drawing at once and marks an in-flight
+// turn's capture stale (its shapes/point are then suppressed rather than drawn on
+// content that has scrolled away). Fed by the shared global input hook's wheel events.
+const drawingScrollTracker = new DrawingScrollTracker();
 
-/** Registers a global accelerator, swallowing a malformed/taken-key failure (returns success). */
-function registerGlobalShortcutSafely(accelerator: string, handler: () => void): boolean {
-  try {
-    return globalShortcut.register(accelerator, handler);
-  } catch (error) {
-    console.error(`[lune] could not register global shortcut ${accelerator}:`, error);
-    return false;
-  }
-}
-
-/** Unregisters a global accelerator, swallowing any failure so teardown never throws. */
-function unregisterGlobalShortcutSafely(accelerator: string): void {
-  try {
-    globalShortcut.unregister(accelerator);
-  } catch (error) {
-    console.error(`[lune] could not unregister global shortcut ${accelerator}:`, error);
-  }
-}
+// The teaching-drawing epoch: bumped when a new answer begins (the moment the previous
+// turn's drawing is cleared). A turn's deferred mark presentation - shapes are drawn only
+// after the refinement calls settle - snapshots this at completion and declines to draw
+// when a newer answer has started meanwhile, so a slow refinement can never paint a stale
+// turn's marks over the new turn's.
+let teachingDrawingEpoch = 0;
 
 // The Transcription lifecycle (ticket 10): the supervised whisper.cpp child + its Core
 // Capability. Held at module scope so app-quit and abrupt-exit teardown can reach it to
@@ -419,6 +428,13 @@ let screenAgentService: ScreenAgentService | null = null;
 // readiness + models directory). A chat turn only runs after the UI is up, so it is set
 // by then; when Kokoro isn't ready the turn simply answers in text without speaking.
 let speechCapability: SpeechCapability | null = null;
+
+// The instant-acknowledgement cache: pre-synthesized filler clips ("hmm, let me see.")
+// a voice turn plays the moment it starts, so Lune answers back right away while the
+// screen capture, the model's first sentence, and its synthesis are still in flight.
+// Assigned with the Speech Capability; `null` (or an unprimed cache) means voice turns
+// simply start without a filler, exactly as before.
+let fillerClipCache: FillerClipCache | null = null;
 
 // The Pill window: Lune's always-present home surface, and the one renderer that owns
 // audio output, so synthesized speech clips are streamed to it. Assigned when the app
@@ -719,13 +735,364 @@ async function runActHandoff(goal: string, signal: AbortSignal | undefined): Pro
  */
 async function captureScreensForTurn(includeScreen: boolean): Promise<DisplayCaptureResult> {
   if (!includeScreen || getScreenMediaAccessStatus() !== "granted") {
-    return { screens: [], geometry: [] };
+    return { screens: [], geometry: [], nativeCaptures: [] };
   }
   try {
     return await captureConnectedDisplays();
   } catch (error) {
     console.error("[lune] screen capture failed; answering text-only:", error);
-    return { screens: [], geometry: [] };
+    return { screens: [], geometry: [], nativeCaptures: [] };
+  }
+}
+
+/**
+ * Lazily decodes this turn's captured screenshots into the grayscale images element
+ * snapping reads, memoized per screen number so several marks on one screen decode its
+ * JPEG once. `null` for a screen with no capture (or an undecodable one) - marks there
+ * keep the model's own coordinates. `screens[i]` and `geometry[i]` come from the same
+ * capture pass in the same order, so the screen number resolves through the geometry.
+ */
+function createSnapImageCache(
+  screens: ScreenCaptureInput[],
+  geometry: DisplayCaptureGeometry[],
+): (screenNumber: number | null) => SnapImage | null {
+  const cache = new Map<number, SnapImage | null>();
+  return (screenNumber) => {
+    // A null screen means the cursor's screen (screen 1), the same rule the resolvers use.
+    const resolved = screenNumber ?? 1;
+    const cached = cache.get(resolved);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const index = geometry.findIndex((display) => display.screenNumber === resolved);
+    const screen = index >= 0 ? screens[index] : undefined;
+    let snapImage: SnapImage | null = null;
+    if (screen !== undefined) {
+      try {
+        const decoded = nativeImage.createFromBuffer(Buffer.from(screen.base64Data, "base64"));
+        const { width, height } = decoded.getSize();
+        if (width > 0 && height > 0) {
+          snapImage = luminanceImageFromBitmap(decoded.toBitmap(), width, height);
+        }
+      } catch (error) {
+        console.error("[lune] element snap: could not decode this turn's capture:", error);
+      }
+    }
+    cache.set(resolved, snapImage);
+    return snapImage;
+  };
+}
+
+/**
+ * A refinement call may not hold the drawing hostage: past this, the mark falls back to
+ * the element snap. The marks refine concurrently but draw together (one `Promise.all`),
+ * so the drawing waits for the slowest call - and a single stuck vendor call would delay
+ * every mark. Good refinements land in ~2-2.5s, so this caps the worst case a beat past
+ * that: a call still running here is almost certainly hung, not slow-but-useful.
+ */
+const MARK_REFINEMENT_TIMEOUT_MS = 4500;
+
+/**
+ * Runs one mark-refinement call: cuts the planned crop from the native capture, asks the
+ * routed Reasoning Vendor where exactly the labeled element sits in it, and returns the
+ * element's box in crop pixels - or `null` on any failure (no key, timeout, a [NONE] or
+ * garbled reply), in which case the caller keeps the mark's original coordinates. The
+ * crop rides the ordinary Reasoning pipeline, so every Vendor refines for free.
+ */
+async function refineMarkAgainstVendor(input: {
+  nativeCapture: NativeScreenCapture;
+  plan: PlannedMarkCrop;
+  label: string;
+  signal?: AbortSignal;
+}): Promise<{ left: number; top: number; right: number; bottom: number } | null> {
+  const { nativeCapture, plan, label, signal } = input;
+  try {
+    const decoded = nativeImage.createFromBuffer(Buffer.from(nativeCapture.base64Data, "base64"));
+    if (decoded.isEmpty()) {
+      return null;
+    }
+    const crop = decoded.crop(plan.crop);
+    const cropSize = crop.getSize();
+    if (cropSize.width <= 0 || cropSize.height <= 0) {
+      return null;
+    }
+
+    const request = buildMarkRefinementRequest({
+      base64Data: crop.toJPEG(80).toString("base64"),
+      mediaType: "image/jpeg",
+      widthInPixels: cropSize.width,
+      heightInPixels: cropSize.height,
+      // The model attached no label to this mark: name the thing generically so the
+      // grounding question is still answerable ("the ui element near the center").
+      label: label.length > 0 ? label : "the ui element nearest the center of this image",
+      hint: plan.guessInCrop,
+    });
+
+    // The call is bounded by its own abort (timeout) chained to the turn's Barge-in
+    // signal, so a stopped turn also stops its refinements at the network source.
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), MARK_REFINEMENT_TIMEOUT_MS);
+    const onTurnAbort = (): void => abort.abort();
+    signal?.addEventListener("abort", onTurnAbort, { once: true });
+    if (signal?.aborted) {
+      abort.abort();
+    }
+    try {
+      let reply = "";
+      for await (const event of reasoningCapability.streamChat(request, { signal: abort.signal })) {
+        if (event.type === "text-delta") {
+          reply += event.text;
+        }
+      }
+      const box = parseMarkRefinementReply(reply, cropSize.width, cropSize.height);
+      if (box === null) {
+        // Always loud: a refinement that silently degrades to the fallback is exactly
+        // how a wrong drawing becomes undiagnosable. An empty reply usually means the
+        // Model Slot spent the whole token budget on hidden reasoning.
+        const shownReply = reply.length === 0 ? "(empty reply)" : reply.slice(0, 160);
+        console.log(`[lune] mark refinement: no usable box for "${label}" - ${shownReply}`);
+      }
+      return box;
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onTurnAbort);
+    }
+  } catch (error) {
+    console.log(
+      `[lune] mark refinement: call failed for "${label}" -`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
+}
+
+/**
+ * Refines this turn's teaching marks against the Vendor (the drawing-accuracy fix): every
+ * "focus an element" shape and the pointing target gets one zoomed native-resolution crop
+ * call that recovers the element's true bounds; a mark whose call fails (or whose shape
+ * kind carries meaning a box can't recover) is returned unchanged and left to the element
+ * snap. All calls run concurrently - a turn rarely has more than a few marks.
+ */
+async function refineTurnMarks(input: {
+  shapes: ParsedShape[];
+  directive: PointDirective;
+  geometry: DisplayCaptureGeometry[];
+  nativeCaptures: NativeScreenCapture[];
+  signal?: AbortSignal;
+}): Promise<{ shapes: ParsedShape[]; directive: PointDirective; refinedCount: number }> {
+  const { shapes, directive, geometry, nativeCaptures, signal } = input;
+
+  // Per-screen lookup of the native capture and the model-image (captured) dimensions the
+  // marks' coordinates live in. A null shape screen means the cursor's screen (screen 1).
+  const contextFor = (
+    screenNumber: number | null,
+  ): { nativeCapture: NativeScreenCapture; captured: { width: number; height: number } } | null => {
+    const resolved = screenNumber ?? 1;
+    const display = geometry.find((candidate) => candidate.screenNumber === resolved);
+    const nativeCapture = nativeCaptures.find((candidate) => candidate.screenNumber === resolved);
+    if (display === undefined || nativeCapture === undefined) {
+      return null;
+    }
+    return {
+      nativeCapture,
+      captured: { width: display.capturedWidth, height: display.capturedHeight },
+    };
+  };
+
+  let refinedCount = 0;
+
+  const refinedShapes = shapes.map(async (shape): Promise<ParsedShape> => {
+    const guess = guessBoxForShape(shape);
+    const context = guess === null ? null : contextFor(shape.screenNumber);
+    if (guess === null || context === null) {
+      return shape;
+    }
+    const plan = planMarkCrop(guess, context.captured, {
+      width: context.nativeCapture.widthInPixels,
+      height: context.nativeCapture.heightInPixels,
+    });
+    if (plan === null) {
+      return shape;
+    }
+    const box = await refineMarkAgainstVendor({
+      nativeCapture: context.nativeCapture,
+      plan,
+      label: shape.label,
+      signal,
+    });
+    if (box === null) {
+      return shape;
+    }
+    if (!refinedBoxIsPlausible(guess, box, plan, true)) {
+      console.log(
+        `[lune] mark refinement: implausible box for "${shape.label}" ` +
+          `(way off the mark's own size); keeping original coordinates`,
+      );
+      return shape;
+    }
+    refinedCount += 1;
+    return applyRefinedBoxToShape(shape, box, plan, context.captured);
+  });
+
+  const refinedDirective = (async (): Promise<PointDirective> => {
+    if (directive.kind !== "point") {
+      return directive;
+    }
+    const context = contextFor(directive.point.screenNumber);
+    if (context === null) {
+      return directive;
+    }
+    const plan = planMarkCrop(guessBoxForPoint(directive.point), context.captured, {
+      width: context.nativeCapture.widthInPixels,
+      height: context.nativeCapture.heightInPixels,
+    });
+    if (plan === null) {
+      return directive;
+    }
+    const box = await refineMarkAgainstVendor({
+      nativeCapture: context.nativeCapture,
+      plan,
+      label: directive.point.label,
+      signal,
+    });
+    if (box === null) {
+      return directive;
+    }
+    refinedCount += 1;
+    const point = refinedPointFromBox(box, plan);
+    return { kind: "point", point: { ...directive.point, x: point.x, y: point.y } };
+  })();
+
+  const [shapesResult, directiveResult] = await Promise.all([
+    Promise.all(refinedShapes),
+    refinedDirective,
+  ]);
+  return { shapes: shapesResult, directive: directiveResult, refinedCount };
+}
+
+/**
+ * Presents a completed turn's marks - the teaching shapes and the pointing flight - after
+ * the drawing-accuracy work has settled. Runs detached from the turn (the spoken answer
+ * plays meanwhile): first every mark is refined against the Vendor (a zoomed
+ * native-resolution crop recovers the element's true bounds); marks the refinement
+ * couldn't improve fall back to the local element snap. Because time passed while
+ * refining, the world is re-checked before anything draws: a Barge-in or a newer answer
+ * means this turn no longer owns the Overlay (return silently - the abort cleanup or the
+ * new turn owns it), and a scroll means the coordinates aim at moved content (end the
+ * interaction without marking anything). Never throws - a failure inside falls back to
+ * presenting the unrefined marks rather than leaving the Overlay's interaction open.
+ */
+async function presentTurnMarks(input: {
+  manager: OverlayWindowManager;
+  cursorDisplayId: number;
+  shapes: ParsedShape[];
+  directive: PointDirective;
+  geometry: DisplayCaptureGeometry[];
+  screens: ScreenCaptureInput[];
+  nativeCaptures: NativeScreenCapture[];
+  scrollGenerationAtCapture: number;
+  epochAtCompletion: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const {
+    manager,
+    cursorDisplayId,
+    shapes,
+    directive,
+    geometry,
+    screens,
+    nativeCaptures,
+    scrollGenerationAtCapture,
+    epochAtCompletion,
+    signal,
+  } = input;
+
+  let effectiveShapes = shapes;
+  let effectiveDirective = directive;
+  try {
+    const refineStartedAt = Date.now();
+    const refined = await refineTurnMarks({ shapes, directive, geometry, nativeCaptures, signal });
+    const refineElapsedMs = Date.now() - refineStartedAt;
+    effectiveShapes = refined.shapes;
+    effectiveDirective = refined.directive;
+
+    // Fallback for the marks refinement didn't move (an unrefinable kind, a failed or
+    // declined call): the local element snap, exactly as before refinement existed. A
+    // refined mark is a new object, an untouched one is the original by reference.
+    const snapImageFor = createSnapImageCache(screens, geometry);
+    effectiveShapes = effectiveShapes.map((shape, index) => {
+      if (shape !== shapes[index]) {
+        return shape;
+      }
+      const snapImage = snapImageFor(shape.screenNumber);
+      return snapImage === null ? shape : snapShapeToElement(shape, snapImage);
+    });
+    if (effectiveDirective.kind === "point" && effectiveDirective === directive) {
+      const snapImage = snapImageFor(effectiveDirective.point.screenNumber);
+      const snappedPoint =
+        snapImage === null ? null : snapPointToElement(effectiveDirective.point, snapImage);
+      if (snappedPoint !== null) {
+        effectiveDirective = {
+          kind: "point",
+          point: { ...effectiveDirective.point, x: snappedPoint.x, y: snappedPoint.y },
+        };
+      }
+    }
+
+    // Always loud (one line per mark): the exact before/after of every drawn mark is
+    // the difference between "it drew in the wrong place" being diagnosable from a
+    // screenshot + console, or not. Marks are rare (a few per teaching turn at most).
+    const captured = geometry.find((display) => display.screenNumber === 1);
+    console.log(
+      `[lune] marks: ${refined.refinedCount}/${shapes.length + (directive.kind === "point" ? 1 : 0)} ` +
+        `vendor-refined in ${refineElapsedMs}ms ` +
+        `(captured space ${captured?.capturedWidth}x${captured?.capturedHeight})`,
+    );
+    effectiveShapes.forEach((adjusted, index) => {
+      const original = shapes[index]!;
+      const wasRefined = refined.shapes[index] !== original;
+      const how = wasRefined ? "refined" : adjusted !== original ? "snapped" : "unchanged";
+      console.log(
+        `[lune] mark: ${original.kind} "${original.label}" ` +
+          `${JSON.stringify(original.points)} r=${original.radius} -> ${how} ` +
+          `${JSON.stringify(adjusted.points)} r=${adjusted.radius}`,
+      );
+    });
+    if (directive.kind === "point" && effectiveDirective.kind === "point") {
+      const wasRefined = refined.directive !== directive;
+      const how =
+        wasRefined ? "refined" : effectiveDirective !== refined.directive ? "snapped" : "unchanged";
+      console.log(
+        `[lune] mark: point "${directive.point.label}" (${directive.point.x}, ${directive.point.y}) ` +
+          `-> ${how} (${effectiveDirective.point.x}, ${effectiveDirective.point.y})`,
+      );
+    }
+  } catch (error) {
+    console.error("[lune] mark refinement failed; presenting unrefined marks:", error);
+  }
+
+  // Time passed while refining: only draw if this turn still owns the Overlay.
+  if (signal?.aborted === true || teachingDrawingEpoch !== epochAtCompletion) {
+    // The abort cleanup (or the newer answer) owns the Overlay's state now.
+    return;
+  }
+  if (drawingScrollTracker.isStaleSince(scrollGenerationAtCapture)) {
+    console.log("[lune] overlay: screen scrolled since capture; suppressing stale shapes/point");
+    for (const message of planCompletionMessages({ kind: "none" }, geometry, cursorDisplayId)) {
+      manager.sendToDisplay(message.displayId, message.event);
+    }
+    return;
+  }
+
+  for (const message of planCompletionMessages(effectiveDirective, geometry, cursorDisplayId)) {
+    manager.sendToDisplay(message.displayId, message.event);
+  }
+  const shapeMessages = planShapeMessages(effectiveShapes, geometry);
+  for (const message of shapeMessages) {
+    manager.sendToDisplay(message.displayId, message.event);
+  }
+  if (shapeMessages.length > 0) {
+    drawingScrollTracker.noteDrawingShown();
   }
 }
 
@@ -815,10 +1182,40 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
   // but the answer text is not streamed into its response bubble (voice-only preference).
   const showStreamingText = settingsStore.getStreamingText();
 
+  // Answer back instantly (the perceived-latency fix): a voice turn plays a short,
+  // pre-synthesized acknowledgement the moment it starts - zero synthesis on the hot
+  // path - so the ~2s of capture + reasoning + first-sentence synthesis never feels like
+  // dead air. It rides this turn's id as sequence 0 (the real sentences start at 1), so
+  // the answer's clips queue seamlessly behind it and a Barge-in's `stop` cuts it like
+  // any other clip. Typed Chat Panel turns stay silent-until-answer as before.
+  let fillerEmitted = false;
+  if (inputMethod === "voice" && speechCapability?.isReady() === true && fillerClipCache !== null) {
+    fillerClipCache.prime();
+    const fillerClip = fillerClipCache.takeClip();
+    if (fillerClip !== null && signal?.aborted !== true) {
+      sendSpeechEvent({
+        type: "clip",
+        turnId,
+        sequence: 0,
+        audioBase64: fillerClip.audioBase64,
+        contentType: fillerClip.contentType,
+        // No caption: the filler is a beat, not answer content, and the thinking
+        // spinner should stay up until the real first sentence speaks.
+        text: "",
+      });
+      fillerEmitted = true;
+    }
+  }
+
   try {
     // Capture the screen(s) first (when opted in and permitted) so the answer is
     // screen-aware; with no captures this is exactly a text-only turn (and no pointing).
-    const { screens, geometry } = await captureScreensForTurn(includeScreen);
+    const { screens, geometry, nativeCaptures } = await captureScreensForTurn(includeScreen);
+
+    // Snapshot the scroll state the capture was taken under: the model's coordinates
+    // are only meaningful against this exact screen, so a scroll before the answer
+    // completes makes its shapes/point stale (they are suppressed at completion below).
+    const scrollGenerationAtCapture = drawingScrollTracker.generation();
 
     // Capture done: bring the following cursor back so it tracks the mouse while the
     // answer streams (the interaction content is layered on top of it below).
@@ -852,8 +1249,11 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
           });
           // A new answer is beginning, so clear the previous turn's teaching drawing
           // everywhere it may still be up (the "next turn" clear of the shape lifecycle)
-          // before this turn draws its own at completion.
+          // before this turn draws its own at completion. Bumping the epoch also stops
+          // any previous turn's still-refining marks from drawing late.
+          teachingDrawingEpoch += 1;
           overlayManager?.broadcast({ type: "clear-shapes" });
+          drawingScrollTracker.noteDrawingCleared();
           // Fade the Overlay in for this interaction on the cursor's display.
           if (overlayManager && cursorDisplayId !== undefined) {
             overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
@@ -870,6 +1270,8 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
               // Carry each spoken sentence as the Pill's caption line when the
               // streaming-text setting is on (ticket 13); voice-only when off.
               includeCaption: showStreamingText,
+              // The instant filler already took sequence 0 of this turn.
+              startSequence: fillerEmitted ? 1 : 0,
             });
             speechEngaged = true;
           }
@@ -918,16 +1320,59 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
             actGoal = parsedActGoal;
             const { directive, displayText: pointStripped } = parseAnswerPointTag(actStripped);
             const { displayText, shapes } = parseAnswerShapeTags(pointStripped);
+            // Dev-only (LUNE_REASONING_DEBUG): show the raw output and what the parsers made
+            // of it, so a teaching turn that only spoke reveals whether the model even
+            // emitted shape tags - and whether their coordinates land in the captured space.
+            if (isReasoningDebugEnabled()) {
+              const cursorScreen = geometry.find((display) => display.screenNumber === 1);
+              console.log(
+                formatReasoningCompletion({
+                  rawAnswer: accumulatedAnswer,
+                  shapes,
+                  pointDirective: directive,
+                  actGoal: parsedActGoal,
+                  coordinateSpace: cursorScreen
+                    ? { width: cursorScreen.capturedWidth, height: cursorScreen.capturedHeight }
+                    : undefined,
+                }),
+              );
+            }
             if (overlayManager && cursorDisplayId !== undefined) {
               // The full answer has streamed, so its trailing tags are now complete. The
               // pointing planner flies the cursor to the target on the correct monitor and
               // closes out; the shape planner draws the teaching shapes on their monitors.
-              // Both keep the multi-monitor routing in one tested place.
-              for (const message of planCompletionMessages(directive, geometry, cursorDisplayId)) {
-                overlayManager.sendToDisplay(message.displayId, message.event);
-              }
-              for (const message of planShapeMessages(shapes, geometry)) {
-                overlayManager.sendToDisplay(message.displayId, message.event);
+              // Both keep the multi-monitor routing in one tested place. If the user
+              // scrolled since this turn's capture, the coordinates aim at content that
+              // has moved: suppress the flight and the drawing (the spoken answer still
+              // plays) rather than mark the wrong pixels.
+              const staleCapture = drawingScrollTracker.isStaleSince(scrollGenerationAtCapture);
+              const hasMarks = shapes.length > 0 || directive.kind === "point";
+              if (staleCapture || !hasMarks) {
+                const effectiveDirective: PointDirective = staleCapture ? { kind: "none" } : directive;
+                for (const message of planCompletionMessages(effectiveDirective, geometry, cursorDisplayId)) {
+                  overlayManager.sendToDisplay(message.displayId, message.event);
+                }
+                if (staleCapture && hasMarks) {
+                  console.log(
+                    "[lune] overlay: screen scrolled since capture; suppressing stale shapes/point",
+                  );
+                }
+              } else {
+                // Marks exist and the capture is fresh: present them asynchronously (the
+                // spoken answer keeps playing meanwhile) so the drawing-accuracy work can
+                // wait on its Vendor calls without holding the turn.
+                void presentTurnMarks({
+                  manager: overlayManager,
+                  cursorDisplayId,
+                  shapes,
+                  directive,
+                  geometry,
+                  screens,
+                  nativeCaptures,
+                  scrollGenerationAtCapture,
+                  epochAtCompletion: teachingDrawingEpoch,
+                  signal,
+                });
               }
             }
             // The turn "spoke" only if speech was engaged AND there was speakable text;
@@ -939,6 +1384,13 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
           break;
         }
       }
+    }
+
+    // The instant filler played but the turn never engaged real speech (readiness
+    // flipped off before the answer started): close the turn out for the player, so it
+    // settles to idle instead of holding "thinking" for clips that will never come.
+    if (fillerEmitted && speechTurn === null) {
+      sendSpeechEvent({ type: "turn-complete", turnId });
     }
 
     // The turn committed in the Core, so persist the active conversation's text-only
@@ -969,6 +1421,7 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     // Clear any teaching drawing at once: a Barge-in (the common abort) should wipe the
     // previous turn's shapes immediately rather than leave them until the timeout.
     overlayManager?.broadcast({ type: "clear-shapes" });
+    drawingScrollTracker.noteDrawingCleared();
     // Halt this turn's speech worker so an interrupted (or failed) turn stops synthesizing
     // and emits no further clips - without this a Barge-in's old turn keeps speaking over
     // the new one. The Pill renderer also ignores a superseded turn's clips by turn id.
@@ -985,7 +1438,7 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
       // alone left upstream failures - a rejected model, a bad request - invisible in
       // every console), clear any audio already queued for this turn, and surface it.
       console.error("[lune] conversation turn failed:", error);
-      if (speechTurn !== null) {
+      if (speechTurn !== null || fillerEmitted) {
         sendSpeechEvent({ type: "stop" });
       }
       sendConversationEvent(webContents, { type: "error", turnId, message: describeChatError(error) });
@@ -1088,6 +1541,19 @@ ipcMain.on(ONBOARDING_OPEN_GET_KEY_CHANNEL, (_event, rawVendor: unknown) => {
   }
 });
 
+// The cursor-riding intro video (M3-03): the welcome step toggles it on while it is showing
+// and off when it advances or is skipped. The Shell owns display geometry, so it snapshots
+// the onboarding window's bounds and hands the Overlay the card to ride, kept clear of the
+// wizard. A `true` with the window already gone (a race on close) simply ends it.
+ipcMain.on(ONBOARDING_SET_INTRO_VIDEO_CHANNEL, (_event, rawActive: unknown) => {
+  const onboardingBounds = getOnboardingWindowBounds();
+  if (rawActive === true && onboardingBounds !== null) {
+    overlayManager?.startIntroVideo(onboardingBounds);
+  } else {
+    overlayManager?.endIntroVideo();
+  }
+});
+
 // The recent-conversations dropdown (ticket 12). These drive the Shell's durable store
 // and the Core's active conversation; the answer stream still flows over the shared
 // chat contract. Each result is parsed on the way out so no untyped shape crosses the
@@ -1100,6 +1566,18 @@ ipcMain.handle(CONVERSATIONS_LIST_CHANNEL, () =>
   ConversationListSnapshotSchema.parse({
     conversations: conversationHistoryStore.list(),
     activeId: conversationHistoryStore.get(activeConversationId) ? activeConversationId : null,
+  }),
+);
+
+// The active conversation's current history, so the panel renders what is already going
+// the moment it opens. A voice turn taken while the panel was closed is committed to the
+// Core (and persisted) but never streamed to the panel's renderer, so without this the
+// panel would open blank on top of a live conversation. A pure read: the active
+// conversation is unchanged (unlike resume, this never switches which one is active).
+ipcMain.handle(CONVERSATIONS_ACTIVE_CHANNEL, () =>
+  ResumedConversationSchema.parse({
+    activeId: activeConversationId,
+    messages: conversationManager.getMessages(),
   }),
 );
 
@@ -1153,23 +1631,31 @@ ipcMain.on(PILL_CAPTION_CHANNEL, (_event, rawCaption: unknown) => {
 
 // Whisper child-process teardown (ticket 10, developer story 41). `before-quit` runs
 // on the normal quit path (pill menu, relaunch) and issues a SIGTERM via the
-// supervisor. `exit` is the abrupt-exit net (uncaught error, hard exit) where only
-// synchronous work runs, so it SIGKILLs the child directly - between them, a quit or
-// crash never leaves a whisper-server process behind. (A parent SIGKILL can't be
-// intercepted by anyone, but there is no owning watchdog process to route around it.)
+// supervisor. `exit` is the graceful-exit net (uncaught error, `process.exit`) where
+// only synchronous work runs, so it SIGKILLs the child directly.
 app.on("before-quit", () => {
   void transcription?.shutdown();
   // Release the global keyboard hook so the native uiohook thread stops cleanly (ticket 11).
   voiceController?.stop();
-  // Release any Confirm Gate resources (a gate open at quit would still hold Enter/Escape;
-  // unregister just those, not every accelerator, and dispose the gate window).
-  unregisterGlobalShortcutSafely("Enter");
-  unregisterGlobalShortcutSafely("Escape");
-  confirmGateWindow?.dispose();
 });
 process.on("exit", () => {
   transcription?.killSync();
 });
+
+// Termination signals (`kill`, a dev Ctrl+C, a supervising launcher's SIGTERM) bypass
+// Node's `exit` handlers entirely unless caught - so without this the child would
+// outlive a signalled parent, exactly the orphaning we saw. Each handler SIGKILLs the
+// child and releases the keyboard hook synchronously, then exits with the conventional
+// 128+signal code (which re-runs the `exit` net harmlessly - `killSync` is idempotent).
+// A parent SIGKILL still can't be intercepted, but the next launch reaps whatever it
+// leaves behind (see `whisperOrphanReaper.ts`).
+for (const terminationSignal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.on(terminationSignal, () => {
+    transcription?.killSync();
+    voiceController?.stop();
+    process.exit(128 + osConstants.signals[terminationSignal]);
+  });
+}
 
 // Screen-recording permission (ticket 05). The status channel reports the current
 // state for live polling and never prompts when access is undetermined; when access
@@ -1286,9 +1772,19 @@ void app.whenReady().then(() => {
   overlayManager = new OverlayWindowManager();
   overlayManager.start();
 
-  // The Screen Agent Confirm Gate window (M2-04): the on-screen chip. Kept hidden until a
-  // gate opens; the controller below drives it alongside the hotkey and voice modalities.
-  confirmGateWindow = new ConfirmGateWindow();
+  // The stale-drawing guard's input: global wheel (scroll) events from the shared uiohook
+  // hook. Scrolling moves the content a teaching drawing was anchored to, so a scroll
+  // clears a visible drawing at once and marks any in-flight turn's capture stale (its
+  // shapes are then suppressed at completion). Rides the same native event tap as
+  // push-to-talk; if the native hook is unavailable, drawings just rely on their
+  // quiet-timeout as before.
+  subscribeGlobalInput(() => ({
+    wheel: () => {
+      if (drawingScrollTracker.noteScroll()) {
+        overlayManager?.broadcast({ type: "clear-shapes" });
+      }
+    },
+  }));
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -1336,6 +1832,17 @@ void app.whenReady().then(() => {
     isKokoroReady: () => provisioning.capability.isRuntimeReady("kokoro"),
   });
 
+  // Warm the instant-acknowledgement fillers as soon as Kokoro is ready, so the very
+  // first voice turn already answers back instantly. `prime()` is a no-op until the
+  // weights verify; each voice turn re-primes (cheaply), which also covers a Kokoro
+  // that finishes provisioning after boot and a Voice changed in Settings.
+  fillerClipCache = createFillerClipCache({
+    speech: speechCapability,
+    getVoiceId: () => routingConfigStore.getConfig().speech.voice,
+    encodeBase64: (audio) => Buffer.from(audio).toString("base64"),
+  });
+  fillerClipCache.prime();
+
   // Synthetic input executor (M2-02): the Screen Agent's hands. Built over the nut.js
   // native backend + Electron clipboard, reusing the M1 Accessibility grant. No consumer
   // drives it yet (the Screen Agent loop is a later M2 ticket); the env-gated dev trigger
@@ -1345,11 +1852,12 @@ void app.whenReady().then(() => {
   // Screen Agent loop (M2-03): compose the Shell-driven agent loop over the real edges -
   // the Core step, the executor above, and the overlay-excluded scene capture (the overlay
   // manager suspends its own windows around each capture so Lune never photographs itself).
-  // The confirm gate (M2-04) is the real chip/voice/hotkey UX: the controller reconciles the
-  // three modalities, the chip is the focusable gate window, the hotkey is Enter/Escape
-  // registered only while a gate is open, and voice reuses push-to-talk (diverted to the
-  // gate so a spoken answer never barges in the run). `speak` uses the same Kokoro path as a
-  // turn. The env-gated dev trigger below is the only caller for now (advisory->act is later).
+  // The confirm gate (M2-04, revised) is voice-only: it fires only before a consequential
+  // (hard-to-undo) Action, speaks a plain-language line, and listens for a spoken yes/no via
+  // push-to-talk (diverted to the gate so the answer never barges in the run). There is no
+  // on-screen modal and no global approve/cancel hotkey - an explicit command is consent to
+  // start, so a run no longer gates just to begin (DECISIONS #15, revised). `speak` uses the
+  // same Kokoro path as a turn.
   screenAgentService = createScreenAgentService({
     capability: screenAgentCapability,
     executor: syntheticInputExecutor,
@@ -1386,30 +1894,17 @@ void app.whenReady().then(() => {
       speak: (text) => {
         void speakLine(text);
       },
-      showChip: (view) => {
-        confirmGateWindow?.open(view);
-        return () => confirmGateWindow?.close();
-      },
       armAnswerCapture: (deliver) => {
-        // The chip's Approve/Cancel buttons.
-        const offChip =
-          confirmGateWindow?.onAnswer((intent) => deliver({ source: "chip", intent })) ?? (() => {});
-        // The hotkey: while the gate is open, Enter approves and Escape cancels from
-        // anywhere. Registered only for the gate's lifetime and released on resolve. Guarded
-        // so that if a key can't be registered (already held, or rejected on a platform), the
-        // chip and voice modalities still answer the gate rather than the whole arm failing.
-        registerGlobalShortcutSafely("Enter", () => deliver({ source: "hotkey", intent: "approve" }));
-        registerGlobalShortcutSafely("Escape", () => deliver({ source: "hotkey", intent: "cancel" }));
-        // Voice: push-to-talk answers the gate (hold to speak "yes"/"no") instead of barging
-        // in the run the gate guards.
+        // Voice-only: push-to-talk answers the gate (hold to speak "yes"/"no") instead of
+        // barging in the run the gate guards. There is no on-screen modal and no global
+        // approve/cancel hotkey - a stray Enter in another app must never approve an
+        // irreversible Action - so the spoken answer (plus the always-on barge-in cancel) is
+        // the only way through. An ambiguous or unheard reply re-prompts and never proceeds.
         const offVoice =
           voiceController?.openConfirmGateCapture((transcript) =>
             deliver({ source: "voice", transcript }),
           ) ?? (() => {});
         return () => {
-          offChip();
-          unregisterGlobalShortcutSafely("Enter");
-          unregisterGlobalShortcutSafely("Escape");
           offVoice();
         };
       },

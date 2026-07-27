@@ -37,6 +37,15 @@ export const ONBOARDING_COMPLETE_CHANNEL = "lune:onboarding:complete";
 /** Renderer -> main (send): open one Vendor's "get a key" page in the default browser. */
 export const ONBOARDING_OPEN_GET_KEY_CHANNEL = "lune:onboarding:open-get-key";
 
+/**
+ * Renderer -> main (send): toggle the cursor-riding intro video (M3-03). The welcome step
+ * turns it on while it is showing and off when it advances or is skipped; the main process
+ * (which owns display geometry) rides the card on the Overlay windows, keeping it clear of
+ * the onboarding window. The payload is a single boolean - `true` to start, `false` to
+ * dismiss - validated on the way in.
+ */
+export const ONBOARDING_SET_INTRO_VIDEO_CHANNEL = "lune:onboarding:set-intro-video";
+
 // The key-validation codec (verdict + request + reply) is shared with the Settings
 // surface, so it lives in the settings contract and is re-exported here - both surfaces
 // validate keys through one shape (the Core verdict crosses either boundary unchanged).

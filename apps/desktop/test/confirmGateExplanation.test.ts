@@ -4,19 +4,20 @@ import type { AgentAction } from "@lune/core";
 import {
   DECLINE_ACKNOWLEDGMENT,
   REPROMPT_LINE,
-  buildConfirmGateView,
+  buildGateSpokenLine,
   describeGateAction,
 } from "../src/main/agent/confirmGateExplanation";
 import type { ConfirmGateRequest } from "../src/main/agent/screenAgentLoop";
 
 /**
- * Unit tests for the Confirm Gate's plain-language explanation (M2-04): the gate must
- * explain *what* Lune is about to do in words a user understands, at both gates. Pure over
- * the request, so it is pinned down here without any chip or speaker.
+ * Unit tests for the Confirm Gate's plain-language spoken line (M2-04, revised): the gate
+ * fires only before a consequential Action and must say *what* Lune is about to do in words
+ * a user understands, then ask for a yes or no. Pure over the request, so it is pinned down
+ * here without any speaker.
  */
 
 function request(action: AgentAction, overrides: Partial<ConfirmGateRequest> = {}): ConfirmGateRequest {
-  return { kind: "irreversible", action, goal: "reply to the email", stepIndex: 1, ...overrides };
+  return { action, stepIndex: 1, ...overrides };
 }
 
 describe("describeGateAction - a plain phrase per Action kind", () => {
@@ -45,34 +46,25 @@ describe("describeGateAction - a plain phrase per Action kind", () => {
   });
 });
 
-describe("buildConfirmGateView - confirm-to-start explains the goal and how to answer", () => {
-  const view = buildConfirmGateView(
-    request({ kind: "click", x: 0, y: 0, consequence: "benign" }, { kind: "confirm-to-start", stepIndex: 0 }),
-  );
-
-  it("mentions the user's goal so the explanation is about their request", () => {
-    expect(view.explanation).toContain("reply to the email");
-  });
-
-  it("tells the user how to answer by voice (yes / no)", () => {
-    expect(view.explanation.toLowerCase()).toContain("yes");
-    expect(view.explanation.toLowerCase()).toContain("no");
-  });
-
-  it("carries a short action summary for the chip", () => {
-    expect(view.actionSummary).toBe("click on the screen");
-    expect(view.kind).toBe("confirm-to-start");
-  });
-});
-
-describe("buildConfirmGateView - the irreversible guard flags that it is hard to undo", () => {
-  const view = buildConfirmGateView(
+describe("buildGateSpokenLine - the consequential guard flags that it is hard to undo", () => {
+  const line = buildGateSpokenLine(
     request({ kind: "type", text: "Sending now", pressEnter: true, consequence: "consequential" }),
   );
 
-  it("describes the consequential Action and warns it may be hard to undo", () => {
-    expect(view.explanation).toContain("Sending now");
-    expect(view.explanation.toLowerCase()).toContain("undo");
+  it("describes the consequential Action in plain words and warns it may be hard to undo", () => {
+    expect(line).toContain("Sending now");
+    expect(line.toLowerCase()).toContain("undo");
+  });
+
+  it("asks the user to answer by voice (yes / no)", () => {
+    expect(line.toLowerCase()).toContain("yes");
+    expect(line.toLowerCase()).toContain("no");
+  });
+
+  it("never leaks raw coordinates or vendor jargon", () => {
+    const clickLine = buildGateSpokenLine(request({ kind: "click", x: 812, y: 344, consequence: "consequential" }));
+    expect(clickLine).toContain("click on the screen");
+    expect(clickLine).not.toContain("812");
   });
 });
 

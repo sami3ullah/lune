@@ -33,6 +33,12 @@ export interface SpeechTurnPlayerDependencies {
    * so the Pill shows no caption - voice only. Defaults to false.
    */
   includeCaption?: boolean;
+  /**
+   * The sequence number of the first emitted clip (defaults to 0). A voice turn that
+   * already played an instant filler acknowledgement as sequence 0 starts its real
+   * sentences at 1, keeping the per-turn sequence contract honest.
+   */
+  startSequence?: number;
   /** Optional error sink for a failed synthesis (defaults to console). */
   onError?: (error: unknown) => void;
 }
@@ -65,7 +71,7 @@ export function createSpeechTurnPlayer(
 
   const chunker = new SpeechSentenceChunker();
   const pendingSentences: string[] = [];
-  let nextSequence = 0;
+  let nextSequence = dependencies.startSequence ?? 0;
   // A single in-flight synthesis chain, so sentences are synthesized (and emitted) in
   // strict order even though `pushAnswerText` may enqueue several before the first
   // finishes. `null` when the worker is idle.

@@ -1,5 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import {
+  AnimatePresence,
+  motion,
+  useMotionValue,
+  useTransform,
+  type MotionValue,
+} from "framer-motion";
 import { useOverlayStore } from "./overlayStore";
 import { CaptionReveal } from "./CaptionReveal";
 import type { CaptionData } from "./caption";
@@ -14,6 +20,23 @@ import {
   type ArcShaping,
   type Point2D,
 } from "./overlayCursorFlight";
+import {
+  buildOutline,
+  outlineToPathData,
+  penTraceVisibility,
+  sampleOutline,
+  shapesBounds,
+  traceDurationMs,
+  type ShapeOutline,
+  type TraceableShape,
+  type TraceBounds,
+} from "./overlayShapeTrace";
+import {
+  computeIntroCardTarget,
+  INTRO_CARD_SPRING_RESPONSE_SECONDS,
+  INTRO_CARD_SPRING_DAMPING_FRACTION,
+} from "./introVideoPlacement";
+import { introVideoUrl } from "./introVideoAsset";
 
 // The Overlay surface (ticket 07 + v1 cursor-follow parity): Lune's playful cursor - the
 // following triangle, the listening waveform, and the "working" loading spinner. This
@@ -32,8 +55,8 @@ import {
 // itself fades in only while the cursor is on this display or an interaction is running.
 
 /** How far the buddy sits from the true mouse point (its tip hugs the cursor). */
-const BUDDY_OFFSET_X = 20;
-const BUDDY_OFFSET_Y = -4;
+const BUDDY_OFFSET_X = 12;
+const BUDDY_OFFSET_Y = 20;
 /** The cursor's resting tilt (its tip points up at 0deg; a slight tilt reads as a pointer). */
 const REST_ROTATION_DEGREES = -20;
 /**
@@ -46,8 +69,8 @@ const ROTATION_EASE_TIME_CONSTANT_SECONDS = 0.1;
  * How long the cursor holds on a pointed target before flying back to the mouse - a
  * random span in this range per point, so the beat isn't metronomic.
  */
-const POINT_HOLD_MIN_MS = 1200;
-const POINT_HOLD_MAX_MS = 2100;
+const POINT_HOLD_MIN_MS = 800;
+const POINT_HOLD_MAX_MS = 1400;
 /**
  * The little arc the cursor traces around the target while holding (the "goes around").
  * Kept small and under a full loop so it reads as a gentle settle at the target, not a
@@ -76,6 +99,18 @@ const INACTIVITY_CLEAR_MS = 1100;
 const SHAPE_INACTIVITY_CLEAR_MS = 1600;
 /** How quickly the buddy fades in/out as the cursor enters/leaves this display. */
 const BUDDY_FADE_S = 0.25;
+
+/**
+ * The cursor-riding intro video card (M3-03), the Farza-style welcome touch. ~400x600 as
+ * the spec asks (DECISIONS #23); it rides alongside the pointer on the welcome step, kept
+ * clear of the onboarding window. Gap is a touch wider than the buddy's so the big card
+ * sits companionably beside the cursor rather than under it; margin keeps it off the edges.
+ */
+const INTRO_CARD_SIZE = { width: 400, height: 600 };
+const INTRO_CARD_GAP_PX = 28;
+const INTRO_CARD_MARGIN_PX = 24;
+/** How quickly the card fades/pops in and out as it appears, dismisses, or changes display. */
+const INTRO_CARD_FADE_S = 0.35;
 
 interface CursorFrame {
   x: number;
@@ -142,7 +177,10 @@ const FLOURISH_PROBABILITY = 0.12;
  */
 function randomArcShaping(flourish: boolean): ArcShaping {
   if (!flourish) {
-    return { perpendicular: -randomBetween(0.45, 0.7), lateral: randomBetween(-0.1, 0.1) };
+    return {
+      perpendicular: -randomBetween(0.45, 0.7),
+      lateral: randomBetween(-0.1, 0.1),
+    };
   }
   const bowsUp = Math.random() < 0.8;
   return {
@@ -168,6 +206,112 @@ function smoothstep(value: number): number {
   return clamped * clamped * (3 - 2 * clamped);
 }
 
+// Guided teaching (M3-04): a drawing that groups its marks into steps is walked one step at
+// a time - the cursor flies to each step, traces its primary mark as the stroke draws on,
+// holds while the voice explains, then moves on, with a soft tinted backdrop lifting the
+// active step's area (never dimming the screen). This is layered on top of the pointing
+// flight above: it
+// reuses the same `flightRef`/`makeFlight` machinery to move the cursor, and only intercepts
+// the flight-landing and cursor-position branches while a walk is in progress.
+
+/** The minimum a step is held before the walk advances (the streaming-text-off fallback). */
+const STEP_MIN_DWELL_MS = 1500;
+/**
+ * Once the voice has moved on to the next step's sentence, advance after this beat. The
+ * drawing often starts after the voice (mark refinement runs while the answer is already
+ * being spoken), so the voice is routinely a step or two ahead - this floor is what keeps
+ * the walk deliberate in that case instead of racing every step to catch up.
+ */
+const STEP_CATCHUP_MIN_MS = 1000;
+/** A hard cap on one teaching walk, so a stalled sync can never leave a walk stuck mid-step. */
+const MAX_TEACH_MS = 45000;
+/** Padding (px) around a step's marks for the backdrop patch and step-badge placement. */
+const STEP_BOUNDS_PADDING = 16;
+
+/** The teaching walk's phase, layered alongside the pointing phase (see PointPhase). */
+type TeachPhase = "idle" | "advancing" | "drawing" | "holding" | "handoff";
+
+/** One resolved teaching step: its marks, the outline the cursor traces, and its label. */
+interface TeachStep {
+  /** The shapes the model grouped into this step (the first is the one the cursor traces). */
+  shapes: OverlayShape[];
+  /** The outline of the step's primary (first) mark - what the cursor rides as it draws on. */
+  primaryOutline: ShapeOutline;
+  /** The padded box enclosing the step's marks, for the backdrop patch (null if empty). */
+  bounds: TraceBounds | null;
+  /** The short instruction shown on this step (the first non-empty mark label). */
+  label: string;
+  /** The 1-based number shown in the step's badge. */
+  stepNumber: number;
+}
+
+/** Reduces an Overlay shape to the pure form the tracer/bounds helpers understand. */
+function toTraceable(shape: OverlayShape): TraceableShape {
+  return {
+    kind: shape.kind,
+    points: shape.points.map((point) => ({ x: point.localX, y: point.localY })),
+    radius: shape.radius,
+  };
+}
+
+/**
+ * Groups a display's shapes into ordered teaching steps by their `step` number. Only shapes
+ * carrying a step take part in the grouping; a drawing with no stepped shapes at all becomes
+ * a single synthetic step holding every mark, so even a plain one-mark drawing gets the full
+ * guided treatment - the cursor flies over and visibly draws it, rather than the mark just
+ * blinking on. Steps are ordered by step number and the shapes within each keep the model's
+ * emission order (the first is the cursor-traced primary).
+ */
+function groupTeachingSteps(shapes: OverlayShape[]): TeachStep[] {
+  const byStep = new Map<number, OverlayShape[]>();
+  for (const shape of shapes) {
+    if (shape.step === null) {
+      continue;
+    }
+    const existing = byStep.get(shape.step);
+    if (existing === undefined) {
+      byStep.set(shape.step, [shape]);
+    } else {
+      existing.push(shape);
+    }
+  }
+  if (byStep.size === 0 && shapes.length > 0) {
+    byStep.set(1, [...shapes]);
+  }
+  return Array.from(byStep.keys())
+    .sort((a, b) => a - b)
+    .map((stepNumber, index) => {
+      const stepShapes = byStep.get(stepNumber)!;
+      const primary = stepShapes[0]!;
+      return {
+        shapes: stepShapes,
+        primaryOutline: buildOutline(toTraceable(primary)),
+        bounds: shapesBounds(stepShapes.map(toTraceable), STEP_BOUNDS_PADDING),
+        label:
+          stepShapes
+            .map((shape) => shape.label)
+            .find((label) => label.length > 0) ?? "",
+        stepNumber: index + 1,
+      };
+    });
+}
+
+/** A calm flight from `from` to the start of `step`'s primary outline (the pen's approach). */
+function flightToStepStart(
+  from: Point2D,
+  step: TeachStep,
+  now: number,
+): ActiveFlight {
+  const start = sampleOutline(step.primaryOutline, 0);
+  return makeFlight(
+    from,
+    { x: start.x, y: start.y },
+    now,
+    randomArcShaping(false),
+    0,
+  );
+}
+
 export function Overlay() {
   const phase = useOverlayStore((state) => state.phase);
   const pointTarget = useOverlayStore((state) => state.pointTarget);
@@ -189,8 +333,25 @@ export function Overlay() {
   const shapes = useOverlayStore((state) => state.shapes);
   const setShapes = useOverlayStore((state) => state.setShapes);
   const clearShapes = useOverlayStore((state) => state.clearShapes);
+  const activeStepIndex = useOverlayStore((state) => state.activeStepIndex);
+  const setActiveStep = useOverlayStore((state) => state.setActiveStep);
+  const teachingActive = useOverlayStore((state) => state.teachingActive);
+  const setTeachingActive = useOverlayStore((state) => state.setTeachingActive);
+  const introVideoActive = useOverlayStore((state) => state.introVideoActive);
+  const introVideoAvoidRect = useOverlayStore(
+    (state) => state.introVideoAvoidRect,
+  );
+  const startIntroVideo = useOverlayStore((state) => state.startIntroVideo);
+  const endIntroVideo = useOverlayStore((state) => state.endIntroVideo);
 
   const [showBuddy, setShowBuddy] = useState(false);
+  // Whether the intro card is drawn on this display this frame (active AND the cursor is
+  // here), and where its top-left rests - both driven by the one RAF loop below.
+  const [showIntroCard, setShowIntroCard] = useState(false);
+  const [introCardPosition, setIntroCardPosition] = useState<Point2D>({
+    x: 0,
+    y: 0,
+  });
   // A key that changes each time a fresh drawing arrives, so React remounts the shape
   // marks and re-runs their draw-on animation rather than reconciling them in place.
   const [shapesGeneration, setShapesGeneration] = useState(0);
@@ -238,6 +399,23 @@ export function Overlay() {
   // Decided once when the flight starts and read again when it lands.
   const pointFlourishRef = useRef<boolean>(false);
 
+  // Guided teaching (M3-04) walk state, all RAF-owned so the loop stays the single writer of
+  // the cursor's position. `teachPhaseRef` layers on top of the pointing phase; the walk only
+  // intercepts the flight-landing and position branches while it is non-idle.
+  const teachPhaseRef = useRef<TeachPhase>("idle");
+  const teachStepsRef = useRef<TeachStep[]>([]);
+  const activeStepIndexRef = useRef<number>(0);
+  const stepDrawStartRef = useRef<number>(0);
+  const stepDrawDurationRef = useRef<number>(0);
+  const stepHoldStartRef = useRef<number>(0);
+  // The step the voice has reached (distinct caption sentences seen), consumed at each hold.
+  const pendingStepRef = useRef<number>(0);
+  const teachSeenCaptionIdsRef = useRef<Set<string>>(new Set());
+  const teachStartRef = useRef<number>(0);
+  // The shared draw-on clock: the active step's primary mark binds its SVG pathLength to this
+  // exact value, so the stroke appears in lockstep with the cursor riding its outline.
+  const drawProgress = useMotionValue(0);
+
   // Mirror the store's phase/listening into refs so the always-on RAF loop reads their
   // current values without being torn down and rebuilt on every change.
   const phaseRef = useRef(phase);
@@ -265,6 +443,23 @@ export function Overlay() {
   useEffect(() => {
     shapesPresentRef.current = shapes.length > 0;
   }, [shapes]);
+
+  // The intro card's follow state, read/written only by the RAF loop (the single writer of
+  // its rendered position, exactly like the buddy's `positionRef`). `seeded` snaps the card
+  // onto its placement on activation and on cursor re-entry so it appears in place rather
+  // than gliding in from a stale spot; the store's active flag + avoid rect are mirrored
+  // into refs so the always-on loop reads them without re-subscribing each frame.
+  const introCardPositionRef = useRef<Point2D>({ x: 0, y: 0 });
+  const introCardVelocityRef = useRef<Point2D>({ x: 0, y: 0 });
+  const introCardSeededRef = useRef<boolean>(false);
+  const introVideoActiveRef = useRef(introVideoActive);
+  useEffect(() => {
+    introVideoActiveRef.current = introVideoActive;
+  }, [introVideoActive]);
+  const introVideoAvoidRectRef = useRef(introVideoAvoidRect);
+  useEffect(() => {
+    introVideoAvoidRectRef.current = introVideoAvoidRect;
+  }, [introVideoAvoidRect]);
 
   // Translate the main process's Overlay events into follow-state + store updates. Only
   // the Overlay surface subscribes; the Pill window never calls this.
@@ -329,6 +524,11 @@ export function Overlay() {
           lastActivityRef.current = performance.now();
           flightRef.current = null;
           pointPhaseRef.current = "none";
+          // A new turn ends any teaching walk in progress (its drawing is cleared by the
+          // main process's `clear-shapes`); reset the refs so a stale walk can't hijack this
+          // turn's pointing flight when it lands.
+          teachPhaseRef.current = "idle";
+          teachStepsRef.current = [];
           beginInteraction();
           break;
         case "answer-delta":
@@ -344,6 +544,19 @@ export function Overlay() {
           if (event.words.length > 0) {
             endThinking();
             setCaption({ id: event.id, words: event.words });
+            // Pace the teaching walk to the voice: each new spoken sentence advances the step
+            // the walk is allowed to reach (one sentence per step, in order), clamped to the
+            // last step. The holding branch consumes this once the current step has drawn.
+            if (
+              teachPhaseRef.current !== "idle" &&
+              !teachSeenCaptionIdsRef.current.has(event.id)
+            ) {
+              teachSeenCaptionIdsRef.current.add(event.id);
+              pendingStepRef.current = Math.min(
+                teachSeenCaptionIdsRef.current.size - 1,
+                Math.max(0, teachStepsRef.current.length - 1),
+              );
+            }
           } else {
             setCaption(null);
           }
@@ -354,23 +567,71 @@ export function Overlay() {
           // it speaks) rather than flying the spinner instead of the triangle.
           lastActivityRef.current = performance.now();
           endThinking();
+          // Pointing and a teaching walk don't co-occur; if a point arrives, let it take over
+          // cleanly so the landing routes to the point hold, not a stale teach step.
+          teachPhaseRef.current = "idle";
+          setTeachingActive(false);
           setPointTarget({
             x: event.point.localX,
             y: event.point.localY,
             label: event.point.label,
           });
           break;
-        case "draw-shapes":
+        case "draw-shapes": {
           // A teaching drawing for this display: render it (animating on) and count it as
           // activity so it isn't cleared until the explanation goes quiet. A fresh
           // generation forces the marks to remount and replay their draw-on animation.
-          lastActivityRef.current = performance.now();
+          const drawnAt = performance.now();
+          lastActivityRef.current = drawnAt;
           setShapes(event.shapes);
           setShapesGeneration((generation) => generation + 1);
+          const steps = groupTeachingSteps(event.shapes);
+          teachStepsRef.current = steps;
+          if (steps.length > 0) {
+            // Begin a guided walk: reveal step 0 and fly the cursor to its primary mark, from
+            // wherever it currently rests. The RAF loop drives it from here (advancing ->
+            // drawing -> holding -> next / handoff).
+            activeStepIndexRef.current = 0;
+            pendingStepRef.current = 0;
+            teachSeenCaptionIdsRef.current = new Set();
+            teachStartRef.current = drawnAt;
+            drawProgress.set(0);
+            setActiveStep(0);
+            setTeachingActive(true);
+            flightRef.current = flightToStepStart(
+              { ...positionRef.current },
+              steps[0]!,
+              drawnAt,
+            );
+            teachPhaseRef.current = "advancing";
+          } else {
+            // An empty drawing (unstepped shapes become a single synthetic step above,
+            // so only a shapeless event lands here): nothing to walk.
+            teachPhaseRef.current = "idle";
+            setTeachingActive(false);
+            setActiveStep(0);
+          }
           break;
+        }
         case "clear-shapes":
-          // The next turn began, or a Barge-in interrupted: remove the drawing at once.
+          // The next turn began, or a Barge-in interrupted: remove the drawing at once and
+          // end any teaching walk, dropping the flight so the follow spring pulls the cursor
+          // back to the mouse.
+          teachPhaseRef.current = "idle";
+          teachStepsRef.current = [];
+          if (pointPhaseRef.current === "none") {
+            flightRef.current = null;
+          }
           clearShapes();
+          break;
+        case "intro-video-start":
+          // The onboarding welcome step opened: ride the intro video beside the cursor,
+          // kept clear of the wizard (`avoidRect`, this display's local rect, or null).
+          startIntroVideo(event.avoidRect);
+          break;
+        case "intro-video-end":
+          // The welcome step advanced or was skipped: dismiss the card (it fades out).
+          endIntroVideo();
           break;
         case "activity-end":
           lastActivityRef.current = performance.now();
@@ -391,6 +652,11 @@ export function Overlay() {
     setCaption,
     setShapes,
     clearShapes,
+    setActiveStep,
+    setTeachingActive,
+    drawProgress,
+    startIntroVideo,
+    endIntroVideo,
   ]);
 
   // Start a flight whenever a (new) pointing target arrives, from wherever the buddy
@@ -432,6 +698,25 @@ export function Overlay() {
         x: cursorLocalRef.current.x + BUDDY_OFFSET_X,
         y: cursorLocalRef.current.y + BUDDY_OFFSET_Y,
       };
+
+      // Hard cap: if a teaching walk overruns (sync stalled, a step never advanced), force it
+      // to hand back to the mouse so a walk can never hold a monitor hostage. Setting the flight here
+      // lets the flight branch below fly it home and land it into `handoff` -> `idle`.
+      if (
+        teachPhaseRef.current !== "idle" &&
+        teachPhaseRef.current !== "handoff" &&
+        now - teachStartRef.current > MAX_TEACH_MS
+      ) {
+        teachPhaseRef.current = "handoff";
+        flightRef.current = makeFlight(
+          { ...positionRef.current },
+          mouseTarget,
+          now,
+          randomArcShaping(false),
+          0,
+        );
+      }
+
       const flight = flightRef.current;
       let x: number;
       let y: number;
@@ -451,28 +736,60 @@ export function Overlay() {
         scale = frame.scale;
         // Layer the flight's twirl on top of the tangent-facing rotation, eased so it
         // winds up out of the start and unwinds as it lands - a playful spin, not a snap.
-        targetRotation = frame.rotationDegrees + flight.spinDegrees * smoothstep(progress);
+        targetRotation =
+          frame.rotationDegrees + flight.spinDegrees * smoothstep(progress);
         if (progress >= 1) {
           positionRef.current = { x: flight.end.x, y: flight.end.y };
           // Hand back to the follow spring from rest so it eases onto the mouse cleanly.
           velocityRef.current = { x: 0, y: 0 };
           flightRef.current = null;
-          if (pointPhaseRef.current === "to-target") {
+          if (teachPhaseRef.current !== "idle") {
+            // A teaching flight landed: route it BEFORE the pointing cases so a walk never
+            // falls into the point-orbit setup.
+            if (teachPhaseRef.current === "advancing") {
+              // Arrived at the step's mark: start drawing it, the cursor riding the outline as
+              // the stroke draws on (both driven by the shared `drawProgress` clock).
+              const step = teachStepsRef.current[activeStepIndexRef.current];
+              teachPhaseRef.current = "drawing";
+              stepDrawStartRef.current = now;
+              stepDrawDurationRef.current = traceDurationMs(
+                step?.primaryOutline.totalLength ?? 0,
+              );
+              drawProgress.set(0);
+            } else if (teachPhaseRef.current === "handoff") {
+              // Flew back to the mouse after the last step: the walk is over. Show every step
+              // at rest (full presence, backdrop faded) and resume plain following; the quiet-timeout clears the
+              // drawing once the voice finishes.
+              teachPhaseRef.current = "idle";
+              setTeachingActive(false);
+              setActiveStep(teachStepsRef.current.length);
+            }
+          } else if (pointPhaseRef.current === "to-target") {
             // Landed on the target and holding so the user can see where it points. A
             // flourish point traces a little randomized orbit around it (centre offset so
             // the loop starts exactly at the landing point); a calm point just rests still
             // (radius 0 = no orbit), which is most of the time.
             pointPhaseRef.current = "holding";
             pointLandedAtRef.current = now;
-            holdDurationRef.current = randomBetween(POINT_HOLD_MIN_MS, POINT_HOLD_MAX_MS);
+            holdDurationRef.current = randomBetween(
+              POINT_HOLD_MIN_MS,
+              POINT_HOLD_MAX_MS,
+            );
             if (pointFlourishRef.current) {
-              const radius = randomBetween(ORBIT_MIN_RADIUS_PX, ORBIT_MAX_RADIUS_PX);
+              const radius = randomBetween(
+                ORBIT_MIN_RADIUS_PX,
+                ORBIT_MAX_RADIUS_PX,
+              );
               const startAngle = randomBetween(0, Math.PI * 2);
               const direction = Math.random() < 0.5 ? -1 : 1;
-              const revolutions = randomBetween(ORBIT_MIN_REVOLUTIONS, ORBIT_MAX_REVOLUTIONS);
+              const revolutions = randomBetween(
+                ORBIT_MIN_REVOLUTIONS,
+                ORBIT_MAX_REVOLUTIONS,
+              );
               orbitRadiusRef.current = radius;
               orbitStartAngleRef.current = startAngle;
-              orbitAngularSpanRef.current = direction * revolutions * Math.PI * 2;
+              orbitAngularSpanRef.current =
+                direction * revolutions * Math.PI * 2;
               orbitCenterRef.current = {
                 x: flight.end.x - radius * Math.cos(startAngle),
                 y: flight.end.y - radius * Math.sin(startAngle),
@@ -489,21 +806,98 @@ export function Overlay() {
             pointPhaseRef.current = "none";
           }
         }
+      } else if (teachPhaseRef.current === "drawing") {
+        // Tracing the active step's primary mark: the cursor rides the outline while the
+        // stroke draws on to the same progress, so it reads as if the cursor drew it.
+        const step = teachStepsRef.current[activeStepIndexRef.current];
+        const progress =
+          stepDrawDurationRef.current > 0
+            ? Math.min(
+                1,
+                (now - stepDrawStartRef.current) / stepDrawDurationRef.current,
+              )
+            : 1;
+        const sample = step
+          ? sampleOutline(step.primaryOutline, progress)
+          : null;
+        x = sample ? sample.x : positionRef.current.x;
+        y = sample ? sample.y : positionRef.current.y;
+        scale = 1;
+        targetRotation = sample
+          ? sample.rotationDegrees
+          : REST_ROTATION_DEGREES;
+        positionRef.current = { x, y };
+        drawProgress.set(progress);
+        if (progress >= 1) {
+          teachPhaseRef.current = "holding";
+          stepHoldStartRef.current = now;
+        }
+      } else if (teachPhaseRef.current === "holding") {
+        // The step is drawn; rest the cursor on the mark's end while the voice explains it,
+        // then advance when the voice reaches the next step (or after a dwell fallback) -
+        // walking to the next mark, or handing back to the mouse after the last step.
+        const step = teachStepsRef.current[activeStepIndexRef.current];
+        const sample = step ? sampleOutline(step.primaryOutline, 1) : null;
+        x = sample ? sample.x : positionRef.current.x;
+        y = sample ? sample.y : positionRef.current.y;
+        scale = 1;
+        targetRotation = sample
+          ? sample.rotationDegrees
+          : REST_ROTATION_DEGREES;
+        positionRef.current = { x, y };
+        const held = now - stepHoldStartRef.current;
+        const captionAhead =
+          pendingStepRef.current > activeStepIndexRef.current;
+        const shouldAdvance =
+          held > STEP_MIN_DWELL_MS ||
+          (captionAhead && held > STEP_CATCHUP_MIN_MS);
+        if (shouldAdvance) {
+          const nextIndex = activeStepIndexRef.current + 1;
+          if (nextIndex < teachStepsRef.current.length) {
+            activeStepIndexRef.current = nextIndex;
+            setActiveStep(nextIndex);
+            drawProgress.set(0);
+            flightRef.current = flightToStepStart(
+              { ...positionRef.current },
+              teachStepsRef.current[nextIndex]!,
+              now,
+            );
+            teachPhaseRef.current = "advancing";
+          } else {
+            // Last step done: fly back to the mouse, then hand off to plain following.
+            teachPhaseRef.current = "handoff";
+            flightRef.current = makeFlight(
+              { ...positionRef.current },
+              mouseTarget,
+              now,
+              randomArcShaping(false),
+              0,
+            );
+          }
+        }
       } else if (pointPhaseRef.current === "holding") {
         // Resting on the pointed target. A flourish point traces a small orbit around it
         // (rotating to face the way it circles) so the hold feels alive; a calm point just
         // sits still, tip at rest. Once the answer has ended and the hold has elapsed, fly
         // back to the mouse and resume following.
-        const holdProgress = Math.min(1, (now - pointLandedAtRef.current) / holdDurationRef.current);
+        const holdProgress = Math.min(
+          1,
+          (now - pointLandedAtRef.current) / holdDurationRef.current,
+        );
         if (orbitRadiusRef.current > 0) {
-          const angle = orbitStartAngleRef.current + orbitAngularSpanRef.current * holdProgress;
-          x = orbitCenterRef.current.x + orbitRadiusRef.current * Math.cos(angle);
-          y = orbitCenterRef.current.y + orbitRadiusRef.current * Math.sin(angle);
+          const angle =
+            orbitStartAngleRef.current +
+            orbitAngularSpanRef.current * holdProgress;
+          x =
+            orbitCenterRef.current.x + orbitRadiusRef.current * Math.cos(angle);
+          y =
+            orbitCenterRef.current.y + orbitRadiusRef.current * Math.sin(angle);
           scale = 1 + ORBIT_SCALE_PULSE * Math.sin(holdProgress * Math.PI);
           // Face the direction of travel around the circle (tangent = angle + 90deg for the
           // spin direction), with the triangle's +90deg tip offset - so it visibly rotates.
           const orbitDirection = Math.sign(orbitAngularSpanRef.current) || 1;
-          targetRotation = ((angle + (orbitDirection * Math.PI) / 2) * 180) / Math.PI + 90;
+          targetRotation =
+            ((angle + (orbitDirection * Math.PI) / 2) * 180) / Math.PI + 90;
         } else {
           // Calm hold: sit exactly on the target at rest.
           x = orbitCenterRef.current.x;
@@ -512,7 +906,10 @@ export function Overlay() {
           targetRotation = REST_ROTATION_DEGREES;
         }
         positionRef.current = { x, y };
-        if (phaseRef.current === "ending" && now - pointLandedAtRef.current > holdDurationRef.current) {
+        if (
+          phaseRef.current === "ending" &&
+          now - pointLandedAtRef.current > holdDurationRef.current
+        ) {
           const returnFlourish = pointFlourishRef.current;
           flightRef.current = makeFlight(
             positionRef.current,
@@ -569,7 +966,9 @@ export function Overlay() {
         listeningRef.current ||
         thinkingRef.current ||
         flightRef.current !== null ||
-        pointPhaseRef.current !== "none";
+        pointPhaseRef.current !== "none" ||
+        // A teaching walk draws its cursor even on a second monitor with no mouse of its own.
+        teachPhaseRef.current !== "idle";
       setShowBuddy(cursorPresentRef.current || interactionActive);
 
       // Once an answer has ended, any pointing has returned, AND the voice has finished
@@ -595,12 +994,76 @@ export function Overlay() {
       // next turn or Barge-in clears it sooner via the `clear-shapes` event.
       if (
         shapesPresentRef.current &&
+        // A teaching walk owns its drawing's lifecycle; never clear mid-walk (the walk hands
+        // off explicitly, and the hard cap above guarantees it eventually does).
+        teachPhaseRef.current === "idle" &&
         captionRef.current === null &&
         now - lastActivityRef.current > SHAPE_INACTIVITY_CLEAR_MS
       ) {
         // Guard against re-entry until the store update propagates back to the ref.
         shapesPresentRef.current = false;
         clearShapes();
+      }
+
+      // The cursor-riding intro video (M3-03): while the welcome step is up and the cursor
+      // is on this display, glide the card toward its placement beside the pointer (clear of
+      // the wizard) with the calm, heavier card spring. It rides only the display the cursor
+      // is on - exactly like the buddy - so the card follows across monitors. Seeded onto its
+      // target on activation and on cursor re-entry so it appears in place, not sliding in.
+      if (introVideoActiveRef.current && cursorPresentRef.current) {
+        const target = computeIntroCardTarget({
+          cursor: cursorLocalRef.current,
+          cardSize: INTRO_CARD_SIZE,
+          displaySize: { width: window.innerWidth, height: window.innerHeight },
+          avoidRect: introVideoAvoidRectRef.current,
+          gap: INTRO_CARD_GAP_PX,
+          margin: INTRO_CARD_MARGIN_PX,
+        });
+        if (!introCardSeededRef.current) {
+          introCardPositionRef.current = target;
+          introCardVelocityRef.current = { x: 0, y: 0 };
+          introCardSeededRef.current = true;
+        } else {
+          const horizontal = springStep(
+            {
+              position: introCardPositionRef.current.x,
+              velocity: introCardVelocityRef.current.x,
+            },
+            target.x,
+            INTRO_CARD_SPRING_RESPONSE_SECONDS,
+            INTRO_CARD_SPRING_DAMPING_FRACTION,
+            elapsedSeconds,
+          );
+          const vertical = springStep(
+            {
+              position: introCardPositionRef.current.y,
+              velocity: introCardVelocityRef.current.y,
+            },
+            target.y,
+            INTRO_CARD_SPRING_RESPONSE_SECONDS,
+            INTRO_CARD_SPRING_DAMPING_FRACTION,
+            elapsedSeconds,
+          );
+          introCardPositionRef.current = {
+            x: horizontal.position,
+            y: vertical.position,
+          };
+          introCardVelocityRef.current = {
+            x: horizontal.velocity,
+            y: vertical.velocity,
+          };
+        }
+        setIntroCardPosition({
+          x: introCardPositionRef.current.x,
+          y: introCardPositionRef.current.y,
+        });
+        setShowIntroCard(true);
+      } else {
+        // Inactive, or the cursor left for another display: hide here and re-seed so the
+        // card snaps back into place if the cursor returns (this window's card unmounts and
+        // the display the cursor moved to shows it instead).
+        introCardSeededRef.current = false;
+        setShowIntroCard(false);
       }
 
       rafId = requestAnimationFrame(renderFrame);
@@ -620,13 +1083,41 @@ export function Overlay() {
     y: cursorFrame.y - BUDDY_OFFSET_Y,
   };
 
+  // The teaching steps this drawing groups into (empty for a plain, unstepped drawing). The
+  // RAF loop drives the walk via `teachStepsRef`; this is the render-time copy the shape
+  // layer, backdrop, and step badges read - both derive from the same pure grouping.
+  const steps = useMemo(() => groupTeachingSteps(shapes), [shapes]);
+
   return (
     <>
       {/* The teaching drawings sit in their own click-through layer, beneath the buddy, so
           they coexist with the cursor and the response bubble and follow their own draw /
           clear lifecycle rather than the buddy's fade. Always mounted; renders nothing when
-          there is no drawing. */}
-      <ShapeLayer shapes={shapes} generation={shapesGeneration} />
+          there is no drawing. A stepped drawing renders as a guided walk (soft backdrop +
+          one step at a time); a plain drawing renders all its marks at once. */}
+      <ShapeLayer
+        shapes={shapes}
+        generation={shapesGeneration}
+        steps={steps}
+        activeStepIndex={activeStepIndex}
+        teachingActive={teachingActive}
+        drawProgress={drawProgress}
+      />
+      {/* The step guide (M3-04): a numbered instruction chip above the active step's marks
+          while a guided walk runs. Click-through, above the drawing layer, below the buddy. */}
+      <StepGuide
+        steps={steps}
+        activeStepIndex={activeStepIndex}
+        teachingActive={teachingActive}
+      />
+      {/* The cursor-riding intro video (M3-03) sits in its own click-through layer, mounted
+          only while it is drawn on this display so its clip (and audio) plays on the one
+          window the cursor is on, never on every monitor at once. */}
+      <AnimatePresence>
+        {showIntroCard && (
+          <IntroVideoCard key="intro-video" position={introCardPosition} />
+        )}
+      </AnimatePresence>
       <motion.div
         className="pointer-events-none fixed inset-0 overflow-hidden"
         animate={{ opacity: showBuddy ? 1 : 0 }}
@@ -643,7 +1134,9 @@ export function Overlay() {
             <PlayfulCursor frame={cursorFrame} />
             {/* The spoken reply, revealed word by word in step with the voice - the same
                 reveal the Pill shows, mirrored here beside the mouse (mirrors pillStore). */}
-            {caption !== null && <CaptionBubble caption={caption} anchor={cursorFrame} />}
+            {caption !== null && (
+              <CaptionBubble caption={caption} anchor={cursorFrame} />
+            )}
           </>
         )}
       </motion.div>
@@ -671,12 +1164,20 @@ const CAPTION_EST_HEIGHT_PX = 40;
  * correctly whatever the wrapped text height. Keyed on the sentence id so a new sentence
  * restarts the reveal.
  */
-function CaptionBubble({ caption, anchor }: { caption: CaptionData; anchor: CursorFrame }) {
+function CaptionBubble({
+  caption,
+  anchor,
+}: {
+  caption: CaptionData;
+  anchor: CursorFrame;
+}) {
   // Flip to the side with room: left when the chip would overflow the right edge, above
   // when it would overflow the bottom. The everyday case (cursor mid-screen) stays
   // down-and-right of the cursor, as before.
-  const placeLeft = anchor.x + CAPTION_GAP_PX + CAPTION_BUBBLE_WIDTH_PX > window.innerWidth;
-  const placeAbove = anchor.y + CAPTION_GAP_PX + CAPTION_EST_HEIGHT_PX > window.innerHeight;
+  const placeLeft =
+    anchor.x + CAPTION_GAP_PX + CAPTION_BUBBLE_WIDTH_PX > window.innerWidth;
+  const placeAbove =
+    anchor.y + CAPTION_GAP_PX + CAPTION_EST_HEIGHT_PX > window.innerHeight;
 
   // Anchor by the near edge on the flipped axis so the chip grows away from the cursor and
   // stays on-screen regardless of its rendered size; a final max() keeps it off the edge.
@@ -813,126 +1314,282 @@ function ProcessingSpinner({ anchor }: { anchor: CursorFrame }) {
 }
 
 /**
- * The teaching palette default - the same indigo the cursor glows in, so a drawing reads
- * as the same hand that flies the cursor. The model can override it per shape.
+ * The teaching palette default - the same emerald green as the listening waveform, so a
+ * drawing reads as clearly "Lune's" and pops against most app UIs. The model can override
+ * it per shape.
  */
-const DEFAULT_SHAPE_COLOR = "#a5b4fc";
-const SHAPE_STROKE_WIDTH = 3;
-/** How long a stroked outline takes to draw on, and the ease - a confident, playful stroke. */
-const SHAPE_DRAW_SECONDS = 0.55;
-const SHAPE_DRAW_EASE = [0.22, 0.61, 0.36, 1] as const;
-/** How long the arrowhead's barbs are, in local pixels. */
-const ARROW_HEAD_LENGTH_PX = 14;
-/** Half the angle between the two arrowhead barbs. */
-const ARROW_HEAD_SPREAD_RAD = Math.PI / 7;
+const DEFAULT_SHAPE_COLOR = "#34d399";
+/** A clean, confident stroke: bold enough to read as a hand-drawn highlight, not a hairline. */
+const SHAPE_STROKE_WIDTH = 2.5;
+/** The default focus dash - a medium dashed line, like a hand-drawn box around a thing. */
+const FOCUS_DASH = "9 7";
+/** Explicit model stroke patterns (a finer dotted, or the same dashed as the default). */
+const DOTTED_DASH = "2 7";
+const DASHED_DASH = "9 7";
+/** How much a focus box/circle is inflated past the element's bounds so it frames, not clips. */
+const RECT_CORNER_RADIUS = 10;
+/** Earlier, already-walked steps fade back to this opacity so the active step stands out. */
+const DONE_STEP_OPACITY = 0.4;
+/** A finished walk shows every step at rest, clearly but a touch under full. */
+const RESTING_STEP_OPACITY = 0.9;
+/**
+ * The step backdrop's tint strength: a light wash of the drawing's own color behind the
+ * marks, so the area being explained lifts gently off the page. Deliberately subtle -
+ * the screen underneath must stay fully readable (no full-screen dimming, ever).
+ */
+const BACKDROP_FILL_OPACITY = 0.14;
+/** The backdrop patch's corner rounding and edge feather (a soft glow, not a hard card). */
+const BACKDROP_RX = 16;
+const BACKDROP_FEATHER_STD = 10;
+/**
+ * A plain (unstepped) drawing also gets the soft backdrop behind its marks, but only when
+ * the drawing is compact - a patch behind a screen-spanning arrow would tint half the
+ * display, which is exactly the heavy-handedness the backdrop replaced.
+ */
+const BACKDROP_MAX_AREA_FRACTION = 0.25;
 
 /** The dash pattern for a stroke style, or undefined for a solid stroke. */
-function strokeDashArray(stroke: OverlayShape["style"]["stroke"]): string | undefined {
+function strokeDashArray(
+  stroke: OverlayShape["style"]["stroke"],
+): string | undefined {
   if (stroke === "dotted") {
-    return "1 7";
+    return DOTTED_DASH;
   }
   if (stroke === "dashed") {
-    return "10 9";
+    return DASHED_DASH;
   }
   return undefined;
 }
 
-/** Builds the arrow's stroke path: the shaft plus a two-barb head at the end point. */
-function arrowPath(start: OverlayShapePoint, end: OverlayShapePoint): string {
-  const angle = Math.atan2(end.localY - start.localY, end.localX - start.localX);
-  const barb = (offset: number) => ({
-    x: end.localX - ARROW_HEAD_LENGTH_PX * Math.cos(angle + offset),
-    y: end.localY - ARROW_HEAD_LENGTH_PX * Math.sin(angle + offset),
-  });
-  const left = barb(-ARROW_HEAD_SPREAD_RAD);
-  const right = barb(ARROW_HEAD_SPREAD_RAD);
-  return (
-    `M ${start.localX} ${start.localY} L ${end.localX} ${end.localY} ` +
-    `M ${left.x} ${left.y} L ${end.localX} ${end.localY} L ${right.x} ${right.y}`
-  );
+/** A soft glow so a stroke reads as a glowing highlight without a heavy halo. */
+function shapeGlow(color: string): string {
+  return `drop-shadow(0 0 3px ${color})`;
 }
 
-type OverlayShapePoint = OverlayShape["points"][number];
+/** The axis-aligned box (window-local px) between a two-point shape's corners. */
+function rectFromPoints(
+  a: OverlayShape["points"][number],
+  b: OverlayShape["points"][number],
+) {
+  return {
+    x: Math.min(a.localX, b.localX),
+    y: Math.min(a.localY, b.localY),
+    width: Math.abs(b.localX - a.localX),
+    height: Math.abs(b.localY - a.localY),
+  };
+}
+
+/** The SVG path `d` for a shape's outline (circle ring, corner-bracket rect, polygon, ...). */
+function markPathData(shape: OverlayShape): string {
+  return outlineToPathData(buildOutline(toTraceable(shape)));
+}
 
 /**
- * The teaching-drawing layer: a full-window, click-through SVG that renders the shapes the
- * model asked for, each animating on (drawn, not blinked) and animating out when the
- * drawing is cleared. One layer per Overlay window; the shapes already carry this window's
- * local pixels. Keyed by generation so a fresh drawing remounts and replays its animation.
+ * The teaching-drawing layer: a full-window, click-through SVG (M3-04). Every non-empty
+ * drawing renders as a guided walk (an unstepped drawing becomes one synthetic step in
+ * `groupTeachingSteps`) - a soft, lightly-tinted backdrop patch sits behind the active
+ * step's marks (the rest of the screen is never dimmed), and each step's marks reveal in
+ * order (earlier ones faded back, the active step's primary drawn on under the cursor via
+ * the shared `drawProgress` clock). The unstepped branch below remains only as a defensive
+ * fallback should a drawing ever arrive without steps. Keyed by generation so a fresh
+ * drawing remounts and replays its animation.
  */
-function ShapeLayer({ shapes, generation }: { shapes: OverlayShape[]; generation: number }) {
+function ShapeLayer({
+  shapes,
+  generation,
+  steps,
+  activeStepIndex,
+  teachingActive,
+  drawProgress,
+}: {
+  shapes: OverlayShape[];
+  generation: number;
+  steps: TeachStep[];
+  activeStepIndex: number;
+  teachingActive: boolean;
+  drawProgress: MotionValue<number>;
+}) {
+  const isTeaching = steps.length > 0;
+  const activeStep = teachingActive ? steps[activeStepIndex] : undefined;
+
+  // The soft backdrop patch: behind the active step's marks during a walk, or behind a
+  // compact plain drawing's marks - tinted with the drawing's own color. `null` means no
+  // patch (nothing drawn, a finished walk, or a drawing too large to tastefully back).
+  let backdropBounds: TraceBounds | null = null;
+  let backdropColor = DEFAULT_SHAPE_COLOR;
+  if (isTeaching) {
+    if (activeStep !== undefined) {
+      backdropBounds = activeStep.bounds;
+      backdropColor = activeStep.shapes[0]?.style.color ?? DEFAULT_SHAPE_COLOR;
+    }
+  } else if (shapes.length > 0) {
+    const wholeDrawingBounds = shapesBounds(
+      shapes.map(toTraceable),
+      STEP_BOUNDS_PADDING,
+    );
+    if (wholeDrawingBounds !== null) {
+      const areaFraction =
+        (wholeDrawingBounds.width * wholeDrawingBounds.height) /
+        (window.innerWidth * window.innerHeight);
+      if (areaFraction <= BACKDROP_MAX_AREA_FRACTION) {
+        backdropBounds = wholeDrawingBounds;
+        backdropColor = shapes[0]?.style.color ?? DEFAULT_SHAPE_COLOR;
+      }
+    }
+  }
+
+  // The teaching marks: the active step's primary is drawn by a single, stable-keyed pen that
+  // glides between steps (so resetting the shared `drawProgress` clock never briefly rebinds a
+  // stale step); every other visible mark is a resting focus ring. A pending step (not yet
+  // walked) shows nothing; earlier steps fade back.
+  const teachingMarks: ReactElement[] = [];
+  if (isTeaching) {
+    if (activeStep !== undefined) {
+      teachingMarks.push(
+        <PenTrace
+          key={`${generation}-pen`}
+          shape={activeStep.shapes[0]!}
+          outline={activeStep.primaryOutline}
+          drawProgress={drawProgress}
+        />,
+      );
+    }
+    steps.forEach((step, stepIndex) => {
+      if (teachingActive && stepIndex > activeStepIndex) {
+        return;
+      }
+      const isActive = teachingActive && stepIndex === activeStepIndex;
+      const opacity = isActive
+        ? 1
+        : teachingActive
+          ? DONE_STEP_OPACITY
+          : RESTING_STEP_OPACITY;
+      step.shapes.forEach((shape, shapeIndex) => {
+        // The active step's primary is drawn by the shared pen above; skip its resting ring.
+        if (isActive && shapeIndex === 0) {
+          return;
+        }
+        teachingMarks.push(
+          <StaticMark
+            key={`${generation}-mark-${stepIndex}-${shapeIndex}`}
+            shape={shape}
+            opacity={opacity}
+          />,
+        );
+      });
+    });
+  }
+
   return (
-    <svg className="pointer-events-none fixed inset-0 h-full w-full overflow-visible" aria-hidden>
+    <svg
+      className="pointer-events-none fixed inset-0 h-full w-full overflow-visible"
+      aria-hidden
+    >
+      <ShapeBackdrop
+        key={`backdrop-${generation}`}
+        bounds={backdropBounds}
+        color={backdropColor}
+        generation={generation}
+      />
       <AnimatePresence>
-        {shapes.map((shape, index) => (
-          <ShapeMark key={`${generation}-${index}`} shape={shape} />
-        ))}
+        {isTeaching
+          ? teachingMarks
+          : shapes.map((shape, index) => (
+              <StaticMark
+                key={`${generation}-${index}`}
+                shape={shape}
+                opacity={1}
+              />
+            ))}
       </AnimatePresence>
     </svg>
   );
 }
 
 /**
- * One drawn shape. A solid outline draws on via `pathLength` (the stroke traces itself);
- * a dashed/dotted or filled shape grows and fades in instead, because `pathLength` drives
- * the same `strokeDasharray` a dash pattern needs - both read as drawn, never a blink. All
- * shapes fade out when cleared. Coordinates are already in this window's local pixels.
+ * The active step's primary mark, drawn on under the cursor: a solid path whose `pathLength`
+ * is bound to the shared `drawProgress` clock, so the stroke appears exactly as fast as the
+ * cursor rides its outline. One stable-keyed instance glides between steps (its `d` swaps to
+ * the new step's outline as `drawProgress` restarts), and it exit-fades when the walk ends.
  */
-function ShapeMark({ shape }: { shape: OverlayShape }) {
+function PenTrace({
+  shape,
+  outline,
+  drawProgress,
+}: {
+  shape: OverlayShape;
+  outline: ShapeOutline;
+  drawProgress: MotionValue<number>;
+}) {
+  const color = shape.style.color ?? DEFAULT_SHAPE_COLOR;
+  // The pen mounts while the cursor is still flying toward the mark, and a round-capped
+  // path at pathLength 0 still paints a dot at the outline's start - so the stroke stays
+  // hidden until the pen touches down (see penTraceVisibility).
+  const visibility = useTransform(drawProgress, penTraceVisibility);
+  return (
+    <motion.path
+      d={outlineToPathData(outline)}
+      fill="none"
+      stroke={color}
+      strokeWidth={SHAPE_STROKE_WIDTH}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ pathLength: drawProgress, visibility, filter: shapeGlow(color) }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ opacity: { duration: 0.2 } }}
+    />
+  );
+}
+
+/**
+ * A resting mark: the full outline shown at once as a thin, precise focus ring (dotted by
+ * default for the closed focus shapes, so it reads as "look here" rather than a heavy box).
+ * Used for a plain drawing's marks, a step's supporting marks, and every mark once its step
+ * has been walked. Fades/pops in and fades out when cleared.
+ */
+function StaticMark({
+  shape,
+  opacity,
+}: {
+  shape: OverlayShape;
+  opacity: number;
+}) {
   const color = shape.style.color ?? DEFAULT_SHAPE_COLOR;
   const isHighlight = shape.kind === "highlight";
-  const canDrawOn = shape.style.stroke === "solid" && !shape.style.filled && !isHighlight;
+  const filled = shape.style.filled || isHighlight;
+  const isFocusRing =
+    shape.kind === "circle" ||
+    shape.kind === "rect" ||
+    shape.kind === "polygon";
+  // Closed focus shapes default to a dashed box/ring (the reference-diagram look); lines and
+  // arrows stay solid unless the model asked otherwise, so an arrow isn't turned into dots.
+  const dash =
+    strokeDashArray(shape.style.stroke) ??
+    (isFocusRing ? FOCUS_DASH : undefined);
 
-  const glow = `drop-shadow(0 0 4px ${color})`;
-  const motionProps = canDrawOn
-    ? {
-        // A solid outline traces itself on, the closest thing to a drawn stroke.
-        initial: { pathLength: 0, opacity: 0 },
-        animate: { pathLength: 1, opacity: 1 },
-        exit: { opacity: 0 },
-        transition: {
-          pathLength: { duration: SHAPE_DRAW_SECONDS, ease: SHAPE_DRAW_EASE },
-          opacity: { duration: 0.2 },
-        },
-        style: { filter: glow },
-      }
-    : isHighlight
-      ? {
-          // A highlight sweeps in from the left, like dragging a marker across the text.
-          initial: { opacity: 0, scaleX: 0 },
-          animate: { opacity: 1, scaleX: 1 },
-          exit: { opacity: 0 },
-          transition: {
-            scaleX: { duration: 0.4, ease: SHAPE_DRAW_EASE },
-            opacity: { duration: 0.2 },
-          },
-          style: {
-            filter: glow,
-            transformBox: "fill-box" as const,
-            transformOrigin: "left" as const,
-          },
-        }
-      : {
-          // A dashed/dotted or filled shape can't trace via pathLength (that drives the
-          // same strokeDasharray the pattern needs), so it grows and fades in instead -
-          // still an entrance, never an instant blink.
-          initial: { opacity: 0, scale: 0.85 },
-          animate: { opacity: 1, scale: 1 },
-          exit: { opacity: 0, scale: 0.92 },
-          transition: { type: "spring" as const, stiffness: 260, damping: 22 },
-          style: {
-            filter: glow,
-            transformBox: "fill-box" as const,
-            transformOrigin: "center" as const,
-          },
-        };
-
-  const strokeProps = {
-    stroke: color,
+  // Shared stroke/fill + a quick pop-in that all the primitives below use.
+  const common = {
+    fill: filled ? color : "none",
+    fillOpacity: filled ? (isHighlight ? 0.18 : 0.12) : undefined,
+    stroke: isHighlight ? "none" : color,
     strokeWidth: SHAPE_STROKE_WIDTH,
     strokeLinecap: "round" as const,
     strokeLinejoin: "round" as const,
-    strokeDasharray: strokeDashArray(shape.style.stroke),
+    strokeDasharray: dash,
+    initial: { opacity: 0, scale: 0.92 },
+    animate: { opacity, scale: 1 },
+    exit: { opacity: 0 },
+    transition: {
+      scale: { type: "spring" as const, stiffness: 300, damping: 24 },
+      opacity: { duration: 0.25 },
+    },
+    style: {
+      filter: shapeGlow(color),
+      transformBox: "fill-box" as const,
+      transformOrigin: "center" as const,
+    },
   };
 
   if (shape.kind === "circle") {
@@ -942,15 +1599,22 @@ function ShapeMark({ shape }: { shape: OverlayShape }) {
     }
     return (
       <motion.circle
-        {...motionProps}
-        {...strokeProps}
+        {...common}
         cx={center.localX}
         cy={center.localY}
         r={shape.radius ?? 0}
-        fill={shape.style.filled ? color : "none"}
-        fillOpacity={shape.style.filled ? 0.16 : undefined}
       />
     );
+  }
+
+  if (shape.kind === "polygon") {
+    if (shape.points.length < 3) {
+      return null;
+    }
+    const points = shape.points
+      .map((point) => `${point.localX},${point.localY}`)
+      .join(" ");
+    return <motion.polygon {...common} points={points} />;
   }
 
   const [start, end] = shape.points;
@@ -959,36 +1623,150 @@ function ShapeMark({ shape }: { shape: OverlayShape }) {
   }
 
   if (shape.kind === "rect" || isHighlight) {
+    const box = rectFromPoints(start, end);
     return (
       <motion.rect
-        {...motionProps}
-        {...strokeProps}
-        x={Math.min(start.localX, end.localX)}
-        y={Math.min(start.localY, end.localY)}
-        width={Math.abs(end.localX - start.localX)}
-        height={Math.abs(end.localY - start.localY)}
-        rx={isHighlight ? 4 : 8}
-        stroke={isHighlight ? "none" : color}
-        fill={isHighlight || shape.style.filled ? color : "none"}
-        fillOpacity={isHighlight ? 0.28 : shape.style.filled ? 0.16 : undefined}
+        {...common}
+        x={box.x}
+        y={box.y}
+        width={box.width}
+        height={box.height}
+        rx={RECT_CORNER_RADIUS}
       />
     );
   }
 
   if (shape.kind === "arrow") {
-    return <motion.path {...motionProps} {...strokeProps} d={arrowPath(start, end)} fill="none" />;
+    // The arrow's shaft + head as a path (reuses the tracer's arrow geometry).
+    return <motion.path {...common} d={markPathData(shape)} />;
   }
 
   // line
   return (
     <motion.line
-      {...motionProps}
-      {...strokeProps}
+      {...common}
       x1={start.localX}
       y1={start.localY}
       x2={end.localX}
       y2={end.localY}
     />
+  );
+}
+
+/**
+ * The soft backdrop behind the marks (the successor of the full-screen spotlight dim,
+ * which darkened everything but the active step and made the whole screen feel heavy).
+ * Instead, a feathered patch lightly tinted with the drawing's own color sits just under
+ * the marks - the area being explained glows gently, and the rest of the screen is left
+ * exactly as it is. It springs (position + size) between steps like the marks do, fades
+ * out in place when there is nothing left to back, and is remounted per drawing
+ * (generation-keyed by the caller) so a fresh drawing fades in at its spot rather than
+ * flying in from the previous drawing's.
+ */
+function ShapeBackdrop({
+  bounds,
+  color,
+  generation,
+}: {
+  bounds: TraceBounds | null;
+  color: string;
+  generation: number;
+}) {
+  const blurId = `lune-backdrop-blur-${generation}`;
+  // When the bounds clear (walk finished, drawing cleared), keep the last patch in place
+  // and only fade - springing the rect off-screen mid-fade would read as it flying away.
+  const lastBoundsRef = useRef<TraceBounds | null>(bounds);
+  if (bounds !== null) {
+    lastBoundsRef.current = bounds;
+  }
+  const patch = bounds ?? lastBoundsRef.current;
+  if (patch === null) {
+    return null;
+  }
+  return (
+    <>
+      <defs>
+        <filter id={blurId} x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation={BACKDROP_FEATHER_STD} />
+        </filter>
+      </defs>
+      <motion.rect
+        fill={color}
+        filter={`url(#${blurId})`}
+        rx={BACKDROP_RX}
+        initial={{ opacity: 0 }}
+        animate={{
+          x: patch.x,
+          y: patch.y,
+          width: patch.width,
+          height: patch.height,
+          opacity: bounds !== null ? BACKDROP_FILL_OPACITY : 0,
+        }}
+        transition={{
+          type: "spring",
+          stiffness: 210,
+          damping: 30,
+          opacity: { duration: 0.3 },
+        }}
+      />
+    </>
+  );
+}
+
+/**
+ * The step guide (M3-04): a small numbered chip with the step's short instruction, shown just
+ * above the active step's marks while a guided walk is in progress. Purely presentational and
+ * click-through; it re-keys per step so it slides in fresh as the walk advances.
+ */
+function StepGuide({
+  steps,
+  activeStepIndex,
+  teachingActive,
+}: {
+  steps: TeachStep[];
+  activeStepIndex: number;
+  teachingActive: boolean;
+}) {
+  if (!teachingActive) {
+    return null;
+  }
+  const step = steps[activeStepIndex];
+  if (step === undefined || step.bounds === null) {
+    return null;
+  }
+  // A single-step walk (a plain drawing given the guided treatment) isn't a numbered
+  // sequence: show just the label, and nothing at all when there's no label to show.
+  const isSequence = steps.length > 1;
+  if (!isSequence && step.label.length === 0) {
+    return null;
+  }
+  const top = Math.max(8, step.bounds.y - 44);
+  const left = Math.max(8, Math.min(step.bounds.x, window.innerWidth - 280));
+  return (
+    <div className="pointer-events-none fixed inset-0">
+      <motion.div
+        key={`step-${activeStepIndex}`}
+        className={`absolute flex items-center gap-2 rounded-full bg-neutral-950/90 py-1 ${isSequence ? "pl-1" : "pl-3"} pr-3 shadow-lg shadow-black/50 ring-1 ring-white/10`}
+        style={{ left, top }}
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25, ease: "easeOut" }}
+      >
+        {isSequence && (
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-400 text-xs font-semibold text-neutral-950">
+            {step.stepNumber}
+          </span>
+        )}
+        <span className="text-[13px] font-medium text-neutral-100">
+          {step.label.length > 0 ? step.label : `Step ${step.stepNumber}`}
+        </span>
+        {isSequence && (
+          <span className="ml-1 text-[11px] text-neutral-500">
+            {step.stepNumber} / {steps.length}
+          </span>
+        )}
+      </motion.div>
+    </div>
   );
 }
 
@@ -1013,3 +1791,93 @@ function PlayfulCursor({ frame }: { frame: CursorFrame }) {
   );
 }
 
+/**
+ * The cursor-riding intro video card (M3-03): a ~400x600 card that rides alongside the
+ * pointer through the onboarding welcome step, introducing Lune. It is positioned by the
+ * RAF loop's spring (so it trails the cursor smoothly) and lives in the click-through
+ * Overlay window, so it can never block the wizard's controls; the placement math keeps it
+ * from covering the wizard either. It fades/pops in when it appears and out when the step
+ * advances, is skipped, or the cursor crosses to another display. The real clip drops in at
+ * {@link introVideoUrl}; until then a branded animated placeholder stands in.
+ */
+function IntroVideoCard({ position }: { position: Point2D }) {
+  return (
+    <motion.div
+      className="pointer-events-none fixed"
+      style={{
+        left: position.x,
+        top: position.y,
+        width: INTRO_CARD_SIZE.width,
+        height: INTRO_CARD_SIZE.height,
+      }}
+      initial={{ opacity: 0, scale: 0.94 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.96 }}
+      transition={{ duration: INTRO_CARD_FADE_S, ease: "easeOut" }}
+    >
+      <div className="h-full w-full overflow-hidden rounded-3xl border border-white/10 bg-neutral-950/90 shadow-2xl shadow-black/60 backdrop-blur-md">
+        {introVideoUrl !== null ? (
+          // The Overlay window sets `autoplayPolicy: no-user-gesture-required`, so the clip
+          // plays with sound the moment it mounts (the card mounts only on the cursor's
+          // display, so audio never doubles across monitors).
+          <video
+            src={introVideoUrl}
+            autoPlay
+            playsInline
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <IntroVideoPlaceholder />
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+/**
+ * The branded stand-in shown until a real intro clip is dropped in at {@link introVideoUrl}.
+ * A dark card with a softly pulsing aurora behind a floating moon, a one-line welcome, and a
+ * gentle equalizer so it reads as "Lune, speaking" - the same sky/violet language as the
+ * onboarding welcome step, so the card feels of a piece with the wizard beside it.
+ */
+function IntroVideoPlaceholder() {
+  return (
+    <div className="relative flex h-full w-full flex-col items-center justify-center gap-6 bg-gradient-to-b from-neutral-900 to-neutral-950 px-8 text-center">
+      <motion.div
+        aria-hidden
+        className="absolute left-1/2 top-[36%] h-56 w-56 -translate-x-1/2 -translate-y-1/2 rounded-full bg-gradient-to-br from-sky-400/30 to-violet-500/30 blur-3xl"
+        animate={{ opacity: [0.5, 0.85, 0.5], scale: [1, 1.08, 1] }}
+        transition={{ duration: 4.5, ease: "easeInOut", repeat: Infinity }}
+      />
+      <motion.div
+        className="flex h-24 w-24 items-center justify-center rounded-[2rem] bg-gradient-to-br from-sky-400/30 to-violet-500/30 text-5xl"
+        animate={{ y: [0, -6, 0] }}
+        transition={{ duration: 5, ease: "easeInOut", repeat: Infinity }}
+      >
+        🌙
+      </motion.div>
+      <div className="relative">
+        <h2 className="text-lg font-semibold text-neutral-50">Meet Lune</h2>
+        <p className="mt-2 max-w-[15rem] text-xs leading-relaxed text-neutral-400">
+          Your on-screen companion. I'll follow along, answer out loud, and
+          point at what I mean.
+        </p>
+      </div>
+      <div className="relative flex items-end gap-1">
+        {[0, 1, 2, 3, 4].map((bar) => (
+          <motion.span
+            key={bar}
+            className="w-1 rounded-full bg-gradient-to-t from-sky-400 to-violet-400"
+            animate={{ height: [6, 18, 6] }}
+            transition={{
+              duration: 1.1,
+              ease: "easeInOut",
+              repeat: Infinity,
+              delay: bar * 0.12,
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}

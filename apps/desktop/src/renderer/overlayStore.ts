@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import type { CaptionData } from "./caption";
-import type { OverlayShape } from "../ipc/overlayControl";
+import type { OverlayAvoidRect, OverlayShape } from "../ipc/overlayControl";
 
 // The Overlay's interaction state (ticket 07). One Overlay window per display runs
 // this store; the main process drives it over IPC (activity, streamed answer text, a
@@ -60,6 +60,34 @@ interface OverlayState {
    * the response bubble rather than gating them.
    */
   shapes: OverlayShape[];
+  /**
+   * The 0-based index of the teaching step the guided walkthrough is currently on (M3-04),
+   * driven by the Overlay's RAF loop as the cursor walks each step. The shape layer reveals
+   * step `activeStepIndex` in full and fades earlier steps back; a value at or past the last
+   * step means the walk is finished and every step is shown at rest. Meaningless (0) when the
+   * drawing isn't a stepped teaching drawing.
+   */
+  activeStepIndex: number;
+  /**
+   * Whether a guided teaching walkthrough is in progress on this display (M3-04): the cursor
+   * is walking the steps one at a time, so the shape layer reveals them in order and the
+   * soft backdrop patch lifts the active step's area. Cleared when the walk hands
+   * back to plain mouse-following, on the next turn, or on Barge-in - after which any drawn
+   * shapes are shown all at once (backdrop faded) until the usual quiet-timeout clears them.
+   */
+  teachingActive: boolean;
+  /**
+   * Whether the cursor-riding intro video is running on this display (M3-03), shown during
+   * the onboarding welcome step. While true the Overlay rides a video card alongside the
+   * cursor; it is dismissed when the welcome step advances or is skipped.
+   */
+  introVideoActive: boolean;
+  /**
+   * The onboarding window's rectangle in this window's local space while the intro video is
+   * active, so the card can be kept clear of the wizard, or `null` when the wizard is not on
+   * this display (nothing to avoid here).
+   */
+  introVideoAvoidRect: OverlayAvoidRect | null;
 
   /** Begins an interaction: clears the previous answer/target and shows the cursor. */
   beginInteraction: () => void;
@@ -89,6 +117,14 @@ interface OverlayState {
   setShapes: (shapes: OverlayShape[]) => void;
   /** Clears all drawn shapes (next turn / Barge-in / the explanation went quiet). */
   clearShapes: () => void;
+  /** Sets which teaching step the guided walk is on (driven by the RAF loop). */
+  setActiveStep: (activeStepIndex: number) => void;
+  /** Turns the guided-teaching UI (stepwise reveal + soft backdrop) on or off. */
+  setTeachingActive: (teachingActive: boolean) => void;
+  /** Starts the cursor-riding intro video, with the wizard rect to keep clear of (or null). */
+  startIntroVideo: (avoidRect: OverlayAvoidRect | null) => void;
+  /** Dismisses the intro video (the welcome step advanced or was skipped). */
+  endIntroVideo: () => void;
 }
 
 export const useOverlayStore = create<OverlayState>((set) => ({
@@ -101,6 +137,10 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   thinking: false,
   caption: null,
   shapes: [],
+  activeStepIndex: 0,
+  teachingActive: false,
+  introVideoActive: false,
+  introVideoAvoidRect: null,
 
   // Starting an answer clears any lingering listening waveform, but deliberately keeps the
   // thinking spinner up: reasoning has begun, yet Lune is still "working" until it actually
@@ -111,7 +151,7 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   appendAnswer: (text) => set((state) => ({ answerText: state.answerText + text })),
   setPointTarget: (target) => set({ pointTarget: target }),
   endInteraction: () => set({ phase: "ending" }),
-  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0, thinking: false, caption: null, shapes: [] }),
+  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0, thinking: false, caption: null, shapes: [], activeStepIndex: 0, teachingActive: false }),
   setShowStreamingText: (showStreamingText) => set({ showStreamingText }),
   beginListening: () => set({ listening: true, listeningLevel: 0 }),
   setListeningLevel: (listeningLevel) => set({ listeningLevel }),
@@ -122,5 +162,9 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   // An empty word list clears the caption (playback finished / stopped).
   setCaption: (caption) => set({ caption: caption !== null && caption.words.length > 0 ? caption : null }),
   setShapes: (shapes) => set({ shapes }),
-  clearShapes: () => set({ shapes: [] }),
+  clearShapes: () => set({ shapes: [], activeStepIndex: 0, teachingActive: false }),
+  setActiveStep: (activeStepIndex) => set({ activeStepIndex }),
+  setTeachingActive: (teachingActive) => set({ teachingActive }),
+  startIntroVideo: (introVideoAvoidRect) => set({ introVideoActive: true, introVideoAvoidRect }),
+  endIntroVideo: () => set({ introVideoActive: false, introVideoAvoidRect: null }),
 }));

@@ -18,6 +18,7 @@ import {
 } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
 import {
+  CONVERSATIONS_ACTIVE_CHANNEL,
   CONVERSATIONS_CHANGED_CHANNEL,
   CONVERSATIONS_LIST_CHANNEL,
   CONVERSATIONS_NEW_CHANNEL,
@@ -71,13 +72,6 @@ import {
   type SpeechEvent,
 } from "../ipc/speechPlayback";
 import {
-  CONFIRM_GATE_ANSWER_CHANNEL,
-  CONFIRM_GATE_EVENT_CHANNEL,
-  ConfirmGateEventSchema,
-  type ConfirmGateAnswerValue,
-  type ConfirmGateEvent,
-} from "../ipc/confirmGate";
-import {
   MIC_OPEN_SETTINGS_CHANNEL,
   MIC_PERMISSION_REQUEST_CHANNEL,
   MIC_PERMISSION_STATUS_CHANNEL,
@@ -106,6 +100,7 @@ import {
   ONBOARDING_COMPLETE_CHANNEL,
   ONBOARDING_DOWNLOAD_STATUS_CHANNEL,
   ONBOARDING_OPEN_GET_KEY_CHANNEL,
+  ONBOARDING_SET_INTRO_VIDEO_CHANNEL,
   ONBOARDING_START_DOWNLOAD_CHANNEL,
   ONBOARDING_VALIDATE_KEY_CHANNEL,
   OnboardingDownloadStatusSchema,
@@ -195,6 +190,14 @@ const luneBridge = {
       return ConversationListSnapshotSchema.parse(await ipcRenderer.invoke(CONVERSATIONS_LIST_CHANNEL));
     },
     /**
+     * Reads the active conversation's current history so the panel can render it on open
+     * (a voice turn taken while the panel was closed is committed but was never streamed
+     * to this renderer). A pure read - it never switches which conversation is active.
+     */
+    async active(): Promise<ResumedConversationValue> {
+      return ResumedConversationSchema.parse(await ipcRenderer.invoke(CONVERSATIONS_ACTIVE_CHANNEL));
+    },
+    /**
      * Resumes a stored conversation by id, resolving with its full text history to
      * render (the main process seeds the Core and makes it active). The next turn
      * answers with fresh screen context - screenshots were never stored.
@@ -240,29 +243,6 @@ const luneBridge = {
     /** Tells the main process this Overlay has faded out and its window can be hidden. */
     signalIdle(): void {
       ipcRenderer.send(OVERLAY_IDLE_CHANNEL);
-    },
-  },
-  confirmGate: {
-    /**
-     * Subscribes the gate window to open/close events, validating each against the shared
-     * codec before it renders (no untyped shape crosses in). Only the Confirm Gate window
-     * subscribes. Returns an unsubscribe function.
-     */
-    onEvent(listener: (event: ConfirmGateEvent) => void): () => void {
-      const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
-        const parsedEvent = ConfirmGateEventSchema.safeParse(rawEvent);
-        if (parsedEvent.success) {
-          listener(parsedEvent.data);
-        } else {
-          console.error("[lune] dropping malformed confirm-gate event:", parsedEvent.error.message);
-        }
-      };
-      ipcRenderer.on(CONFIRM_GATE_EVENT_CHANNEL, forwardValidatedEvent);
-      return () => ipcRenderer.removeListener(CONFIRM_GATE_EVENT_CHANNEL, forwardValidatedEvent);
-    },
-    /** Reports the chip's Approve/Cancel button press to the main process. */
-    answer(answer: ConfirmGateAnswerValue): void {
-      ipcRenderer.send(CONFIRM_GATE_ANSWER_CHANNEL, answer);
     },
   },
   speech: {
@@ -450,6 +430,14 @@ const luneBridge = {
     /** Opens one Vendor's "get a key" page in the default browser. */
     openGetKeyLink(vendor: SettingsVendorId): void {
       ipcRenderer.send(ONBOARDING_OPEN_GET_KEY_CHANNEL, vendor);
+    },
+    /**
+     * Toggles the cursor-riding intro video (M3-03): `true` while the welcome step is
+     * showing, `false` when it advances or is skipped. The main process rides the card on
+     * the Overlay, kept clear of the onboarding window.
+     */
+    setIntroVideo(active: boolean): void {
+      ipcRenderer.send(ONBOARDING_SET_INTRO_VIDEO_CHANNEL, active);
     },
   },
 };

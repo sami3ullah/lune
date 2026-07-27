@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 
 import type { ChildRuntimeGateway, ChildRuntimeId, TranscribeAudio, TranscriptionResult } from "@lune/core";
+import { reapOrphanedWhisperServers } from "./whisperOrphanReaper";
 
 /**
  * The real Node-backed whisper.cpp child Runtime (ADR-0003), ported from v1's
@@ -50,6 +51,12 @@ export function createNodeWhisperRuntime(options: NodeWhisperRuntimeOptions): {
   killSync: () => void;
 } {
   let whisperProcess: ChildProcess | undefined;
+
+  // Reap any whisper-server left running by a prior launch that died without teardown
+  // (a parent SIGKILL or crash orphans the child to launchd, where it lingers holding
+  // the model in memory). Done once, up front, before we ever spawn - the one recovery
+  // for a death no in-process handler can observe.
+  reapOrphanedWhisperServers(options.serverBinaryPath);
 
   const gateway: ChildRuntimeGateway = {
     async start(runtimeId: ChildRuntimeId): Promise<void> {

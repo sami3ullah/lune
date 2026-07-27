@@ -141,6 +141,42 @@ describe("buildOpenAiChatRequest", () => {
     expect(geminiRequest.max_completion_tokens).toBeUndefined();
   });
 
+  it("maps a minimal-reasoning request to reasoning_effort low on models that accept it", () => {
+    // Gemini's OpenAI-compatible surface accepts reasoning_effort on every gemini model;
+    // OpenAI accepts it on its reasoning families. Both get the low-effort hint.
+    for (const modelSlot of ["gemini-3.5-flash-lite", "gemini-pro-latest", "gpt-5.4-mini", "o3-mini"]) {
+      const request = buildOpenAiChatRequest({
+        request: { messages: [{ role: "user", content: "hi" }], reasoningEffort: "minimal" },
+        downscaledScreenshots: [],
+        modelSlot,
+        tokenLimitField: "max_tokens",
+      });
+      expect(request.reasoning_effort).toBe("low");
+    }
+  });
+
+  it("omits reasoning_effort on models that reject the field, and on ordinary requests", () => {
+    // The classic gpt-4 family rejects reasoning_effort outright (and doesn't reason
+    // anyway), so the hint is dropped rather than failing the whole call.
+    const gpt4Request = buildOpenAiChatRequest({
+      request: { messages: [{ role: "user", content: "hi" }], reasoningEffort: "minimal" },
+      downscaledScreenshots: [],
+      modelSlot: "gpt-4o",
+      tokenLimitField: "max_completion_tokens",
+    });
+    expect(gpt4Request.reasoning_effort).toBeUndefined();
+    expect("reasoning_effort" in gpt4Request).toBe(false);
+
+    // A request that doesn't ask for minimal effort keeps the Vendor's default.
+    const conversationalRequest = buildOpenAiChatRequest({
+      request: { messages: [{ role: "user", content: "hi" }] },
+      downscaledScreenshots: [],
+      modelSlot: "gemini-3.5-flash-lite",
+      tokenLimitField: "max_tokens",
+    });
+    expect("reasoning_effort" in conversationalRequest).toBe(false);
+  });
+
   it("defaults the completion budget high enough to cover a reasoning model's hidden tokens", () => {
     // With no stated limit, a reasoning model's reasoning tokens plus the short spoken
     // answer must fit, so the default is generous rather than sized for the answer alone.

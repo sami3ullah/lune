@@ -10,34 +10,27 @@ import { DECLINE_ACKNOWLEDGMENT, REPROMPT_LINE } from "../src/main/agent/confirm
 import type { ConfirmGateRequest } from "../src/main/agent/screenAgentLoop";
 
 /**
- * Unit tests for the Confirm Gate controller (M2-04): the coordinator that turns chip,
- * hotkey, and voice answers into one approve/decline, driving the pure reconciliation and
- * the plain-language explanation behind the loop's `confirm` seam. Every edge (speak, the
- * chip, answer capture) is a fake, in the style of `VoiceLoopController`'s tests, so the
- * acceptance-critical behaviour - all three modalities answer, ambiguous voice re-prompts,
- * a decline is acknowledged aloud, and a barge-in ends the wait cleanly - is pinned down
- * without any real speaker, window, or hotkey.
+ * Unit tests for the Confirm Gate controller (M2-04, revised): the coordinator that turns
+ * the user's spoken answer into one approve/decline, driving the pure reconciliation and the
+ * plain-language line behind the loop's `confirm` seam. The gate is voice-only (no on-screen
+ * modal), so every edge (speak, answer capture) is a fake, in the style of
+ * `VoiceLoopController`'s tests, so the acceptance-critical behaviour - a spoken yes/no
+ * answers, ambiguous voice re-prompts, a decline is acknowledged aloud, and a barge-in ends
+ * the wait cleanly - is pinned down without any real speaker. The reconciler stays general
+ * (it also accepts an explicit approve/cancel intent), covered in `confirmGateReconciliation`.
  */
 
 const CLICK: AgentAction = { kind: "click", x: 10, y: 20, consequence: "consequential" };
 
-/** A fake gate environment: records what was spoken/shown and lets a test push answers. */
+/** A fake gate environment: records what was spoken and lets a test push answers. */
 function makeEdges() {
   const spoken: string[] = [];
-  let chipShown = 0;
-  let chipHidden = 0;
   let captureDisposed = 0;
   let deliver: ((signal: ConfirmGateAnswerSignal) => void) | null = null;
 
   const edges: ConfirmGateEdges = {
     speak: (text) => {
       spoken.push(text);
-    },
-    showChip: () => {
-      chipShown += 1;
-      return () => {
-        chipHidden += 1;
-      };
     },
     armAnswerCapture: (deliverSignal) => {
       deliver = deliverSignal;
@@ -51,7 +44,7 @@ function makeEdges() {
   return {
     edges,
     spoken,
-    counts: () => ({ chipShown, chipHidden, captureDisposed }),
+    counts: () => ({ captureDisposed }),
     /** Pushes one answer into the armed gate (throws if the gate isn't listening). */
     answer: (signal: ConfirmGateAnswerSignal) => {
       if (deliver === null) {
@@ -64,11 +57,11 @@ function makeEdges() {
 }
 
 function request(overrides: Partial<ConfirmGateRequest> = {}): ConfirmGateRequest {
-  return { kind: "irreversible", action: CLICK, goal: "send the message", stepIndex: 1, ...overrides };
+  return { action: CLICK, stepIndex: 1, ...overrides };
 }
 
-describe("ConfirmGateController - the gate opens by explaining and showing the chip", () => {
-  it("speaks the explanation and shows the chip while it waits", async () => {
+describe("ConfirmGateController - the gate opens by speaking its line", () => {
+  it("speaks the plain-language line and listens while it waits", async () => {
     const env = makeEdges();
     const gate = createConfirmGateController(env.edges);
     void gate(request());
@@ -76,14 +69,13 @@ describe("ConfirmGateController - the gate opens by explaining and showing the c
     // Let the confirm() microtasks settle so the gate has opened.
     await Promise.resolve();
 
-    expect(env.counts().chipShown).toBe(1);
     expect(env.spoken[0]).toContain("about to"); // the irreversible-guard phrasing
     expect(env.isCapturing()).toBe(true);
   });
 });
 
 describe("ConfirmGateController - every modality answers", () => {
-  it("approves on a chip Approve, hiding the chip and tearing down capture", async () => {
+  it("approves on an explicit approve intent, tearing down capture", async () => {
     const env = makeEdges();
     const gate = createConfirmGateController(env.edges);
     const pending = gate(request());
@@ -92,12 +84,11 @@ describe("ConfirmGateController - every modality answers", () => {
     env.answer({ source: "chip", intent: "approve" });
 
     await expect(pending).resolves.toBe(true);
-    expect(env.counts().chipHidden).toBe(1);
     expect(env.counts().captureDisposed).toBe(1);
     expect(env.spoken).not.toContain(DECLINE_ACKNOWLEDGMENT);
   });
 
-  it("declines on a chip Cancel and acknowledges the decline aloud", async () => {
+  it("declines on an explicit cancel intent and acknowledges the decline aloud", async () => {
     const env = makeEdges();
     const gate = createConfirmGateController(env.edges);
     const pending = gate(request());
@@ -184,7 +175,6 @@ describe("ConfirmGateController - barge-in ends the wait without a spoken declin
     controller.abort();
 
     await expect(pending).resolves.toBe(false);
-    expect(env.counts().chipHidden).toBe(1);
     expect(env.counts().captureDisposed).toBe(1);
     // A barge-in is a cancellation of the whole session, not a gate decline: no ack over the
     // fresh recording that the barge-in has already started.
@@ -203,7 +193,7 @@ describe("ConfirmGateController - barge-in ends the wait without a spoken declin
 });
 
 describe("ConfirmGateController - a settled gate ignores later answers", () => {
-  it("does not resolve twice or re-hide the chip when a stray answer arrives after settling", async () => {
+  it("does not resolve twice or keep listening when a stray answer arrives after settling", async () => {
     const env = makeEdges();
     const gate = createConfirmGateController(env.edges);
     const pending = gate(request());
@@ -213,6 +203,6 @@ describe("ConfirmGateController - a settled gate ignores later answers", () => {
     await expect(pending).resolves.toBe(true);
     // The armed capture is disposed on settle, so no further answers can arrive.
     expect(env.isCapturing()).toBe(false);
-    expect(env.counts().chipHidden).toBe(1);
+    expect(env.counts().captureDisposed).toBe(1);
   });
 });

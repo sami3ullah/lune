@@ -6,6 +6,7 @@ import {
   OVERLAY_ROUTE_HASH,
   type OverlayEvent,
 } from "../../ipc/overlayControl";
+import { toDisplayLocalRect, type ScreenBounds } from "./overlayGeometry";
 
 // The Overlay windows (ticket 07): Lune's playful cursor + response bubble live in a
 // full-screen, click-through, focus-less window - one per connected display, so the
@@ -36,6 +37,12 @@ const CURSOR_FOLLOW_POLL_INTERVAL_MS = 16;
 interface OverlayWindowEntry {
   displayId: number;
   window: BrowserWindow;
+  /**
+   * The display bounds this window must cover exactly - every drawn mark's window-local
+   * coordinates assume it. Kept to verify macOS actually honored the frame (see
+   * {@link OverlayWindowManager.verifyWindowsCoverDisplays}).
+   */
+  bounds: ScreenBounds;
 }
 
 /**
@@ -150,6 +157,28 @@ export class OverlayWindowManager {
     return screen.getDisplayNearestPoint(screenPoint).id;
   }
 
+  /**
+   * Rides the onboarding intro video alongside the cursor (M3-03). The card follows the
+   * mouse across monitors, so every window is told to show it (each draws it only while the
+   * cursor is on its display); each is given the wizard's rectangle in its own display-local
+   * space so the card stays clear of the wizard, or `null` when the wizard isn't on that
+   * display. This is the display-geometry half the renderer can't do (it knows no bounds);
+   * the placement math it feeds is the pure, tested `computeIntroCardTarget`.
+   */
+  startIntroVideo(onboardingBounds: ScreenBounds): void {
+    const displays = screen.getAllDisplays();
+    for (const entry of this.entries) {
+      const display = displays.find((candidate) => candidate.id === entry.displayId);
+      const avoidRect = display ? toDisplayLocalRect(onboardingBounds, display.bounds) : null;
+      this.sendToDisplay(entry.displayId, { type: "intro-video-start", avoidRect });
+    }
+  }
+
+  /** Dismisses the intro video on every window (the welcome step advanced or was skipped). */
+  endIntroVideo(): void {
+    this.broadcast({ type: "intro-video-end" });
+  }
+
   /** Tears down the manager: stops the poll, removes listeners, and closes every window. */
   dispose(): void {
     this.destroyed = true;
@@ -182,13 +211,47 @@ export class OverlayWindowManager {
     this.entries = screen.getAllDisplays().map((display) => ({
       displayId: display.id,
       window: this.createOverlayWindow(display),
+      bounds: { ...display.bounds },
     }));
     // The old window the cursor was on is gone; re-resolve it on the next poll tick.
     this.cursorDisplayId = null;
     if (!this.followingSuspended) {
       this.showAllInactive();
     }
+    // Once the fresh windows' frames settle, verify macOS actually left them covering
+    // their displays (the clamp this guards against applies at show time, async).
+    setTimeout(() => this.verifyWindowsCoverDisplays(), 1000);
   };
+
+  /**
+   * Shouts when an Overlay window does not exactly cover its display. macOS clamps a
+   * shown window below the menu bar unless `enableLargerThanScreen` disarms it (see
+   * {@link createOverlayWindow}), and the clamp is not repairable by setBounds - so this
+   * only logs. It matters because the failure is otherwise invisible: every mark and the
+   * following cursor on that display render offset by exactly the reported delta, which
+   * presents as "the drawing is a bit off" with nothing in the console to explain it.
+   */
+  private verifyWindowsCoverDisplays(): void {
+    for (const entry of this.entries) {
+      if (entry.window.isDestroyed() || !entry.window.isVisible()) {
+        continue;
+      }
+      const actual = entry.window.getBounds();
+      const intended = entry.bounds;
+      if (
+        actual.x !== intended.x ||
+        actual.y !== intended.y ||
+        actual.width !== intended.width ||
+        actual.height !== intended.height
+      ) {
+        console.error(
+          `[lune] overlay window on display ${entry.displayId} does not cover it ` +
+            `(window ${JSON.stringify(actual)} vs display ${JSON.stringify(intended)}); ` +
+            `marks on this display will draw offset by that delta`,
+        );
+      }
+    }
+  }
 
   /** Shows every window without activating it, so the user's focused app is never disturbed. */
   private showAllInactive(): void {
@@ -278,11 +341,23 @@ export class OverlayWindowManager {
       skipTaskbar: true,
       focusable: false,
       fullscreenable: false,
+      // macOS clamps a window's frame below the menu bar when it is *shown* - even at
+      // the screen-saver level, and a later setBounds cannot undo it. Without this flag
+      // the overlay sits ~25-35px below the display's top edge while believing it covers
+      // it, so every drawn mark (and the following cursor) lands that far below its
+      // intended screen position. This flag disables AppKit's frame constraining so the
+      // window covers the display exactly, menu bar included. No-op outside macOS.
+      enableLargerThanScreen: true,
       // Enter/leave events let the click-through forwarding stay off (see below); we
       // never want the overlay to react to the mouse, so forwarding is disabled.
       webPreferences: {
         preload: join(__dirname, "../preload/index.js"),
         sandbox: false,
+        // The cursor-riding intro video (M3-03) autoplays in this window with sound the
+        // moment its card mounts; the overlay never gets a user gesture (it is focus-less
+        // and click-through), so allow gesture-less autoplay. Harmless for every other
+        // overlay state - nothing else here plays media.
+        autoplayPolicy: "no-user-gesture-required",
       },
     });
 

@@ -45,6 +45,11 @@ export function useSpeechPlayback(): void {
   // audio". Abandoned ids are kept for the session so a very-late stale clip stays ignored.
   const currentTurnIdRef = useRef<string | null>(null);
   const abandonedTurnIdsRef = useRef<Set<string>>(new Set());
+  // The turns whose `turn-complete` has arrived: no more clips are coming for them. Lets
+  // the player tell "the queue drained because the answer is over" (return to idle) apart
+  // from "the queue drained mid-turn" - e.g. the instant filler acknowledgement finished
+  // before the first real sentence was synthesized - where it shows "thinking" and waits.
+  const completedTurnIdsRef = useRef<Set<string>>(new Set());
   const setIndicatorStateRef = useRef(setIndicatorState);
   setIndicatorStateRef.current = setIndicatorState;
 
@@ -97,11 +102,21 @@ export function useSpeechPlayback(): void {
     };
     captionTimerRef.current = setInterval(revealTick, 60);
 
-    /** Starts the next queued clip, or returns the pill to idle when the queue is empty. */
+    /** Starts the next queued clip, or settles the pill when the queue is empty. */
     const playNext = (): void => {
       const nextClip = queueRef.current.shift();
       if (nextClip === undefined) {
         isPlayingRef.current = false;
+        // Drained mid-turn (its `turn-complete` hasn't arrived): more clips are still
+        // being synthesized upstream - the filler acknowledgement outran the first real
+        // sentence. Show "thinking" and keep the turn current so its next clip resumes.
+        const drainedTurnId = currentTurnIdRef.current;
+        if (drainedTurnId !== null && !completedTurnIdsRef.current.has(drainedTurnId)) {
+          setIndicatorStateRef.current("thinking");
+          captionRevealRef.current = null;
+          emitCaptionRef.current(null);
+          return;
+        }
         currentTurnIdRef.current = null;
         setIndicatorStateRef.current("idle");
         // The whole answer has finished speaking: clear the caption so the Pill returns
@@ -200,9 +215,17 @@ export function useSpeechPlayback(): void {
           break;
         }
         case "turn-complete":
-          // Nothing to do: the queue drains on its own and playNext returns to idle
-          // after the last clip. (This event exists for a future "was anything spoken?"
-          // decision; the sequential player needs no explicit end signal.)
+          // No more clips are coming for this turn. Usually the queue is still playing
+          // and playNext settles to idle after the last clip; but if the queue already
+          // drained mid-turn (the player is holding in "thinking" after a filler), there
+          // is nothing left to wait for - settle to idle now.
+          completedTurnIdsRef.current.add(event.turnId);
+          if (!isPlayingRef.current && currentTurnIdRef.current === event.turnId) {
+            currentTurnIdRef.current = null;
+            setIndicatorStateRef.current("idle");
+            captionRevealRef.current = null;
+            emitCaptionRef.current(null);
+          }
           break;
         case "stop":
           stopAll();

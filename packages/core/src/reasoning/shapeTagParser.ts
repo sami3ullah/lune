@@ -49,6 +49,12 @@ export interface ParsedShape {
    * meaning the cursor's screen (screen 1), exactly like a Point Tag.
    */
   screenNumber: number | null;
+  /**
+   * The 1-based teaching step the shape belongs to, or null when it isn't grouped into a
+   * step. Shapes sharing a step are revealed together as one step of a guided walkthrough;
+   * shapes with no step draw in a single pass (the Overlay decides how to sequence).
+   */
+  step: number | null;
 }
 
 /** The answer split into what the user reads and the shapes the Overlay draws. */
@@ -69,13 +75,24 @@ const TRAILING_SHAPE_TAG = new RegExp(
 
 /** Turns a parsed tag body into the uniform points+radius shape the Overlay draws. */
 function toParsedShape(body: ShapeTagBody): ParsedShape {
-  const common = { kind: body.kind, label: body.label, style: body.style, screenNumber: body.screenNumber };
+  const common = {
+    kind: body.kind,
+    label: body.label,
+    style: body.style,
+    screenNumber: body.screenNumber,
+    step: body.step,
+  };
   if (body.kind === "circle") {
     const [x, y, radius] = body.numbers;
     return { ...common, points: [{ x, y }], radius };
   }
-  const [x1, y1, x2, y2] = body.numbers;
-  return { ...common, points: [{ x: x1, y: y1 }, { x: x2, y: y2 }], radius: null };
+  // Every other shape is a flat run of x,y pairs: two for a two-point shape, >= 3 for a
+  // polygon. Fold the run into points the same way regardless of count.
+  const points: ShapePoint[] = [];
+  for (let i = 0; i + 1 < body.numbers.length; i += 2) {
+    points.push({ x: body.numbers[i]!, y: body.numbers[i + 1]! });
+  }
+  return { ...common, points, radius: null };
 }
 
 /**

@@ -66,10 +66,13 @@ export type OverlayCursorPosition = z.infer<typeof OverlayCursorPositionSchema>;
  * renderer needs no display geometry (exactly like {@link OverlayPointSchema}).
  *
  * `points` are the shape's defining points: `[center]` for a circle (with `radius` in
- * local pixels), `[start, end]` for every two-point shape (rect/highlight/arrow/line,
- * `radius` null). `style` carries the stroke pattern, fill, and an optional color; a null
- * color means the Overlay's default. `kind`, `style`, and the coordinate layout mirror
- * the Core's `ParsedShape` so the mapping is a straight translation.
+ * local pixels), `[start, end]` for a two-point shape (rect/highlight/arrow/line), or the
+ * full run of vertices for a polygon (`radius` null for both). `style` carries the stroke
+ * pattern, fill, and an optional color; a null color means the Overlay's default. `step`
+ * groups the shape into a 1-based teaching step (the Overlay reveals steps one at a time),
+ * or is null when the shape isn't part of a guided walkthrough. `kind`, `style`, `step`,
+ * and the coordinate layout mirror the Core's `ParsedShape` so the mapping is a straight
+ * translation.
  */
 export const OverlayShapePointSchema = z.object({
   localX: z.number(),
@@ -81,13 +84,29 @@ export const OverlayShapeStyleSchema = z.object({
   color: z.string().nullable(),
 });
 export const OverlayShapeSchema = z.object({
-  kind: z.enum(["circle", "rect", "highlight", "arrow", "line"]),
+  kind: z.enum(["circle", "rect", "highlight", "arrow", "line", "polygon"]),
   points: z.array(OverlayShapePointSchema),
   radius: z.number().nullable(),
   label: z.string(),
   style: OverlayShapeStyleSchema,
+  step: z.number().nullable(),
 });
 export type OverlayShape = z.infer<typeof OverlayShapeSchema>;
+
+/**
+ * The onboarding window's rectangle in one Overlay window's display-local space (M3-03),
+ * so the cursor-riding intro video can be kept clear of the wizard. The main process owns
+ * display geometry, so it converts the wizard's global bounds into each display's local
+ * space before sending; a window whose display the wizard isn't on carries `null` (nothing
+ * to avoid there). All values are logical pixels from the window's top-left.
+ */
+export const OverlayAvoidRectSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+});
+export type OverlayAvoidRect = z.infer<typeof OverlayAvoidRectSchema>;
 
 /**
  * One Overlay event, main -> a single window. Three concerns share the surface:
@@ -127,6 +146,13 @@ export type OverlayShape = z.infer<typeof OverlayShapeSchema>;
  * may draw without pointing, shapes on another monitor draw without a cursor there, and
  * the shapes are cleared on the next turn, on Barge-in, or after the explanation goes
  * quiet - so they ride their own two events rather than the `activity-*` pair.
+ *
+ * Intro video (M3-03, onboarding delight): `intro-video-start` rides the Farza-style
+ * welcome-step video card alongside the cursor on this display, kept clear of the wizard
+ * (`avoidRect`, this display's local rect, or null when the wizard isn't here);
+ * `intro-video-end` dismisses it when the welcome step advances or is skipped. Like the
+ * following buddy the card only draws on the display the cursor is on, so these two events
+ * are broadcast to every window and each shows the card only while the cursor is on it.
  */
 export const OverlayEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cursor-move"), position: OverlayCursorPositionSchema }),
@@ -142,6 +168,8 @@ export const OverlayEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("point"), point: OverlayPointSchema }),
   z.object({ type: z.literal("draw-shapes"), shapes: z.array(OverlayShapeSchema) }),
   z.object({ type: z.literal("clear-shapes") }),
+  z.object({ type: z.literal("intro-video-start"), avoidRect: OverlayAvoidRectSchema.nullable() }),
+  z.object({ type: z.literal("intro-video-end") }),
   z.object({ type: z.literal("activity-end") }),
 ]);
 export type OverlayEvent = z.infer<typeof OverlayEventSchema>;

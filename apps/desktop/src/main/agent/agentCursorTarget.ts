@@ -97,9 +97,9 @@ function actionTargetPoint(action: AgentAction): { x: number; y: number } | null
 }
 
 /** Flight-duration knobs, mirroring `overlayCursorFlight` so the wait matches the animation. */
-const MIN_FLIGHT_MS = 600;
-const MAX_FLIGHT_MS = 1400;
-const MS_PER_PIXEL = 1000 / 800;
+const MIN_FLIGHT_MS = 550;
+const MAX_FLIGHT_MS = 1900;
+const MS_PER_PIXEL = 1000 / 850;
 /** A beat added after the flight so the Action fires only once the cursor has visibly landed. */
 const SETTLE_BUFFER_MS = 250;
 

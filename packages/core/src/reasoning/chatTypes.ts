@@ -74,6 +74,15 @@ export interface CoreChatRequest {
   messages: CoreChatMessage[];
   /** Upper bound on the answer length; the Vendor's default is used when absent. */
   maxTokens?: number;
+  /**
+   * Asks the Vendor to spend as little hidden "reasoning"/"thinking" as it allows.
+   * Set on small machine-read calls (mark refinement) where a reasoning-mode Model
+   * Slot's default deliberation adds seconds of latency for no accuracy gain. Each
+   * Vendor adapter maps it to its own wire knob where one exists (the OpenAI-compatible
+   * `reasoning_effort`); Anthropic runs without thinking unless asked, so it needs no
+   * mapping. Absent on ordinary conversational turns - the Vendor's default wins.
+   */
+  reasoningEffort?: "minimal";
 }
 
 /**

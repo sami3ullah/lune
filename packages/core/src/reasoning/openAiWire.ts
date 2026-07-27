@@ -46,4 +46,12 @@ export interface OpenAiChatRequest {
   messages: OpenAiChatMessage[];
   max_tokens?: number;
   max_completion_tokens?: number;
+  /**
+   * How much hidden reasoning the model spends before answering. Gemini's
+   * OpenAI-compatible surface maps this to a thinking budget on every gemini model;
+   * OpenAI accepts it only on its reasoning families and rejects it on the classic
+   * gpt-4 models - so it is set per-model (see `modelSlotAcceptsReasoningEffort`),
+   * and only when the Core request asks for minimal effort.
+   */
+  reasoning_effort?: "low";
 }

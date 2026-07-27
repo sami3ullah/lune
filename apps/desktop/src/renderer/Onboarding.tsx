@@ -127,6 +127,19 @@ function BackButton() {
 /** Step 1: what Lune is. The download has already started silently behind this screen. */
 function WelcomeStep() {
   const next = useOnboardingStore((state) => state.next);
+  // The Farza-style intro video (M3-03) rides alongside the cursor for this step only. It
+  // starts when the step mounts and is dismissed when the step advances (unmount cleanup) or
+  // is skipped. Skipping flips this flag, which re-runs the effect: the cleanup ends the
+  // video and the early return keeps it from restarting while the user lingers on welcome.
+  const [introDismissed, setIntroDismissed] = useState(false);
+  useEffect(() => {
+    if (introDismissed) {
+      return;
+    }
+    window.lune.onboarding.setIntroVideo(true);
+    return () => window.lune.onboarding.setIntroVideo(false);
+  }, [introDismissed]);
+
   return (
     <StepLayout
       body={
@@ -144,7 +157,17 @@ function WelcomeStep() {
       }
       footer={
         <>
-          <span />
+          {introDismissed ? (
+            <span />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setIntroDismissed(true)}
+              className="app-no-drag cursor-pointer rounded-xl px-3 py-2 text-sm text-neutral-400 transition hover:text-neutral-100"
+            >
+              Skip intro
+            </button>
+          )}
           <PrimaryButton label="Get started" onClick={next} />
         </>
       }

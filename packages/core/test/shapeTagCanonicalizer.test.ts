@@ -139,4 +139,43 @@ describe("canonicalizeShapeBracket", () => {
       "[LINE:0,0,10,10:step 2]",
     );
   });
+
+  it("supports a polygon's variable run of points and remaps each", () => {
+    expect(
+      canonicalizeShapeBracket("[polygon:10,10,90,20,50,80:the region]", identityRemap),
+    ).toBe("[POLYGON:10,10,90,20,50,80:the region]");
+    const remap = remapForScaleFactor(0.5);
+    expect(canonicalizeShapeBracket("[POLYGON:5,5,45,10,25,40:region]", remap)).toBe(
+      "[POLYGON:10,10,90,20,50,80:region]",
+    );
+  });
+
+  it("accepts the 'poly' alias and needs at least three points", () => {
+    expect(canonicalizeShapeBracket("[poly:0,0,10,0,10,10,0,10:box]", identityRemap)).toBe(
+      "[POLYGON:0,0,10,0,10,10,0,10:box]",
+    );
+    // Two points can't enclose a region, so there's nothing to repair.
+    const tooFew = "[POLYGON:0,0,10,10:x]";
+    expect(canonicalizeShapeBracket(tooFew, identityRemap)).toBe(tooFew);
+  });
+
+  it("reads and renders a teaching step modifier after the label", () => {
+    expect(
+      canonicalizeShapeBracket("[RECT:0,0,10,10:File menu:step2]", identityRemap),
+    ).toBe("[RECT:0,0,10,10:File menu:step2]");
+    // Canonical order is stroke, fill, color, step, screen, whatever the input order.
+    expect(
+      canonicalizeShapeBracket(
+        "[CIRCLE:1,2,3:save:screen2:step1:red:dotted]",
+        identityRemap,
+      ),
+    ).toBe("[CIRCLE:1,2,3:save:dotted:red:step1:screen2]");
+  });
+
+  it("keeps a 'step 2' label as the label, not a step", () => {
+    // In label position "step 2" is the label; only a later segment is read as a step.
+    expect(canonicalizeShapeBracket("[RECT:0,0,10,10:step 2]", identityRemap)).toBe(
+      "[RECT:0,0,10,10:step 2]",
+    );
+  });
 });

@@ -1,8 +1,7 @@
 import {
-  buildConfirmGateView,
+  buildGateSpokenLine,
   DECLINE_ACKNOWLEDGMENT,
   REPROMPT_LINE,
-  type ConfirmGateView,
 } from "./confirmGateExplanation";
 import {
   classifyConfirmUtterance,
@@ -12,32 +11,30 @@ import {
 } from "./confirmGateReconciliation";
 import type { ConfirmGateRequest } from "./screenAgentLoop";
 
-// The Confirm Gate controller (M2-04): the coordinator that sits behind the loop's
-// `confirm` seam and turns the three answer modalities - the on-screen chip, the hotkey,
-// and voice - into one approve/decline, under the fail-safe reconciliation. The pure parts
-// (reconciliation, the plain-language explanation) hold the decisions and the words; this
-// owns the wiring (the untested-edge injection): speaking, showing the chip, and arming
-// answer capture across the modalities.
+// The Confirm Gate controller (M2-04, revised): the coordinator that sits behind the loop's
+// `confirm` seam and turns the user's spoken answer into one approve/decline, under the
+// fail-safe reconciliation. The gate is voice-only now - no on-screen modal (DECISIONS #15,
+// revised) - so this speaks a plain-language line and listens; the pure parts (reconciliation,
+// the spoken line) hold the decisions and the words, and this owns the untested-edge
+// injection: speaking and arming answer capture.
 //
-// The flow of one gate: speak the plain-language explanation and show the chip, then wait.
-// Each incoming answer is normalized to a vote (a spoken reply is classified first) and
-// reconciled against everything heard so far: a cancel (chip Cancel, Esc, a negative
-// utterance) stops immediately, an explicit approve proceeds, and an ambiguous spoken reply
-// re-prompts (re-asks aloud) rather than ever proceeding. A decline is acknowledged aloud
-// before the session ends.
+// The flow of one gate: speak the plain-language line, then wait. Each incoming answer is
+// normalized to a vote (a spoken reply is classified first) and reconciled against everything
+// heard so far: a cancel (a negative utterance) stops immediately, an explicit approve
+// proceeds, and an ambiguous spoken reply re-prompts (re-asks aloud) rather than ever
+// proceeding. A decline is acknowledged aloud before the session ends.
 //
-// Answers arrive one at a time (each is its own IPC/hotkey/transcription callback), so the
-// first decisive vote settles the gate. The fail-safe "a cancel beats a *simultaneous*
-// approve" rule is the reconciliation function's contract, tested there over a set; here,
-// serial arrival means whichever decisive answer the user gives first wins. The run's abort
-// signal is the always-on override on top of that: a barge-in ends the wait as not-approved
-// - without a spoken acknowledgment, since the session is being cancelled and its fresh
-// recording is already starting, so the gate must not talk over it - and the loop re-checks
-// the same signal before any OS touch, so a barge-in beats even an approve that just resolved.
+// The answer signal stays a general union (a voice reply, or an explicit approve/cancel
+// intent) so the reconciler is modality-agnostic and its fail-safe rules stay tested over a
+// set; the composition root currently arms voice only. The run's abort signal is the always-on
+// override: a barge-in ends the wait as not-approved - without a spoken acknowledgment, since
+// the session is being cancelled and its fresh recording is already starting, so the gate must
+// not talk over it - and the loop re-checks the same signal before any OS touch, so a barge-in
+// beats even an approve that just resolved.
 
 /** One raw answer arriving from a single modality, before it is normalized to a vote. */
 export type ConfirmGateAnswerSignal =
-  /** A chip button or the approve/cancel hotkey: an explicit, unambiguous intent. */
+  /** An explicit, unambiguous approve/cancel intent (e.g. a future button or hotkey). */
   | { source: "chip" | "hotkey"; intent: "approve" | "cancel" }
   /** A spoken reply; the controller classifies the transcript into affirmative/negative/ambiguous. */
   | { source: "voice"; transcript: string };
@@ -46,8 +43,6 @@ export type ConfirmGateAnswerSignal =
 export interface ConfirmGateEdges {
   /** Speaks a line aloud (the explanation, a re-prompt nudge, or the decline ack). Fire-and-forget. */
   speak: (text: string) => void;
-  /** Shows the chip explaining what Lune will do; returns a disposer that hides it. */
-  showChip: (view: ConfirmGateView) => () => void;
   /**
    * Arms answer capture across every modality (chip buttons, the approve/cancel hotkey, and
    * voice), delivering each raw answer to `deliver`. Returns a disposer that tears the
@@ -74,7 +69,7 @@ function voteForSignal(signal: ConfirmGateAnswerSignal): GateVote {
  */
 export function createConfirmGateController(edges: ConfirmGateEdges): ConfirmGate {
   return function confirm(request: ConfirmGateRequest): Promise<boolean> {
-    const view = buildConfirmGateView(request);
+    const spokenLine = buildGateSpokenLine(request);
 
     return new Promise<boolean>((resolve) => {
       const votes: GateVote[] = [];
@@ -90,7 +85,6 @@ export function createConfirmGateController(edges: ConfirmGateEdges): ConfirmGat
         }
         settled = true;
         disposeCapture();
-        hideChip();
         signal?.removeEventListener("abort", onAbort);
         resolve(approved);
       }
@@ -101,9 +95,8 @@ export function createConfirmGateController(edges: ConfirmGateEdges): ConfirmGat
         finish(false);
       }
 
-      // Open the gate: show the chip and speak the explanation, then listen.
-      const hideChip = edges.showChip(view);
-      edges.speak(view.explanation);
+      // Open the gate: speak the plain-language line, then listen for the spoken answer.
+      edges.speak(spokenLine);
 
       disposeCapture = edges.armAnswerCapture((incoming) => {
         if (settled) {

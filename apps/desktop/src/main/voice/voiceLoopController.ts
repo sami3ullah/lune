@@ -217,15 +217,22 @@ export class VoiceLoopController {
 
     const plan = this.machine.hotkeyPressed();
     if (plan.bargeIn) {
-      // Interrupt every in-flight turn and silence any playback before the new recording,
-      // so nothing streams or speaks behind it (no overlap, no zombie audio).
+      // A turn is still streaming/answering: abort it so nothing streams behind the new
+      // recording (no overlap, no zombie stream).
       for (const abort of this.activeTurnAborts) {
         abort.abort();
       }
       this.activeTurnAborts.clear();
-      this.dependencies.stopSpeech();
     }
     if (plan.startRecording) {
+      // Silence any speech before listening, unconditionally. Barge-in aborts an in-flight
+      // turn above, but audio can still be playing even after the machine has returned to
+      // idle: synthesis finishing ends the turn (phase -> idle) while Kokoro keeps playing
+      // the tail in the renderer. A press in that window is a plain idle->listening start
+      // (bargeIn:false) yet the user still hears Lune, so gating stopSpeech on bargeIn let
+      // the old answer talk over the new phrase. Stopping here - a no-op when nothing is
+      // playing - guarantees a press always cuts playback and just listens.
+      this.dependencies.stopSpeech();
       this.generation += 1;
       const recordingId = this.dependencies.generateId();
       this.currentRecordingId = recordingId;

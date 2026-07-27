@@ -91,8 +91,9 @@ describe("agentCursorSettleMs", () => {
     const near = agentCursorSettleMs({ x: 0, y: 0 }, { x: 10, y: 0 });
     const far = agentCursorSettleMs({ x: 0, y: 0 }, { x: 5000, y: 0 });
     expect(far).toBeGreaterThan(near);
-    // Even a zero-distance hop waits at least the floor; even a huge one is capped.
-    expect(agentCursorSettleMs({ x: 0, y: 0 }, { x: 0, y: 0 })).toBeGreaterThanOrEqual(600);
-    expect(far).toBeLessThanOrEqual(1400 + 400);
+    // Even a zero-distance hop waits at least the floor; even a huge one is capped
+    // (the flight range mirrors overlayCursorFlight's deliberately unhurried pacing).
+    expect(agentCursorSettleMs({ x: 0, y: 0 }, { x: 0, y: 0 })).toBeGreaterThanOrEqual(500);
+    expect(far).toBeLessThanOrEqual(1900 + 400);
   });
 });

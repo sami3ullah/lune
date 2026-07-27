@@ -123,6 +123,34 @@ export function resolveOverlayPointTarget(
   };
 }
 
+/**
+ * Converts a global-desktop rectangle (the onboarding window) into one display's Overlay-
+ * window-local space (M3-03), clipped to that display, or `null` when the two don't
+ * overlap. The Overlay window's origin is the display's bounds origin, so local == global
+ * minus the bounds origin; clipping to the display keeps the returned rect within the
+ * window so the renderer's placement math sees the wizard exactly where it sits on this
+ * screen. Kept beside {@link toWindowLocalPoint} so the coordinate math stays in one tested
+ * place - the cursor-riding intro card is kept clear of this rect.
+ */
+export function toDisplayLocalRect(
+  globalRect: ScreenBounds,
+  displayBounds: ScreenBounds,
+): ScreenBounds | null {
+  const left = Math.max(globalRect.x, displayBounds.x);
+  const top = Math.max(globalRect.y, displayBounds.y);
+  const right = Math.min(globalRect.x + globalRect.width, displayBounds.x + displayBounds.width);
+  const bottom = Math.min(globalRect.y + globalRect.height, displayBounds.y + displayBounds.height);
+  if (right <= left || bottom <= top) {
+    return null;
+  }
+  return {
+    x: left - displayBounds.x,
+    y: top - displayBounds.y,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
 /** A shape resolved onto one display, ready to send to that display's Overlay window. */
 export interface ResolvedOverlayShape {
   displayId: number;
@@ -173,6 +201,7 @@ export function resolveOverlayShape(
       radius,
       label: shape.label,
       style: shape.style,
+      step: shape.step,
     },
   };
 }

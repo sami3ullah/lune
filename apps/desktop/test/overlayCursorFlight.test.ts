@@ -88,9 +88,11 @@ describe("flightDurationMs", () => {
     const shortHop = flightDurationMs(50);
     const longFlight = flightDurationMs(3000);
     expect(longFlight).toBeGreaterThan(shortHop);
-    // Clamped so a tiny hop still reads as a flight and a huge one never drags.
-    expect(shortHop).toBeGreaterThanOrEqual(600);
-    expect(longFlight).toBeLessThanOrEqual(1400);
+    // Clamped so a tiny hop still reads as a flight and a huge one never drags. The
+    // floor keeps even a short hop trackable by eye (the flight is the user's cue for
+    // where to look next), and the ceiling keeps a cross-screen flight under ~3s.
+    expect(shortHop).toBeGreaterThanOrEqual(500);
+    expect(longFlight).toBeLessThanOrEqual(2000);
   });
 });
 

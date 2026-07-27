@@ -27,10 +27,11 @@ import type { GuardrailStopReason, ScreenAgentGuardrails } from "./screenAgentGu
 //   - Advisory -> act boundary (DECISIONS #14): a first-Step `done` means the model chose
 //     to *advise*, so the loop speaks and never touches the OS. Any answer-only turn ends
 //     as `completed` with `advisory: true`, having executed zero Actions (acceptance #2).
-//   - Confirm Gates (DECISIONS #15): confirm-to-start before the first OS touch, and the
-//     irreversible guard before any `consequential` Action. This ticket owns the *seam*
-//     (`confirm`) and calls it at the right moments; M2-04 fills in the chip/voice/hotkey
-//     UX behind it. A declined gate ends the run cleanly (`declined`).
+//   - Confirm Gate (DECISIONS #15, revised): the irreversible guard fires before any
+//     `consequential` Action. Confirm-to-start was dropped at the owner's request - an
+//     explicit user command is consent to begin - so a run only gates hard-to-undo steps.
+//     This ticket owns the *seam* (`confirm`) and calls it at that moment; M2-04 answers it
+//     by voice (no on-screen modal). A declined gate ends the run cleanly (`declined`).
 //
 // Barge-in (the push-to-talk hotkey) cancels a session by aborting the injected
 // `signal`: the loop checks it between every await and ceases to call, so a cancelled run
@@ -52,20 +53,16 @@ export interface SceneCapture {
   targetSignal?: AgentTargetSignal;
 }
 
-/** Why the loop wants to confirm before touching the OS - shaping the gate's explanation. */
-export type ConfirmGateKind =
-  /** The first OS touch of the session (confirm-to-start). */
-  | "confirm-to-start"
-  /** A `consequential` Action mid-session (the irreversible guard). */
-  | "irreversible";
-
-/** One confirm request handed to the gate seam; M2-04 renders it as chip/voice/hotkey. */
+/**
+ * One confirm request handed to the gate seam. The gate fires only before a `consequential`
+ * (hard-to-undo) Action - a send, delete, pay, submit, overwrite, or irreversible navigation
+ * - which M2-04 asks the user to approve by voice. Confirm-to-start was dropped (DECISIONS
+ * #15, revised): an explicit command is consent to begin, so a run no longer gates just to
+ * start.
+ */
 export interface ConfirmGateRequest {
-  kind: ConfirmGateKind;
   /** The Action about to run, so the gate can explain in plain language what Lune will do. */
   action: AgentAction;
-  /** The user's spoken goal, for context in the explanation. */
-  goal: string;
   /** The 0-based index of the Action this gate precedes. */
   stepIndex: number;
   /**
@@ -271,16 +268,11 @@ export async function runScreenAgentLoop(
         return stop("cancelled", stepIndex, false);
       }
 
-      // Confirm if needed: confirm-to-start before the first OS touch, and the irreversible
-      // guard before any consequential Action. Benign mid-session Actions run without a gate.
-      const gateKind: ConfirmGateKind | null =
-        stepIndex === 0
-          ? "confirm-to-start"
-          : action.consequence === "consequential"
-            ? "irreversible"
-            : null;
-      if (gateKind !== null) {
-        const approved = await confirm({ kind: gateKind, action, goal, stepIndex, signal });
+      // Confirm only before a consequential (hard-to-undo) Action - a send, delete, pay,
+      // submit, overwrite, or irreversible navigation. An explicit command is consent to
+      // start, so a run no longer gates just to begin; benign Actions run without a gate.
+      if (action.consequence === "consequential") {
+        const approved = await confirm({ action, stepIndex, signal });
         // A barge-in can land while the user is answering the gate. Honour it first, so a
         // cancelled run is reported as `cancelled` rather than misread as a `declined` gate
         // (the gate resolves not-approved when its wait is aborted).

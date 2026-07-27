@@ -26,6 +26,7 @@ describe("parseAnswerShapeTags", () => {
         label: "save button",
         style: { stroke: "solid", filled: false, color: null },
         screenNumber: null,
+        step: null,
       },
     ]);
   });
@@ -43,6 +44,7 @@ describe("parseAnswerShapeTags", () => {
         label: "it flows here",
         style: { stroke: "solid", filled: false, color: null },
         screenNumber: 2,
+        step: null,
       },
     ]);
   });
@@ -64,6 +66,29 @@ describe("parseAnswerShapeTags", () => {
       { x: 100, y: 100 },
       { x: 200, y: 200 },
     ]);
+  });
+
+  it("reads a polygon's variable run of points as a closed point list", () => {
+    const result = parseAnswerShapeTags("outline this [POLYGON:10,10,90,20,50,80:the region]");
+    expect(result.displayText).toBe("outline this");
+    expect(result.shapes[0]!.kind).toBe("polygon");
+    expect(result.shapes[0]!.points).toEqual([
+      { x: 10, y: 10 },
+      { x: 90, y: 20 },
+      { x: 50, y: 80 },
+    ]);
+    expect(result.shapes[0]!.radius).toBeNull();
+  });
+
+  it("reads the teaching step modifier (and keeps a 'step 2' label distinct)", () => {
+    const stepped = parseAnswerShapeTags("[RECT:0,0,10,10:File menu:dotted:step2]");
+    expect(stepped.shapes[0]!.step).toBe(2);
+    expect(stepped.shapes[0]!.label).toBe("File menu");
+
+    // A label that reads "step 2" is the label, not a step (it sits in label position).
+    const labelled = parseAnswerShapeTags("[RECT:0,0,10,10:step 2]");
+    expect(labelled.shapes[0]!.step).toBeNull();
+    expect(labelled.shapes[0]!.label).toBe("step 2");
   });
 
   it("leaves an ordinary trailing bracket alone", () => {

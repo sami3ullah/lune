@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { nativeImage } from "electron";
 import type { AgentScreenshot, ScreenAgentCapability } from "@lune/core";
 import {
   runScreenAgentLoop,
@@ -15,6 +16,7 @@ import {
   resolveActiveDisplayId,
   type OverlaySuspender,
 } from "./agentSceneCapture";
+import { fingerprintBitmap, PROGRESS_GRID } from "./progressFingerprint";
 import type { SyntheticInputExecutor } from "./syntheticInputExecutor";
 import type { AxSignalProvider } from "./axSignalProvider";
 import {
@@ -29,12 +31,12 @@ import {
 // is the tested control flow; this is the thin wiring, mirroring the transcription/speech/
 // synthetic-input services.
 //
-// The confirm gate is a seam here on purpose: M2-03 owns *when* the loop confirms
-// (confirm-to-start + the irreversible guard); the chip/voice/hotkey UX behind it is M2-04,
-// injected by the composition root (`createConfirmGateController` wired to the gate window,
-// the Enter/Escape hotkey, and push-to-talk voice). The {@link autoApproveConfirmGate}
-// default remains only so a run can be exercised in isolation (tests / a headless dev
-// trigger) where no gate UX is mounted; the real app always passes the real gate.
+// The confirm gate is a seam here on purpose: M2-03 owns *when* the loop confirms (only
+// before a consequential, hard-to-undo Action now - confirm-to-start was dropped); the UX
+// behind it is M2-04, injected by the composition root (`createConfirmGateController` wired
+// to push-to-talk voice, no on-screen modal). The {@link autoApproveConfirmGate} default
+// remains only so a run can be exercised in isolation (tests / a headless dev trigger) where
+// no gate UX is mounted; the real app always passes the real gate.
 
 /** A confirm gate: decide whether the loop may proceed with the Action it is about to run. */
 export type ConfirmGate = (request: ConfirmGateRequest) => Promise<boolean>;
@@ -48,16 +50,32 @@ export type ConfirmGate = (request: ConfirmGateRequest) => Promise<boolean>;
 export function autoApproveConfirmGate(log: (message: string) => void): ConfirmGate {
   return async (request) => {
     log(
-      `confirm gate (${request.kind}) auto-approved for a '${request.action.kind}' action ` +
-        `[M2-04 replaces this with the real chip/voice/hotkey gate]`,
+      `confirm gate auto-approved for a consequential '${request.action.kind}' action ` +
+        `[M2-04 replaces this with the real voice gate]`,
     );
     return true;
   };
 }
 
-/** Fingerprints a scene for the no-progress detector: a content hash of the screenshot bytes. */
+/**
+ * Fingerprints a scene for the no-progress detector: decodes the frame, downscales it to the
+ * coarse grid, and hands the bitmap to the pure {@link fingerprintBitmap} (see that module for
+ * why a coarse, quantized fingerprint - not a byte-exact hash - is what stops a stuck model
+ * from looping forever). Falls back to a raw-bytes hash if the frame can't be decoded.
+ */
 function hashScreenshot(screenshot: AgentScreenshot): string {
-  return createHash("sha1").update(screenshot.base64Data).digest("hex");
+  try {
+    const image = nativeImage.createFromBuffer(Buffer.from(screenshot.base64Data, "base64"));
+    if (image.isEmpty()) {
+      return createHash("sha1").update(screenshot.base64Data).digest("hex");
+    }
+    const bitmap = image
+      .resize({ width: PROGRESS_GRID, height: PROGRESS_GRID, quality: "good" })
+      .toBitmap(); // row-major BGRA bytes
+    return fingerprintBitmap(Uint8Array.from(bitmap));
+  } catch {
+    return createHash("sha1").update(screenshot.base64Data).digest("hex");
+  }
 }
 
 /** The edges the Screen Agent service is composed from. */

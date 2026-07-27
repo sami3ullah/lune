@@ -123,6 +123,17 @@ export {
 } from "./reasoning/shapeTagParser.js";
 export type { ShapeKind, ShapeStyle } from "./reasoning/shapeTagCanonicalizer.js";
 
+// Mark grounding refinement (the drawing-accuracy fix): the request one refinement call
+// sends (a native-resolution crop + "where exactly is <label>?") and the parse of its
+// reply. The Shell cuts the crop and applies the refined box back to the mark; riding the
+// ordinary Reasoning pipeline gives every Vendor refinement for free.
+export {
+  buildMarkRefinementRequest,
+  parseMarkRefinementReply,
+  type MarkRefinementInput,
+  type RefinedMarkBox,
+} from "./reasoning/markGrounding.js";
+
 // The answer Act Tag parser: reads the trailing [ACT: goal] the advisory turn appends
 // when the user wants Lune to perform an on-screen task, so the Shell can hand the goal
 // to the Screen Agent (DECISIONS #14, advisory->act). The acting counterpart of the

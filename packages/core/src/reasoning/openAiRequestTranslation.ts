@@ -34,6 +34,24 @@ import type {
  */
 const DEFAULT_COMPLETION_TOKENS = 4096;
 
+/**
+ * Whether `modelSlot` accepts the OpenAI-compatible `reasoning_effort` field. Gemini's
+ * OpenAI-compatible surface accepts it on every gemini model, mapping it to a thinking
+ * budget ("low" is the one value every gemini model takes - pro models reject "none").
+ * OpenAI accepts it only on its reasoning families (o-series, gpt-5) and rejects the
+ * request outright on the classic gpt-4 family - which doesn't reason anyway, so
+ * omitting it there loses nothing. The Model Slot is free text, so unknown slots are
+ * conservatively treated as not accepting it: a wrongly-omitted hint costs latency,
+ * but a wrongly-sent field fails the whole call.
+ */
+export function modelSlotAcceptsReasoningEffort(modelSlot: string): boolean {
+  const slot = modelSlot.trim().toLowerCase();
+  if (slot.startsWith("gemini")) {
+    return true;
+  }
+  return /^(gpt-5|o1(?!-mini|-preview)|o3|o4)/.test(slot);
+}
+
 /** Maps one normalized content block onto its OpenAI wire shape. */
 function toOpenAiContentPart(block: PreparedContentBlock): OpenAiContentPart {
   if (block.kind === "image") {
@@ -76,6 +94,11 @@ export function buildOpenAiChatRequest(options: {
     stream: true,
     // The limit travels under whichever field name the Vendor accepts; the other stays unset.
     [tokenLimitField]: request.maxTokens ?? DEFAULT_COMPLETION_TOKENS,
+    // A request asking for minimal hidden reasoning gets the lowest effort the model
+    // accepts; models that reject the field (or don't reason) simply don't get it.
+    ...(request.reasoningEffort === "minimal" && modelSlotAcceptsReasoningEffort(modelSlot)
+      ? { reasoning_effort: "low" as const }
+      : {}),
     messages,
   };
 }
