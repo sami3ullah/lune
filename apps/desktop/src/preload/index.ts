@@ -53,6 +53,20 @@ import {
   type ValidateKeyResponse,
 } from "../ipc/settings";
 import {
+  SKILLS_CREATE_CHANNEL,
+  SKILLS_DELETE_CHANNEL,
+  SKILLS_LIST_CHANNEL,
+  SKILLS_SET_ENABLED_CHANNEL,
+  SKILLS_TOGGLE_CHANNEL,
+  SKILLS_UPDATE_CHANNEL,
+  SkillsSnapshotSchema,
+  type CreateSkillRequest,
+  type DeleteSkillRequest,
+  type SetSkillEnabledRequest,
+  type SkillsSnapshotValue,
+  type UpdateSkillRequest,
+} from "../ipc/skills";
+import {
   OVERLAY_EVENT_CHANNEL,
   OVERLAY_IDLE_CHANNEL,
   OverlayEventSchema,
@@ -219,6 +233,32 @@ const luneBridge = {
       const forward = (): void => listener();
       ipcRenderer.on(CONVERSATIONS_CHANGED_CHANNEL, forward);
       return () => ipcRenderer.removeListener(CONVERSATIONS_CHANGED_CHANNEL, forward);
+    },
+  },
+  skills: {
+    /** Opens the Skills window, or hides it if already open. */
+    toggle(): void {
+      ipcRenderer.send(SKILLS_TOGGLE_CHANNEL);
+    },
+    /** Reads every stored Skill (predefined + user) for the tab, validated on the way in. */
+    async list(): Promise<SkillsSnapshotValue> {
+      return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_LIST_CHANNEL));
+    },
+    /** Creates a new user Skill; resolves with the updated snapshot. */
+    async create(request: CreateSkillRequest): Promise<SkillsSnapshotValue> {
+      return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_CREATE_CHANNEL, request));
+    },
+    /** Edits a user Skill's title/instructions; resolves with the updated snapshot. */
+    async update(request: UpdateSkillRequest): Promise<SkillsSnapshotValue> {
+      return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_UPDATE_CHANNEL, request));
+    },
+    /** Turns one Skill on or off; resolves with the updated snapshot. */
+    async setEnabled(request: SetSkillEnabledRequest): Promise<SkillsSnapshotValue> {
+      return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_SET_ENABLED_CHANNEL, request));
+    },
+    /** Deletes a user Skill; resolves with the updated snapshot. */
+    async delete(request: DeleteSkillRequest): Promise<SkillsSnapshotValue> {
+      return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_DELETE_CHANNEL, request));
     },
   },
   overlay: {

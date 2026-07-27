@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { constants as osConstants } from "node:os";
@@ -56,6 +56,9 @@ import {
 import { ConversationHistoryStore } from "./conversationHistoryStore";
 import { getChatPanelWebContents, toggleChatPanelWindow } from "./chatPanelWindow";
 import { toggleSettingsWindow } from "./settingsWindow";
+import { toggleSkillsWindow } from "./skillsWindow";
+import { SkillsManager, type SkillFileStore } from "./skillsManager";
+import { PREDEFINED_SKILLS } from "./predefinedSkills";
 import {
   SETTINGS_GET_CHANNEL,
   SETTINGS_LIST_MODELS_CHANNEL,
@@ -76,6 +79,19 @@ import {
   ValidateKeyResponseSchema,
 } from "../ipc/settings";
 import { VENDOR_GET_KEY_URLS, SettingsVendorIdSchema } from "../ipc/settings";
+import {
+  SKILLS_CREATE_CHANNEL,
+  SKILLS_DELETE_CHANNEL,
+  SKILLS_LIST_CHANNEL,
+  SKILLS_SET_ENABLED_CHANNEL,
+  SKILLS_TOGGLE_CHANNEL,
+  SKILLS_UPDATE_CHANNEL,
+  CreateSkillRequestSchema,
+  DeleteSkillRequestSchema,
+  SetSkillEnabledRequestSchema,
+  SkillsSnapshotSchema,
+  UpdateSkillRequestSchema,
+} from "../ipc/skills";
 import { SettingsStore } from "./settings/settingsStore";
 import { CredentialStore } from "./settings/credentialStore";
 import { createSettingsService, type SettingsService } from "./settings/settingsService";
@@ -415,6 +431,35 @@ const conversationHistoryStore = new ConversationHistoryStore(
   (path, contents) => writeFileSync(path, contents, "utf8"),
   () => Date.now(),
 );
+
+// The Skills tab's write path (M4-02). The Core owns the model and the injection; the
+// M4-01 wiring above owns the live `skillStore` the conversation reads. This manager owns
+// the *other* half: seeding the predefined starters and persisting the tab's
+// create/edit/toggle/delete as markdown files in the same `skills/` folder, then reloading
+// that shared store so the next turn injects the new set (belt-and-braces with the
+// directory watch, and the sole path on first run before the watch exists). The file seam
+// works in ids (filename stems); all path/`.md` mechanics stay here, out of the manager.
+const skillFileStore: SkillFileStore = {
+  list: () =>
+    existsSync(skillsDirectoryPath)
+      ? readdirSync(skillsDirectoryPath, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
+          .map((entry) => entry.name.slice(0, -3))
+      : [],
+  read: (id) => readFileSync(join(skillsDirectoryPath, `${id}.md`), "utf8"),
+  write: (id, contents) => {
+    mkdirSync(skillsDirectoryPath, { recursive: true });
+    writeFileSync(join(skillsDirectoryPath, `${id}.md`), contents, "utf8");
+  },
+  remove: (id) => {
+    const filePath = join(skillsDirectoryPath, `${id}.md`);
+    if (existsSync(filePath)) {
+      unlinkSync(filePath);
+    }
+  },
+  has: (id) => existsSync(join(skillsDirectoryPath, `${id}.md`)),
+};
+const skillsManager = new SkillsManager(skillFileStore, PREDEFINED_SKILLS, () => skillStore.reload());
 
 // The active conversation the next turn belongs to. Each app launch starts a fresh,
 // unpersisted conversation (minted here, persisted only once its first turn completes),
@@ -1569,6 +1614,31 @@ ipcMain.handle(SETTINGS_REPAIR_CHANNEL, () => SettingsStateSchema.parse(requireS
 ipcMain.handle(SETTINGS_READINESS_CHANNEL, () =>
   ReadinessRowSchema.array().parse(requireSettingsService().readiness()),
 );
+
+// The Skills surface (M4-02): open/close the window from the Pill, and the tab's
+// browse/create/edit/toggle/delete IPC. Each mutating call persists a markdown file,
+// reloads the live SkillStore so the next turn injects the new set, and returns the whole
+// snapshot so the tab re-renders from one consistent view. Every payload is validated on
+// the way in and the snapshot parsed on the way out, so no untyped shape crosses the
+// boundary (developer story 46).
+ipcMain.on(SKILLS_TOGGLE_CHANNEL, () => toggleSkillsWindow());
+ipcMain.handle(SKILLS_LIST_CHANNEL, () => SkillsSnapshotSchema.parse(skillsManager.snapshot()));
+ipcMain.handle(SKILLS_CREATE_CHANNEL, (_event, rawRequest: unknown) => {
+  const request = CreateSkillRequestSchema.parse(rawRequest);
+  return SkillsSnapshotSchema.parse(skillsManager.create(request.title, request.instructions));
+});
+ipcMain.handle(SKILLS_UPDATE_CHANNEL, (_event, rawRequest: unknown) => {
+  const request = UpdateSkillRequestSchema.parse(rawRequest);
+  return SkillsSnapshotSchema.parse(skillsManager.update(request.id, request.title, request.instructions));
+});
+ipcMain.handle(SKILLS_SET_ENABLED_CHANNEL, (_event, rawRequest: unknown) => {
+  const request = SetSkillEnabledRequestSchema.parse(rawRequest);
+  return SkillsSnapshotSchema.parse(skillsManager.setEnabled(request.id, request.enabled));
+});
+ipcMain.handle(SKILLS_DELETE_CHANNEL, (_event, rawRequest: unknown) => {
+  const request = DeleteSkillRequestSchema.parse(rawRequest);
+  return SkillsSnapshotSchema.parse(skillsManager.delete(request.id));
+});
 
 // The onboarding surface's IPC (ticket 14): live-validate + store a Vendor key, start
 // (or resume) the background download, poll its progress, open a "get a key" page, and

@@ -142,6 +142,13 @@ export function Pill() {
               }}
             />
             <MenuButton
+              label="Skills"
+              onClick={() => {
+                setMenuOpen(false);
+                window.lune.skills.toggle();
+              }}
+            />
+            <MenuButton
               label="Settings"
               onClick={() => {
                 setMenuOpen(false);
