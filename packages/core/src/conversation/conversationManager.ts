@@ -19,8 +19,10 @@
  * lives here.
  */
 import { buildConversationRequest } from "./buildConversationRequest.js";
+import { renderActiveSkillsSection } from "../skills/skillInjection.js";
 import type { ScreenCaptureInput } from "../reasoning/chatTypes.js";
 import type { ReasoningCapability } from "../reasoning/reasoningCapability.js";
+import type { Skill } from "../skills/skillTypes.js";
 import type {
   AssistantConversationMessage,
   ChatInputMethod,
@@ -35,6 +37,14 @@ export interface ConversationManagerDependencies {
   reasoningCapability: ReasoningCapability;
   /** Mints a unique id per message (injected so tests get deterministic ids). */
   generateMessageId: () => string;
+  /**
+   * The Skills the user has turned on, read live at the start of each turn (M4-01), so
+   * a Skill toggled between turns takes effect on the next one with no rebuild - just as
+   * {@link ReasoningCapability} re-reads the routing config per turn. When it yields an
+   * empty set (or is omitted), the turn carries no system prompt and each Vendor falls
+   * back to the canonical prompt - the unchanged path for a fresh install.
+   */
+  getActiveSkills?: () => readonly Skill[];
 }
 
 /** One user turn the Shell submits: its text, how it arrived, and this turn's screen context. */
@@ -73,11 +83,21 @@ export interface ConversationManager {
 export function createConversationManager(
   dependencies: ConversationManagerDependencies,
 ): ConversationManager {
-  const { reasoningCapability, generateMessageId } = dependencies;
+  const { reasoningCapability, generateMessageId, getActiveSkills } = dependencies;
 
   // The committed history: only completed user/assistant pairs, so it is always
   // well-formed alternating context for the next turn.
   const committedMessages: ConversationMessage[] = [];
+
+  /**
+   * The active-Skills section appended to this turn's system prompt, read live so a
+   * Skill toggled between turns takes effect on the next one. Empty when nothing is on,
+   * which leaves the request's system prompt undefined and the Vendor's canonical-prompt
+   * fallback in place (the unchanged path for a fresh install).
+   */
+  function resolveSystemSuffix(): string {
+    return renderActiveSkillsSection(getActiveSkills?.() ?? []);
+  }
 
   async function* submitUserTurn(
     input: SubmitUserTurnInput,
@@ -99,6 +119,7 @@ export function createConversationManager(
     const request = buildConversationRequest(
       [...committedMessages, userMessage],
       input.screenshots,
+      resolveSystemSuffix(),
     );
 
     yield { type: "user-message", message: userMessage };

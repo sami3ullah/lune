@@ -48,6 +48,10 @@ _Avoid_: agent mode (v1 term), computer use (as a product name), autopilot
 An inline marker the Reasoning model emits - `[POINT:x,y:label:screenN]` - telling the Overlay to fly the cursor to a screen coordinate and point. Carried from v1, including the canonicalizer that repairs malformed tags and remaps downscaled coordinates. The planned drawing feature (circles, arrows, highlights) extends this same tag grammar.
 _Avoid_: marker, annotation
 
+**Skill**:
+A named, user-editable instruction package that shapes how Lune answers for a class of tasks: markdown instructions plus light metadata (title, on/off, source), stored one file per Skill under userData so they survive restarts and are validated on load. An *active* Skill (one the user has explicitly turned on - the explicit-invocation path; auto-matching and always-on are deferred) is injected into the Reasoning conversation by **appending** its instructions to the canonical system prompt, in a delimited section below the persona and tag grammar. The base always leads and wins on any conflict; a Skill that references a tool Lune doesn't have yet (Task Agent tools, MCP) degrades gracefully, since it is only text bound to no tool and the injected preamble tells the model to do what it can and say what it can't. The Core owns the model, format, load/validate, and injection; the Skills tab (M4-02) is the surface to browse, add, edit, and toggle them.
+_Avoid_: prompt, macro, plugin
+
 **Barge-in**:
 Interrupting Lune while it is speaking: pressing the push-to-talk hotkey during playback stops the voice, aborts the in-flight Reasoning stream (or cancels a running Screen Agent), and starts recording. Carried from v1.
 _Avoid_: interrupt, cut off (as jargon)

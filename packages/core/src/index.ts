@@ -307,6 +307,28 @@ export type {
   CoreConversationEvent,
 } from "./conversation/conversationTypes.js";
 
+// Skills (M4-01): a named, user-editable instruction package injected into the Reasoning
+// conversation when the user turns it on. The Core owns the model, the on-disk markdown
+// format, the load/validate store (filesystem behind an injected seam, like the routing
+// config store), and how an active Skill composes into the system prompt. Storage on disk
+// and the Skills tab UI (M4-02) are the Shell's concern.
+export type { Skill, SkillSource } from "./skills/skillTypes.js";
+export {
+  parseSkillDocument,
+  serializeSkillDocument,
+} from "./skills/skillDocument.js";
+export {
+  loadSkills,
+  SkillStore,
+  type RawSkillFile,
+  type ReadSkillDirectory,
+} from "./skills/skillStore.js";
+export {
+  renderActiveSkillsSection,
+  ACTIVE_SKILLS_SECTION_HEADING,
+  ACTIVE_SKILLS_PREAMBLE,
+} from "./skills/skillInjection.js";
+
 /**
  * Human-readable identifier for this Core build, stamped with the IPC contract
  * version it was compiled against. The Shell surfaces it so the Shell<->Core

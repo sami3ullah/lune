@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createConversationManager } from "../src/conversation/conversationManager.js";
+import { CANONICAL_SYSTEM_PROMPT } from "../src/reasoning/canonicalSystemPrompt.js";
 import type { ReasoningCapability } from "../src/reasoning/reasoningCapability.js";
 import type { CoreChatRequest, CoreChatStreamEvent } from "../src/reasoning/chatTypes.js";
+import type { Skill } from "../src/skills/skillTypes.js";
 import type {
   ConversationMessage,
   CoreConversationEvent,
@@ -259,5 +261,63 @@ describe("conversationManager.loadConversation (ticket 12 - resume/new)", () => 
     // Mutating the original seed after loading must not corrupt committed history.
     seed.push({ id: "leak", role: "assistant", text: "leaked" });
     expect(manager.getMessages()).toHaveLength(1);
+  });
+});
+
+function activeSkill(id: string, title: string, instructions: string): Skill {
+  return { id, title, instructions, enabled: true, source: "user" };
+}
+
+describe("conversationManager Skill injection (M4-01)", () => {
+  it("leaves the turn's system prompt undefined when no Skill is active", async () => {
+    // The explicit-invocation path: with nothing turned on, the request carries no system
+    // prompt, so each Vendor's canonical-prompt fallback wins - unchanged from before M4.
+    const reasoning = stubReasoning({ replies: [["ok"]] });
+    const manager = createConversationManager({
+      reasoningCapability: reasoning,
+      generateMessageId: sequentialIds(),
+      getActiveSkills: () => [],
+    });
+
+    await drain(manager.submitUserTurn({ text: "hi", inputMethod: "text", screenshots: [] }));
+
+    expect(reasoning.requests[0]!.system).toBeUndefined();
+  });
+
+  it("injects an active Skill after the canonical prompt so a stored Skill changes behavior", async () => {
+    const reasoning = stubReasoning({ replies: [["aye"]] });
+    const manager = createConversationManager({
+      reasoningCapability: reasoning,
+      generateMessageId: sequentialIds(),
+      getActiveSkills: () => [activeSkill("pirate", "Pirate", "answer like a pirate")],
+    });
+
+    await drain(manager.submitUserTurn({ text: "hi", inputMethod: "text", screenshots: [] }));
+
+    const system = reasoning.requests[0]!.system;
+    expect(system).toBeDefined();
+    // The persona/grammar leads and the Skill follows it - additive, never a replacement.
+    expect(system!.startsWith(CANONICAL_SYSTEM_PROMPT)).toBe(true);
+    expect(system).toContain("## Pirate");
+    expect(system).toContain("answer like a pirate");
+  });
+
+  it("re-reads active Skills each turn so a toggle takes effect on the next turn", async () => {
+    // The store is live: a Skill turned on between turns injects on the following turn
+    // with no rebuild, matching how the routing config is re-read per turn.
+    const reasoning = stubReasoning({ replies: [["one"], ["two"]] });
+    let active: Skill[] = [];
+    const manager = createConversationManager({
+      reasoningCapability: reasoning,
+      generateMessageId: sequentialIds(),
+      getActiveSkills: () => active,
+    });
+
+    await drain(manager.submitUserTurn({ text: "first", inputMethod: "text", screenshots: [] }));
+    active = [activeSkill("terse", "Terse", "one line only")];
+    await drain(manager.submitUserTurn({ text: "second", inputMethod: "text", screenshots: [] }));
+
+    expect(reasoning.requests[0]!.system).toBeUndefined();
+    expect(reasoning.requests[1]!.system).toContain("one line only");
   });
 });

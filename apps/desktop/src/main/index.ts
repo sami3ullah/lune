@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { constants as osConstants } from "node:os";
@@ -22,10 +22,12 @@ import {
   parseMarkRefinementReply,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
+  SkillStore,
   validateReasoningKey,
   type ComputerUseVendorId,
   type ParsedShape,
   type PointDirective,
+  type RawSkillFile,
   type ReasoningVendorId,
   type ScreenCaptureInput,
   type SpeechCapability,
@@ -333,12 +335,74 @@ function requireOnboardingService(): OnboardingService {
   return onboardingService;
 }
 
+// Skills (M4-01): the user's instruction packages live as markdown files under a
+// `skills/` folder in userData, so they survive restarts and the Skills tab (M4-02) can
+// add/edit/delete them as plain files. The Core owns the format, the load/validate, and
+// how an active Skill composes into the system prompt; the Shell only supplies the
+// directory read. LUNE_SKILLS_DIR overrides the location for dev/tests.
+const skillsDirectoryPath =
+  process.env.LUNE_SKILLS_DIR !== undefined && process.env.LUNE_SKILLS_DIR.trim().length > 0
+    ? process.env.LUNE_SKILLS_DIR
+    : join(app.getPath("userData"), "skills");
+
+// The injected directory-read seam the Core's SkillStore loads from. A missing folder
+// (no Skills yet) reads as the empty set; an unreadable file is skipped so one bad Skill
+// never breaks the load. Only `.md` files are Skills; the id is the filename stem.
+function readSkillDirectory(): RawSkillFile[] {
+  if (!existsSync(skillsDirectoryPath)) {
+    return [];
+  }
+  const files: RawSkillFile[] = [];
+  for (const entry of readdirSync(skillsDirectoryPath, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".md")) {
+      continue;
+    }
+    try {
+      const content = readFileSync(join(skillsDirectoryPath, entry.name), "utf8");
+      // Strip the matched extension (the endsWith(".md") guard above ran case-insensitively).
+      files.push({ id: entry.name.slice(0, -".md".length), content });
+    } catch (error) {
+      console.error(`[lune] could not read skill file ${entry.name}:`, error);
+    }
+  }
+  return files;
+}
+
+// Ensure the folder exists up front, so the directory watch below actually registers on a
+// fresh install (`watch` throws ENOENT on a missing path) - otherwise the first Skill ever
+// added wouldn't reconcile until a restart. It also gives the Skills tab (M4-02) a place to
+// write. A failure here is non-fatal: the store still loads (readSkillDirectory tolerates a
+// missing folder), only live reload is lost.
+try {
+  mkdirSync(skillsDirectoryPath, { recursive: true });
+} catch (error) {
+  console.error("[lune] could not create skills directory:", error);
+}
+
+// The live Skill set the conversation reads each turn.
+const skillStore = new SkillStore(readSkillDirectory);
+
+// Watch the folder so a hand-edit (or a tab write in M4-02) reconciles active Skills
+// without a restart, mirroring the routing-config watch. Guarded on existence in case the
+// mkdir above failed, and in a try/catch so a watch failure never crashes startup.
+if (existsSync(skillsDirectoryPath)) {
+  try {
+    watch(skillsDirectoryPath, () => {
+      skillStore.reload();
+    });
+  } catch (error) {
+    console.error("[lune] could not watch skills directory:", error);
+  }
+}
+
 // Conversation state lives in the Core (ticket 06): the Chat Panel renders the history
 // the manager owns. The manager holds one *active* conversation; the durable set of
 // the last 10 (text only, oldest pruned) is the Shell's ConversationHistoryStore below.
+// Active Skills are read live per turn, so a toggle (M4-02) takes effect on the next turn.
 const conversationManager = createConversationManager({
   reasoningCapability,
   generateMessageId: () => randomUUID(),
+  getActiveSkills: () => skillStore.getActiveSkills(),
 });
 
 // The durable last-10 conversation store (ticket 12): text only, under the app's

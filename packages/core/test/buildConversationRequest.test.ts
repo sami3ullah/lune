@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildConversationRequest } from "../src/conversation/buildConversationRequest.js";
+import { CANONICAL_SYSTEM_PROMPT } from "../src/reasoning/canonicalSystemPrompt.js";
 import type { ConversationMessage } from "../src/conversation/conversationTypes.js";
 import type { ScreenCaptureInput } from "../src/reasoning/chatTypes.js";
 
@@ -47,5 +48,34 @@ describe("buildConversationRequest", () => {
 
   it("returns an empty request when there are no messages", () => {
     expect(buildConversationRequest([], [])).toEqual({ messages: [] });
+  });
+
+  it("leaves the system prompt to the Vendor default when no suffix is given (M4-01)", () => {
+    const request = buildConversationRequest(
+      [{ id: "u1", role: "user", inputMethod: "text", text: "hi" }],
+      [],
+    );
+    // No `system`: each Vendor falls back to CANONICAL_SYSTEM_PROMPT itself.
+    expect(request.system).toBeUndefined();
+  });
+
+  it("appends a non-blank system suffix to the canonical prompt, never overwriting it (M4-01)", () => {
+    const suffix = "=== active skills ===\nalways answer in one short sentence.";
+    const request = buildConversationRequest(
+      [{ id: "u1", role: "user", inputMethod: "text", text: "hi" }],
+      [],
+      suffix,
+    );
+    // The whole persona/grammar prompt leads; the Skills suffix is appended after it.
+    expect(request.system).toBe(`${CANONICAL_SYSTEM_PROMPT}\n\n${suffix}`);
+  });
+
+  it("ignores a blank suffix (whitespace only) so it never dilutes the prompt (M4-01)", () => {
+    const request = buildConversationRequest(
+      [{ id: "u1", role: "user", inputMethod: "text", text: "hi" }],
+      [],
+      "   \n  ",
+    );
+    expect(request.system).toBeUndefined();
   });
 });
