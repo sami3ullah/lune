@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { CaptionData } from "./caption";
+import type { OverlayShape } from "../ipc/overlayControl";
 
 // The Overlay's interaction state (ticket 07). One Overlay window per display runs
 // this store; the main process drives it over IPC (activity, streamed answer text, a
@@ -51,6 +52,14 @@ interface OverlayState {
    * by the mouse. Cleared when playback finishes.
    */
   caption: CaptionData | null;
+  /**
+   * The teaching-overlay shapes currently drawn on this display (M3-02), in window-local
+   * coordinates. Drawn as one set when an answer completes, they persist while Lune
+   * explains and clear on the next turn, on Barge-in, or after the turn goes quiet. Kept
+   * separate from the answering/pointing lifecycle so drawing coexists with the cursor and
+   * the response bubble rather than gating them.
+   */
+  shapes: OverlayShape[];
 
   /** Begins an interaction: clears the previous answer/target and shows the cursor. */
   beginInteraction: () => void;
@@ -76,6 +85,10 @@ interface OverlayState {
   endThinking: () => void;
   /** Sets the caption shown beside the cursor (`null`/empty words clears it). */
   setCaption: (caption: CaptionData | null) => void;
+  /** Replaces the drawn shapes with a fresh set (the turn's teaching drawing). */
+  setShapes: (shapes: OverlayShape[]) => void;
+  /** Clears all drawn shapes (next turn / Barge-in / the explanation went quiet). */
+  clearShapes: () => void;
 }
 
 export const useOverlayStore = create<OverlayState>((set) => ({
@@ -87,6 +100,7 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   listeningLevel: 0,
   thinking: false,
   caption: null,
+  shapes: [],
 
   // Starting an answer clears any lingering listening waveform, but deliberately keeps the
   // thinking spinner up: reasoning has begun, yet Lune is still "working" until it actually
@@ -97,7 +111,7 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   appendAnswer: (text) => set((state) => ({ answerText: state.answerText + text })),
   setPointTarget: (target) => set({ pointTarget: target }),
   endInteraction: () => set({ phase: "ending" }),
-  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0, thinking: false, caption: null }),
+  reset: () => set({ phase: "idle", answerText: "", pointTarget: null, listening: false, listeningLevel: 0, thinking: false, caption: null, shapes: [] }),
   setShowStreamingText: (showStreamingText) => set({ showStreamingText }),
   beginListening: () => set({ listening: true, listeningLevel: 0 }),
   setListeningLevel: (listeningLevel) => set({ listeningLevel }),
@@ -107,4 +121,6 @@ export const useOverlayStore = create<OverlayState>((set) => ({
   endThinking: () => set({ thinking: false }),
   // An empty word list clears the caption (playback finished / stopped).
   setCaption: (caption) => set({ caption: caption !== null && caption.words.length > 0 ? caption : null }),
+  setShapes: (shapes) => set({ shapes }),
+  clearShapes: () => set({ shapes: [] }),
 }));

@@ -16,6 +16,7 @@ import {
   listReasoningModels,
   parseAnswerActTag,
   parseAnswerPointTag,
+  parseAnswerShapeTags,
   PROVISIONING_MANIFEST,
   RoutingConfigStore,
   validateReasoningKey,
@@ -93,6 +94,7 @@ import {
 } from "./screenCapture/captureDisplays";
 import { OverlayWindowManager } from "./overlay/overlayWindows";
 import { planCompletionMessages } from "./overlay/overlayPointing";
+import { planShapeMessages } from "./overlay/overlayShapes";
 import {
   deriveScreenPermissionState,
   type ScreenRecordingAccessStatus,
@@ -848,6 +850,10 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
             turnId,
             messageId: coreEvent.messageId,
           });
+          // A new answer is beginning, so clear the previous turn's teaching drawing
+          // everywhere it may still be up (the "next turn" clear of the shape lifecycle)
+          // before this turn draws its own at completion.
+          overlayManager?.broadcast({ type: "clear-shapes" });
           // Fade the Overlay in for this interaction on the cursor's display.
           if (overlayManager && cursorDisplayId !== undefined) {
             overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-start" });
@@ -882,11 +888,11 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
           // Stream the answer into the Overlay bubble, but only the clean human text, and
           // only when the streaming-text toggle is on.
           if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
-            // Strip both trailing tags (the Act Tag, then the Point Tag) so neither ever
-            // flashes in the response bubble - only the spoken human text is shown.
-            const { displayText } = parseAnswerPointTag(
-              parseAnswerActTag(accumulatedAnswer).displayText,
-            );
+            // Strip all trailing tags (Act, then Point, then the Shape Tags before them) so
+            // none ever flashes in the response bubble - only the spoken human text shows.
+            const actStripped = parseAnswerActTag(accumulatedAnswer).displayText;
+            const pointStripped = parseAnswerPointTag(actStripped).displayText;
+            const { displayText } = parseAnswerShapeTags(pointStripped);
             if (displayText.length > sentCleanLength) {
               overlayManager.sendToDisplay(cursorDisplayId, {
                 type: "answer-delta",
@@ -903,19 +909,24 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
             messageId: coreEvent.messageId,
           });
           {
-            // Read the trailing Act Tag first (the acting goal, if any), then the Point
-            // Tag on the remainder - so both are stripped from the display text and the
-            // acting goal is captured to hand the Screen Agent once the turn commits.
+            // Peel the trailing tags off the completed answer in grammar order: the Act
+            // Tag (the acting goal, if any), then the Point Tag, then the Shape Tags that
+            // sit before them - so each is stripped from the display text, the acting goal
+            // is captured, and the shapes are ready to draw.
             const { displayText: actStripped, actGoal: parsedActGoal } =
               parseAnswerActTag(accumulatedAnswer);
             actGoal = parsedActGoal;
-            const { directive, displayText } = parseAnswerPointTag(actStripped);
+            const { directive, displayText: pointStripped } = parseAnswerPointTag(actStripped);
+            const { displayText, shapes } = parseAnswerShapeTags(pointStripped);
             if (overlayManager && cursorDisplayId !== undefined) {
-              // The full answer has streamed, so its trailing Point Tag (if any) is now
-              // complete. The planner turns the parsed directive + capture geometry into
-              // the exact messages to send (fly to the target on the correct monitor,
-              // then close out), keeping the multi-monitor sequencing in one tested place.
+              // The full answer has streamed, so its trailing tags are now complete. The
+              // pointing planner flies the cursor to the target on the correct monitor and
+              // closes out; the shape planner draws the teaching shapes on their monitors.
+              // Both keep the multi-monitor routing in one tested place.
               for (const message of planCompletionMessages(directive, geometry, cursorDisplayId)) {
+                overlayManager.sendToDisplay(message.displayId, message.event);
+              }
+              for (const message of planShapeMessages(shapes, geometry)) {
                 overlayManager.sendToDisplay(message.displayId, message.event);
               }
             }
@@ -955,6 +966,9 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     if (overlayManager && overlayActive && cursorDisplayId !== undefined) {
       overlayManager.sendToDisplay(cursorDisplayId, { type: "activity-end" });
     }
+    // Clear any teaching drawing at once: a Barge-in (the common abort) should wipe the
+    // previous turn's shapes immediately rather than leave them until the timeout.
+    overlayManager?.broadcast({ type: "clear-shapes" });
     // Halt this turn's speech worker so an interrupted (or failed) turn stops synthesizing
     // and emits no further clips - without this a Barge-in's old turn keeps speaking over
     // the new one. The Pill renderer also ignores a superseded turn's clips by turn id.

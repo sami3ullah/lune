@@ -60,6 +60,36 @@ export const OverlayCursorPositionSchema = z.object({
 export type OverlayCursorPosition = z.infer<typeof OverlayCursorPositionSchema>;
 
 /**
+ * One shape the Overlay should draw while Lune teaches (M3-02), in the target window's
+ * display-local coordinate space - the main process resolves each captured-pixel point
+ * onto the correct monitor and into window-local logical pixels before sending, so the
+ * renderer needs no display geometry (exactly like {@link OverlayPointSchema}).
+ *
+ * `points` are the shape's defining points: `[center]` for a circle (with `radius` in
+ * local pixels), `[start, end]` for every two-point shape (rect/highlight/arrow/line,
+ * `radius` null). `style` carries the stroke pattern, fill, and an optional color; a null
+ * color means the Overlay's default. `kind`, `style`, and the coordinate layout mirror
+ * the Core's `ParsedShape` so the mapping is a straight translation.
+ */
+export const OverlayShapePointSchema = z.object({
+  localX: z.number(),
+  localY: z.number(),
+});
+export const OverlayShapeStyleSchema = z.object({
+  stroke: z.enum(["solid", "dotted", "dashed"]),
+  filled: z.boolean(),
+  color: z.string().nullable(),
+});
+export const OverlayShapeSchema = z.object({
+  kind: z.enum(["circle", "rect", "highlight", "arrow", "line"]),
+  points: z.array(OverlayShapePointSchema),
+  radius: z.number().nullable(),
+  label: z.string(),
+  style: OverlayShapeStyleSchema,
+});
+export type OverlayShape = z.infer<typeof OverlayShapeSchema>;
+
+/**
  * One Overlay event, main -> a single window. Three concerns share the surface:
  *
  * Following (v1 parity): Lune's playful cursor tracks the real mouse. `cursor-move`
@@ -90,6 +120,13 @@ export type OverlayCursorPosition = z.infer<typeof OverlayCursorPositionSchema>;
  * with the spoken reply (the Pill owns playback timing). `words` is the current sentence
  * revealed so far and `id` identifies the sentence (so the reveal restarts per sentence),
  * exactly as in the Pill. An empty `words` array clears it.
+ *
+ * Drawing (M3-02): `draw-shapes` tells this window to draw a set of shapes (the teaching
+ * overlay), which animate on and persist while Lune explains; `clear-shapes` removes them.
+ * Drawing is deliberately independent of the answering/pointing lifecycle above: a turn
+ * may draw without pointing, shapes on another monitor draw without a cursor there, and
+ * the shapes are cleared on the next turn, on Barge-in, or after the explanation goes
+ * quiet - so they ride their own two events rather than the `activity-*` pair.
  */
 export const OverlayEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("cursor-move"), position: OverlayCursorPositionSchema }),
@@ -103,6 +140,8 @@ export const OverlayEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("answer-delta"), text: z.string() }),
   z.object({ type: z.literal("caption"), id: z.string(), words: z.array(z.string()) }),
   z.object({ type: z.literal("point"), point: OverlayPointSchema }),
+  z.object({ type: z.literal("draw-shapes"), shapes: z.array(OverlayShapeSchema) }),
+  z.object({ type: z.literal("clear-shapes") }),
   z.object({ type: z.literal("activity-end") }),
 ]);
 export type OverlayEvent = z.infer<typeof OverlayEventSchema>;

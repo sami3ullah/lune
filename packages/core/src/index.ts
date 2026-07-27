@@ -111,6 +111,18 @@ export {
   type PointDirective,
 } from "./reasoning/pointTagParser.js";
 
+// The teaching-overlay Shape Tag reader (M3-02): splits a finished answer into the clean
+// display text and the shapes the Overlay draws while Lune explains. The canonicalizer
+// (M3-01) repairs the tags into the canonical grammar; this reads them back. Shape kinds,
+// styles, and coordinates travel to the Shell, which maps them onto the right monitor.
+export {
+  parseAnswerShapeTags,
+  type ParsedShape,
+  type ParsedShapeAnswer,
+  type ShapePoint,
+} from "./reasoning/shapeTagParser.js";
+export type { ShapeKind, ShapeStyle } from "./reasoning/shapeTagCanonicalizer.js";
+
 // The answer Act Tag parser: reads the trailing [ACT: goal] the advisory turn appends
 // when the user wants Lune to perform an on-screen task, so the Shell can hand the goal
 // to the Screen Agent (DECISIONS #14, advisory->act). The acting counterpart of the

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import { useOverlayStore } from "./overlayStore";
 import { CaptionReveal } from "./CaptionReveal";
 import type { CaptionData } from "./caption";
+import type { OverlayShape } from "../ipc/overlayControl";
 import {
   arcControlPoint,
   flightDurationMs,
@@ -61,6 +62,18 @@ const ORBIT_MAX_REVOLUTIONS = 0.7;
 const ORBIT_SCALE_PULSE = 0.06;
 /** How long after an answer ends the bubble lingers before clearing (then plain following). */
 const INACTIVITY_CLEAR_MS = 1100;
+/**
+ * How long teaching drawings linger after the turn goes quiet before they fade (the
+ * timeout half of the clear lifecycle). Each caption word bumps `lastActivityRef`, so
+ * while the voice is reading (streaming text on) the drawing stays up for the whole
+ * explanation and only starts this countdown once the caption clears at speech-end - a
+ * touch longer than the bubble's clear, so a shape the voice just described doesn't vanish
+ * the instant the words stop. With streaming text off there is no caption, so the drawing
+ * instead clears this long after it was drawn. On the display that ran the answer the
+ * bubble's `reset` usually clears shapes first; this timer is what clears a drawing on a
+ * *second* monitor that got no cursor or bubble of its own to run that reset.
+ */
+const SHAPE_INACTIVITY_CLEAR_MS = 1600;
 /** How quickly the buddy fades in/out as the cursor enters/leaves this display. */
 const BUDDY_FADE_S = 0.25;
 
@@ -173,8 +186,14 @@ export function Overlay() {
   const endListening = useOverlayStore((state) => state.endListening);
   const beginThinking = useOverlayStore((state) => state.beginThinking);
   const endThinking = useOverlayStore((state) => state.endThinking);
+  const shapes = useOverlayStore((state) => state.shapes);
+  const setShapes = useOverlayStore((state) => state.setShapes);
+  const clearShapes = useOverlayStore((state) => state.clearShapes);
 
   const [showBuddy, setShowBuddy] = useState(false);
+  // A key that changes each time a fresh drawing arrives, so React remounts the shape
+  // marks and re-runs their draw-on animation rather than reconciling them in place.
+  const [shapesGeneration, setShapesGeneration] = useState(0);
   const [cursorFrame, setCursorFrame] = useState<CursorFrame>(() => ({
     x: window.innerWidth / 2,
     y: window.innerHeight / 2,
@@ -240,6 +259,12 @@ export function Overlay() {
   useEffect(() => {
     captionRef.current = caption;
   }, [caption]);
+  // Whether any teaching drawing is currently up, read by the always-on RAF loop so it can
+  // clear the drawing once the turn goes quiet without re-subscribing each frame.
+  const shapesPresentRef = useRef(shapes.length > 0);
+  useEffect(() => {
+    shapesPresentRef.current = shapes.length > 0;
+  }, [shapes]);
 
   // Translate the main process's Overlay events into follow-state + store updates. Only
   // the Overlay surface subscribes; the Pill window never calls this.
@@ -335,6 +360,18 @@ export function Overlay() {
             label: event.point.label,
           });
           break;
+        case "draw-shapes":
+          // A teaching drawing for this display: render it (animating on) and count it as
+          // activity so it isn't cleared until the explanation goes quiet. A fresh
+          // generation forces the marks to remount and replay their draw-on animation.
+          lastActivityRef.current = performance.now();
+          setShapes(event.shapes);
+          setShapesGeneration((generation) => generation + 1);
+          break;
+        case "clear-shapes":
+          // The next turn began, or a Barge-in interrupted: remove the drawing at once.
+          clearShapes();
+          break;
         case "activity-end":
           lastActivityRef.current = performance.now();
           endInteraction();
@@ -352,6 +389,8 @@ export function Overlay() {
     beginThinking,
     endThinking,
     setCaption,
+    setShapes,
+    clearShapes,
   ]);
 
   // Start a flight whenever a (new) pointing target arrives, from wherever the buddy
@@ -548,12 +587,28 @@ export function Overlay() {
         reset();
       }
 
+      // Clear a teaching drawing once the turn has gone quiet. This is deliberately
+      // independent of the buddy's phase above: a drawing on a second monitor runs no
+      // answer or pointing of its own, so that window never enters "ending" and its
+      // `reset` never fires - but it still received the broadcast caption, so gating on the
+      // caption (plus a linger) clears it in step with the spoken explanation everywhere. A
+      // next turn or Barge-in clears it sooner via the `clear-shapes` event.
+      if (
+        shapesPresentRef.current &&
+        captionRef.current === null &&
+        now - lastActivityRef.current > SHAPE_INACTIVITY_CLEAR_MS
+      ) {
+        // Guard against re-entry until the store update propagates back to the ref.
+        shapesPresentRef.current = false;
+        clearShapes();
+      }
+
       rafId = requestAnimationFrame(renderFrame);
     };
 
     rafId = requestAnimationFrame(renderFrame);
     return () => cancelAnimationFrame(rafId);
-  }, [reset]);
+  }, [reset, clearShapes]);
 
   // The listening waveform and thinking spinner sit right at the real mouse point, not at
   // the buddy's offset spot beside it (the triangle sits offset so its tip hugs the cursor;
@@ -566,26 +621,33 @@ export function Overlay() {
   };
 
   return (
-    <motion.div
-      className="pointer-events-none fixed inset-0 overflow-hidden"
-      animate={{ opacity: showBuddy ? 1 : 0 }}
-      transition={{ duration: BUDDY_FADE_S, ease: "easeOut" }}
-    >
-      {listening ? (
-        <ListeningWaveform level={listeningLevel} anchor={cursorAtMouse} />
-      ) : thinking ? (
-        // Transcribing + reasoning: the spinner replaces the triangle right at the mouse
-        // (like v1's processing state) so the user sees Lune is working, not stalled.
-        <ProcessingSpinner anchor={cursorAtMouse} />
-      ) : (
-        <>
-          <PlayfulCursor frame={cursorFrame} />
-          {/* The spoken reply, revealed word by word in step with the voice - the same
-              reveal the Pill shows, mirrored here beside the mouse (mirrors pillStore). */}
-          {caption !== null && <CaptionBubble caption={caption} anchor={cursorFrame} />}
-        </>
-      )}
-    </motion.div>
+    <>
+      {/* The teaching drawings sit in their own click-through layer, beneath the buddy, so
+          they coexist with the cursor and the response bubble and follow their own draw /
+          clear lifecycle rather than the buddy's fade. Always mounted; renders nothing when
+          there is no drawing. */}
+      <ShapeLayer shapes={shapes} generation={shapesGeneration} />
+      <motion.div
+        className="pointer-events-none fixed inset-0 overflow-hidden"
+        animate={{ opacity: showBuddy ? 1 : 0 }}
+        transition={{ duration: BUDDY_FADE_S, ease: "easeOut" }}
+      >
+        {listening ? (
+          <ListeningWaveform level={listeningLevel} anchor={cursorAtMouse} />
+        ) : thinking ? (
+          // Transcribing + reasoning: the spinner replaces the triangle right at the mouse
+          // (like v1's processing state) so the user sees Lune is working, not stalled.
+          <ProcessingSpinner anchor={cursorAtMouse} />
+        ) : (
+          <>
+            <PlayfulCursor frame={cursorFrame} />
+            {/* The spoken reply, revealed word by word in step with the voice - the same
+                reveal the Pill shows, mirrored here beside the mouse (mirrors pillStore). */}
+            {caption !== null && <CaptionBubble caption={caption} anchor={cursorFrame} />}
+          </>
+        )}
+      </motion.div>
+    </>
   );
 }
 
@@ -747,6 +809,186 @@ function ProcessingSpinner({ anchor }: { anchor: CursorFrame }) {
         />
       </motion.svg>
     </motion.div>
+  );
+}
+
+/**
+ * The teaching palette default - the same indigo the cursor glows in, so a drawing reads
+ * as the same hand that flies the cursor. The model can override it per shape.
+ */
+const DEFAULT_SHAPE_COLOR = "#a5b4fc";
+const SHAPE_STROKE_WIDTH = 3;
+/** How long a stroked outline takes to draw on, and the ease - a confident, playful stroke. */
+const SHAPE_DRAW_SECONDS = 0.55;
+const SHAPE_DRAW_EASE = [0.22, 0.61, 0.36, 1] as const;
+/** How long the arrowhead's barbs are, in local pixels. */
+const ARROW_HEAD_LENGTH_PX = 14;
+/** Half the angle between the two arrowhead barbs. */
+const ARROW_HEAD_SPREAD_RAD = Math.PI / 7;
+
+/** The dash pattern for a stroke style, or undefined for a solid stroke. */
+function strokeDashArray(stroke: OverlayShape["style"]["stroke"]): string | undefined {
+  if (stroke === "dotted") {
+    return "1 7";
+  }
+  if (stroke === "dashed") {
+    return "10 9";
+  }
+  return undefined;
+}
+
+/** Builds the arrow's stroke path: the shaft plus a two-barb head at the end point. */
+function arrowPath(start: OverlayShapePoint, end: OverlayShapePoint): string {
+  const angle = Math.atan2(end.localY - start.localY, end.localX - start.localX);
+  const barb = (offset: number) => ({
+    x: end.localX - ARROW_HEAD_LENGTH_PX * Math.cos(angle + offset),
+    y: end.localY - ARROW_HEAD_LENGTH_PX * Math.sin(angle + offset),
+  });
+  const left = barb(-ARROW_HEAD_SPREAD_RAD);
+  const right = barb(ARROW_HEAD_SPREAD_RAD);
+  return (
+    `M ${start.localX} ${start.localY} L ${end.localX} ${end.localY} ` +
+    `M ${left.x} ${left.y} L ${end.localX} ${end.localY} L ${right.x} ${right.y}`
+  );
+}
+
+type OverlayShapePoint = OverlayShape["points"][number];
+
+/**
+ * The teaching-drawing layer: a full-window, click-through SVG that renders the shapes the
+ * model asked for, each animating on (drawn, not blinked) and animating out when the
+ * drawing is cleared. One layer per Overlay window; the shapes already carry this window's
+ * local pixels. Keyed by generation so a fresh drawing remounts and replays its animation.
+ */
+function ShapeLayer({ shapes, generation }: { shapes: OverlayShape[]; generation: number }) {
+  return (
+    <svg className="pointer-events-none fixed inset-0 h-full w-full overflow-visible" aria-hidden>
+      <AnimatePresence>
+        {shapes.map((shape, index) => (
+          <ShapeMark key={`${generation}-${index}`} shape={shape} />
+        ))}
+      </AnimatePresence>
+    </svg>
+  );
+}
+
+/**
+ * One drawn shape. A solid outline draws on via `pathLength` (the stroke traces itself);
+ * a dashed/dotted or filled shape grows and fades in instead, because `pathLength` drives
+ * the same `strokeDasharray` a dash pattern needs - both read as drawn, never a blink. All
+ * shapes fade out when cleared. Coordinates are already in this window's local pixels.
+ */
+function ShapeMark({ shape }: { shape: OverlayShape }) {
+  const color = shape.style.color ?? DEFAULT_SHAPE_COLOR;
+  const isHighlight = shape.kind === "highlight";
+  const canDrawOn = shape.style.stroke === "solid" && !shape.style.filled && !isHighlight;
+
+  const glow = `drop-shadow(0 0 4px ${color})`;
+  const motionProps = canDrawOn
+    ? {
+        // A solid outline traces itself on, the closest thing to a drawn stroke.
+        initial: { pathLength: 0, opacity: 0 },
+        animate: { pathLength: 1, opacity: 1 },
+        exit: { opacity: 0 },
+        transition: {
+          pathLength: { duration: SHAPE_DRAW_SECONDS, ease: SHAPE_DRAW_EASE },
+          opacity: { duration: 0.2 },
+        },
+        style: { filter: glow },
+      }
+    : isHighlight
+      ? {
+          // A highlight sweeps in from the left, like dragging a marker across the text.
+          initial: { opacity: 0, scaleX: 0 },
+          animate: { opacity: 1, scaleX: 1 },
+          exit: { opacity: 0 },
+          transition: {
+            scaleX: { duration: 0.4, ease: SHAPE_DRAW_EASE },
+            opacity: { duration: 0.2 },
+          },
+          style: {
+            filter: glow,
+            transformBox: "fill-box" as const,
+            transformOrigin: "left" as const,
+          },
+        }
+      : {
+          // A dashed/dotted or filled shape can't trace via pathLength (that drives the
+          // same strokeDasharray the pattern needs), so it grows and fades in instead -
+          // still an entrance, never an instant blink.
+          initial: { opacity: 0, scale: 0.85 },
+          animate: { opacity: 1, scale: 1 },
+          exit: { opacity: 0, scale: 0.92 },
+          transition: { type: "spring" as const, stiffness: 260, damping: 22 },
+          style: {
+            filter: glow,
+            transformBox: "fill-box" as const,
+            transformOrigin: "center" as const,
+          },
+        };
+
+  const strokeProps = {
+    stroke: color,
+    strokeWidth: SHAPE_STROKE_WIDTH,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    strokeDasharray: strokeDashArray(shape.style.stroke),
+  };
+
+  if (shape.kind === "circle") {
+    const center = shape.points[0];
+    if (center === undefined) {
+      return null;
+    }
+    return (
+      <motion.circle
+        {...motionProps}
+        {...strokeProps}
+        cx={center.localX}
+        cy={center.localY}
+        r={shape.radius ?? 0}
+        fill={shape.style.filled ? color : "none"}
+        fillOpacity={shape.style.filled ? 0.16 : undefined}
+      />
+    );
+  }
+
+  const [start, end] = shape.points;
+  if (start === undefined || end === undefined) {
+    return null;
+  }
+
+  if (shape.kind === "rect" || isHighlight) {
+    return (
+      <motion.rect
+        {...motionProps}
+        {...strokeProps}
+        x={Math.min(start.localX, end.localX)}
+        y={Math.min(start.localY, end.localY)}
+        width={Math.abs(end.localX - start.localX)}
+        height={Math.abs(end.localY - start.localY)}
+        rx={isHighlight ? 4 : 8}
+        stroke={isHighlight ? "none" : color}
+        fill={isHighlight || shape.style.filled ? color : "none"}
+        fillOpacity={isHighlight ? 0.28 : shape.style.filled ? 0.16 : undefined}
+      />
+    );
+  }
+
+  if (shape.kind === "arrow") {
+    return <motion.path {...motionProps} {...strokeProps} d={arrowPath(start, end)} fill="none" />;
+  }
+
+  // line
+  return (
+    <motion.line
+      {...motionProps}
+      {...strokeProps}
+      x1={start.localX}
+      y1={start.localY}
+      x2={end.localX}
+      y2={end.localY}
+    />
   );
 }
 
