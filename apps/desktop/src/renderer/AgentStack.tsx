@@ -113,6 +113,15 @@ function AgentCardView({ view, onDismiss }: { view: AgentCardView; onDismiss: ()
     }
   }, [openable, onDismiss]);
 
+  const handleRetry = useCallback(() => {
+    // Re-run the same goal in the background. The new run opens its own card via the event
+    // stream, so the spent failed card is cleared to avoid two cards for one intent.
+    if (view.goal.trim().length > 0) {
+      void window.lune.taskAgent.start({ goal: view.goal });
+    }
+    onDismiss();
+  }, [view.goal, onDismiss]);
+
   return (
     <motion.div
       layout
@@ -161,6 +170,20 @@ function AgentCardView({ view, onDismiss }: { view: AgentCardView; onDismiss: ()
               {view.activityHint}
             </div>
           )}
+        </div>
+      ) : view.retryable ? (
+        // A failed run: offer a one-tap re-run of the same goal (M6-03), so a mid-way failure
+        // isn't a dead end the user has to re-ask by voice.
+        <div className="mt-3 flex items-center gap-2.5">
+          <button
+            type="button"
+            onClick={handleRetry}
+            className="rounded-lg px-3 py-1 text-xs font-semibold text-neutral-950 transition hover:brightness-110"
+            style={{ backgroundColor: tone }}
+          >
+            Try again
+          </button>
+          <span className="truncate text-[11px] text-neutral-500">we&apos;ll run it again in the background</span>
         </div>
       ) : (
         openable !== null &&

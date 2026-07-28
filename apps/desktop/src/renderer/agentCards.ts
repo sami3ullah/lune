@@ -34,6 +34,15 @@ export interface AgentCard {
   artifact?: TaskAgentArtifact;
   /** The readable failure reason, present only when `status` is `failed`. */
   error?: string;
+  /**
+   * Whether the run's most recent tool call errored. A Task Agent treats a tool failure (an
+   * expired integration sign-in, a rate limit) as recoverable - the model reacts and the
+   * Session can still settle `succeeded` with an apologetic summary rather than `failed`. This
+   * flag lets a finished card tell "did the thing" from "tried but the last step failed", so
+   * an incomplete success can still offer a retry (M6-03 acceptance). Overwritten by each
+   * tool-result, so a later success clears an earlier failure.
+   */
+  lastToolErrored?: boolean;
 }
 
 /** Upserts the card for a session, applying a patch (and creating it if new). */
@@ -81,8 +90,10 @@ export function reduceAgentCards(
     case "tool-call":
       return upsert(cards, event.sessionId, (card) => ({ ...card, activity: describeToolCall(event.toolName, event.input) }), seed);
     case "tool-result":
-      // The activity line already reflects the call; a result doesn't change what's shown.
-      return upsert(cards, event.sessionId, (card) => card, seed);
+      // The activity line already reflects the call; a result doesn't change what's shown - but
+      // the card remembers whether this latest tool errored, so a finished-but-incomplete run
+      // (the last step failed) can still offer a retry.
+      return upsert(cards, event.sessionId, (card) => ({ ...card, lastToolErrored: event.isError }), seed);
     case "succeeded":
       return upsert(cards, event.sessionId, (card) => ({ ...card, status: "succeeded", result: event.result, artifact: event.artifact, narration: undefined, activity: undefined }), seed);
     case "failed":
@@ -217,6 +228,12 @@ export interface AgentCardView {
   isTerminal: boolean;
   /** The open target when the card is a finished success with something to open; else `null`. */
   openable: ResultTarget | null;
+  /**
+   * Whether the card offers a retry - true only for a failed run, so a mid-way failure (an
+   * expired sign-in, a rate limit) is a readable dead end the user can re-run with one tap
+   * (M6-03 acceptance) rather than having to re-ask by voice. Retry re-starts the same goal.
+   */
+  retryable: boolean;
 }
 
 /** The short status pill per lifecycle state. */
@@ -242,6 +259,9 @@ export function deriveCardView(card: AgentCard): AgentCardView {
     goal: card.goal,
     status: card.status,
     badge: STATUS_BADGE[card.status],
+    // Default: no retry. Only a dead-end failure (below) and a finished-but-incomplete success
+    // override this, so a new lifecycle state can't silently inherit the wrong affordance.
+    retryable: false,
   };
   switch (card.status) {
     case "running": {
@@ -259,6 +279,10 @@ export function deriveCardView(card: AgentCard): AgentCardView {
       // from the prose summary, which the agent is told to keep free of paths and jargon.
       const openable = card.artifact ?? (result.trim().length > 0 ? classifyResult(result) : null);
       const canOpen = openable !== null && openable.kind !== "summary";
+      // A success that produced nothing to open AND whose last tool errored is an "incomplete"
+      // finish - the run tried the action (add to the sheet) and the last step failed. Offer a
+      // retry there too, so the acceptance's mid-run auth/rate-limit failures aren't dead ends.
+      const incomplete = !canOpen && card.lastToolErrored === true;
       return {
         ...base,
         tone: "done",
@@ -274,6 +298,7 @@ export function deriveCardView(card: AgentCard): AgentCardView {
           : null,
         isTerminal: true,
         openable,
+        retryable: incomplete,
       };
     }
     case "failed":
@@ -285,6 +310,7 @@ export function deriveCardView(card: AgentCard): AgentCardView {
         invitation: null,
         isTerminal: true,
         openable: null,
+        retryable: true,
       };
     case "cancelled":
       return {

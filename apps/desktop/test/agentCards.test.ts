@@ -76,6 +76,15 @@ describe("reduceAgentCards", () => {
     expect(other[0]).toMatchObject({ status: "cancelled" });
   });
 
+  it("remembers whether the last tool call errored, and a later success clears it", () => {
+    let cards = reduceAgentCards([], started("a", "g"));
+    cards = reduceAgentCards(cards, { type: "tool-result", sessionId: "a", step: 1, toolCallId: "t1", toolName: "mcp_sheets_create_spreadsheet", output: "sign-in expired", isError: true });
+    expect(cards[0]!.lastToolErrored).toBe(true);
+    // A subsequent successful tool result flips it back - the run recovered.
+    cards = reduceAgentCards(cards, { type: "tool-result", sessionId: "a", step: 2, toolCallId: "t2", toolName: "web_search", output: "ok", isError: false });
+    expect(cards[0]!.lastToolErrored).toBe(false);
+  });
+
   it("does not mutate the previous card list", () => {
     const before = reduceAgentCards([], started("a", "g"));
     const after = reduceAgentCards(before, { type: "step-started", sessionId: "a", step: 1 });
@@ -222,5 +231,62 @@ describe("deriveCardView", () => {
     expect(view.badge).toBe("Failed");
     expect(view.detail).toContain("credentials");
     expect(view.openable).toBeNull();
+  });
+
+  it("offers a clickable Open link for a sheet URL artifact (the flagship result)", () => {
+    // The Sheets MCP tool produced an http url artifact; the card must offer to open it in the
+    // browser, name the sheet in its ready line, and invite the click (M6-03 clickable result).
+    const view = deriveCardView({
+      sessionId: "a",
+      goal: "research creators and add to a google sheet",
+      status: "succeeded",
+      step: 4,
+      result: "All done - your Google Sheet with the top 20 TikTok creators is ready.",
+      artifact: { kind: "url", url: "https://docs.google.com/spreadsheets/d/abc123/edit" },
+    });
+    expect(view.openable).toEqual({ kind: "url", url: "https://docs.google.com/spreadsheets/d/abc123/edit" });
+    expect(view.detail).toBe("docs.google.com is ready");
+    expect(view.invitation).toBe("it's open in your browser");
+    expect(view.retryable).toBe(false);
+  });
+
+  it("makes a failed card retryable and keeps its goal, so a mid-way failure re-runs in one tap", () => {
+    // Acceptance: a failure (auth expiry, rate limit) is a readable card state WITH retry.
+    const view = deriveCardView({
+      sessionId: "a",
+      goal: "research creators and add to a google sheet",
+      status: "failed",
+      step: 2,
+      error: "HTTP 429 - rate limited",
+    });
+    expect(view.retryable).toBe(true);
+    expect(view.detail).toBe("HTTP 429 - rate limited");
+    // The goal rides on the view so the surface can re-start it verbatim.
+    expect(view.goal).toBe("research creators and add to a google sheet");
+  });
+
+  it("offers retry on an incomplete success: the last step failed and produced nothing to open", () => {
+    // The named acceptance failure: a Sheets sign-in expired mid-run, the agent recovered to a
+    // succeeded state with an apologetic summary and no artifact - still a retryable dead end.
+    const view = deriveCardView({
+      sessionId: "a",
+      goal: "add creators to a google sheet",
+      status: "succeeded",
+      step: 3,
+      result: "I researched the creators but couldn't add them - your Google sign-in needs renewing.",
+      lastToolErrored: true,
+    });
+    expect(view.retryable).toBe(true);
+    expect(view.openable).toMatchObject({ kind: "summary" });
+    expect(view.detail).toContain("sign-in");
+  });
+
+  it("never offers retry for a clean success, a running, or a cancelled card", () => {
+    // A clean answer (no failed tool along the way) is not a retry candidate.
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "succeeded", step: 1, result: "it's sunny" }).retryable).toBe(false);
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "running", step: 1 }).retryable).toBe(false);
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "cancelled", step: 1 }).retryable).toBe(false);
+    // Even an artifactless success that DIDN'T hit a tool error stays non-retryable.
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "succeeded", step: 1, result: "done", lastToolErrored: false }).retryable).toBe(false);
   });
 });
