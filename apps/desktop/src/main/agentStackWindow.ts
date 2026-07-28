@@ -113,13 +113,11 @@ function createAgentStackWindow(): BrowserWindow {
     },
   });
 
-  // Always-on-top and on every Space (incl. over full-screen apps) so background work stays
-  // glanceable wherever the user is - but at the "floating" level, deliberately *below* macOS
-  // notification banners. The stack pins to the same top-right corner the banners drop into,
-  // and the completion banner must land on top of the card, not behind it; the higher
-  // "screen-saver" level the Pill/Overlay use would cover the banner (they never share that
-  // corner, so it doesn't bite them).
-  window.setAlwaysOnTop(true, "floating");
+  // Above full-screen apps and on every Space, so background work stays glanceable wherever
+  // the user is working - matching the Pill and Overlay. (Lune fires no OS notification on
+  // completion - the on-screen card and its chime are the signal - so nothing needs to render
+  // above the stack in this corner.)
+  window.setAlwaysOnTop(true, "screen-saver");
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   if (process.env.ELECTRON_RENDERER_URL) {

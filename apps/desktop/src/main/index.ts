@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch, wr
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { constants as osConstants } from "node:os";
-import { app, BrowserWindow, ipcMain, nativeImage, Notification, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, nativeImage, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
   buildMarkRefinementRequest,
   createAnthropicComputerUseAdapter,
@@ -73,6 +73,8 @@ import {
 } from "./agentStackWindow";
 import {
   AGENT_STACK_OPEN_RESULT_CHANNEL,
+  AGENT_STACK_RESEED_CHANNEL,
+  AGENT_STACK_REVEAL_CHANNEL,
   AGENT_STACK_SNAPSHOTS_CHANNEL,
   OpenAgentResultRequestSchema,
   type OpenAgentResultRequest,
@@ -570,25 +572,6 @@ let taskAgentRuntime: TaskAgentRuntime | null = null;
 /** Maps one native Task Agent event to its wire form (the `started` event stamps the IPC version). */
 function toWireTaskAgentEvent(event: TaskAgentEvent): TaskAgentStreamEvent {
   return event.type === "started" ? { ...event, ipcVersion: LUNE_IPC_VERSION } : event;
-}
-
-/**
- * Fires the completion notification for a settled Task Agent ("done brewing" on success), so
- * the user - who has been working elsewhere - learns their background work finished. Clicking
- * it brings the Agent Stack to the foreground. Best-effort: a no-op where notifications aren't
- * supported.
- */
-function notifyTaskAgentComplete(sessionId: string, succeeded: boolean): void {
-  if (!Notification.isSupported()) {
-    return;
-  }
-  const goal = taskAgentRuntime?.get(sessionId)?.goal ?? "your task";
-  const notification = new Notification({
-    title: succeeded ? "done brewing" : "couldn't finish",
-    body: goal,
-  });
-  notification.on("click", () => revealAgentStackWindow());
-  notification.show();
 }
 
 /** Opens a finished agent's produced artifact: reveal a file in its default app, or open a URL. */
@@ -2196,17 +2179,15 @@ void app.whenReady().then(() => {
   taskAgentRuntime = taskAgent;
 
   // Bridge the runtime to the Agent Stack surface (M5-03): forward every session's events to
-  // the stack window (creating it on the first agent so its cards appear), and fire a
-  // completion notification when one settles. The renderer folds the stream into cards; it
-  // seeds from `list()` on mount so a window opened mid-flight still shows running agents.
+  // the stack window (creating it on the first agent so its cards appear). The renderer folds
+  // the stream into cards; it seeds from `list()` on mount so a window opened mid-flight still
+  // shows running agents. Completion is signalled by the card settling (and its soft chime) -
+  // no OS notification, since the on-screen stack already tells the user it's done.
   taskAgent.subscribe((event) => {
     if (event.type === "started") {
       ensureAgentStackWindow();
     }
     getAgentStackWebContents()?.send(TASK_AGENT_EVENT_CHANNEL, toWireTaskAgentEvent(event));
-    if (event.type === "succeeded" || event.type === "failed") {
-      notifyTaskAgentComplete(event.sessionId, event.type === "succeeded");
-    }
   });
   ipcMain.handle(TASK_AGENT_START_CHANNEL, (_event, rawRequest) => {
     const handle = taskAgent.start(StartTaskAgentRequestSchema.parse(rawRequest));
@@ -2224,6 +2205,15 @@ void app.whenReady().then(() => {
       return;
     }
     openAgentResult(parsed.data);
+  });
+  // The Pill's "Background tasks" entry: bring the stack back and re-seed it, so a user who
+  // dismissed the cards still finds their background work. Reveal (ensure + show) first, then
+  // ask the surface to re-seed from the runtime's current snapshots - restoring sessions that
+  // were dismissed from the stack but are still tracked. A freshly created window seeds itself
+  // on mount, so the extra reseed is harmless there.
+  ipcMain.on(AGENT_STACK_REVEAL_CHANNEL, () => {
+    revealAgentStackWindow();
+    getAgentStackWebContents()?.send(AGENT_STACK_RESEED_CHANNEL);
   });
 
   // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the

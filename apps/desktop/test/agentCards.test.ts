@@ -206,6 +206,8 @@ describe("deriveCardView", () => {
     });
     expect(view.openable).toEqual({ kind: "file", path: "/Users/me/Documents/Lune/creators.xlsx" });
     expect(view.invitation).not.toBeNull();
+    // The card stays short: a "ready" line naming the file, not the whole paragraph.
+    expect(view.detail).toBe("creators.xlsx is ready");
   });
 
   it("offers no invitation when a success has nothing openable to show", () => {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { StateIndicator, labelForState } from "./StateIndicator";
 import { PILL_INDICATOR_STATES, usePillStore, type PillIndicatorState } from "./pillStore";
@@ -6,6 +6,7 @@ import { ScreenAccessSection } from "./ScreenAccessSection";
 import { MicAccessSection } from "./MicAccessSection";
 import { useSpeechPlayback } from "./useSpeechPlayback";
 import { useVoiceRecording } from "./useVoiceRecording";
+import { useBackgroundTasks } from "./useBackgroundTasks";
 
 // The Pill: Lune's home surface (ticket 04). A thin always-on-top bar, fixed in place,
 // that expands into its menu on click. The window is frameless
@@ -30,6 +31,11 @@ export function Pill() {
   // Lune is speaking: the pill collapses to just the waveform. The reply text itself shows
   // only at the cursor, never in the pill. (The user's own voice does NOT show a waveform.)
   const speaking = indicatorState === "speaking";
+
+  // Background Task Agents: the Pill is their durable home, so a user who dismissed the stack
+  // cards can still find (and re-open) their work here. A live badge counts running agents; the
+  // menu entry brings the stack back.
+  const { runningCount, totalCount } = useBackgroundTasks();
 
   // The pill is fixed in place (not draggable) and opens its menu on click. The bar is a
   // normal (no-drag) element so the click reliably registers - a `-webkit-app-region: drag`
@@ -88,12 +94,13 @@ export function Pill() {
     });
   }, []);
 
-  // Re-measure whenever the menu opens/closes AND whenever the pill's content switches
-  // between the "Lune" label and the speaking waveform, so the frameless window resizes to
-  // match with no dead click region.
+  // Re-measure whenever the menu opens/closes, whenever the pill's content switches between the
+  // "Lune" label and the speaking waveform, AND whenever the background-task badge/entry appears
+  // or its count changes width - so the frameless window always resizes to match with no dead
+  // click region and no clipped badge.
   useLayoutEffect(() => {
     reportContentSize();
-  }, [menuOpen, speaking, reportContentSize]);
+  }, [menuOpen, speaking, runningCount, totalCount, reportContentSize]);
 
   return (
     <div ref={wrapperRef} className="app-no-drag inline-flex flex-col items-center">
@@ -117,6 +124,9 @@ export function Pill() {
           <>
             <StateIndicator state={indicatorState} />
             <span className="text-sm font-medium tracking-wide">Lune</span>
+            {/* A live count of running background agents, so the user knows work is underway
+                even with the stack cards dismissed. Tapping the pill opens the menu to reach it. */}
+            {runningCount > 0 && <BackgroundTaskBadge count={runningCount} />}
           </>
         )}
       </motion.div>
@@ -132,6 +142,24 @@ export function Pill() {
             exit={{ opacity: 0, y: -10, scale: 0.9 }}
             transition={{ type: "spring", stiffness: 520, damping: 24, mass: 0.8 }}
           >
+            {/* Background tasks live here so they outlast their stack cards: even after the
+                cards are dismissed, this brings the stack back with every tracked session. Shown
+                only when there's something to find. */}
+            {totalCount > 0 && (
+              <MenuButton
+                label="Background tasks"
+                badge={
+                  <TaskCountChip
+                    label={runningCount > 0 ? `${runningCount} running` : `${totalCount}`}
+                    active={runningCount > 0}
+                  />
+                }
+                onClick={() => {
+                  setMenuOpen(false);
+                  window.lune.agentStack.reveal();
+                }}
+              />
+            )}
             {/* Opening a window collapses the menu behind it, so the Settings/Chat Panel
                 surface never sits atop a leftover pill menu. */}
             <MenuButton
@@ -205,16 +233,43 @@ function PillVoiceWave({ color, prominent = false }: { color: string; prominent?
   );
 }
 
-/** A live menu row - pointer cursor, hover highlight, real action. */
-function MenuButton({ label, onClick }: { label: string; onClick: () => void }) {
+/** A live menu row - pointer cursor, hover highlight, real action, and an optional trailing badge. */
+function MenuButton({ label, onClick, badge }: { label: string; onClick: () => void; badge?: ReactNode }) {
   return (
     <button
       type="button"
       onClick={onClick}
       className="app-no-drag flex w-full cursor-pointer items-center rounded-xl px-3 py-2 text-left text-sm text-neutral-100 transition hover:bg-white/10"
     >
-      {label}
+      <span className="flex-1">{label}</span>
+      {badge}
     </button>
+  );
+}
+
+/** The pill-bar badge counting running background agents - a soft amber pulse matching the stack. */
+function BackgroundTaskBadge({ count }: { count: number }) {
+  return (
+    <motion.span
+      className="flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none"
+      style={{ backgroundColor: "#fbbf2433", color: "#fbbf24" }}
+      animate={{ opacity: [1, 0.55, 1] }}
+      transition={{ duration: 1.8, repeat: Infinity, ease: "easeInOut" }}
+    >
+      {count}
+    </motion.span>
+  );
+}
+
+/** The count chip in the "Background tasks" menu row: amber while work runs, muted once idle. */
+function TaskCountChip({ label, active }: { label: string; active: boolean }) {
+  return (
+    <span
+      className="rounded-full px-2 py-0.5 text-[10px] font-semibold"
+      style={active ? { backgroundColor: "#fbbf2433", color: "#fbbf24" } : { backgroundColor: "#ffffff1a", color: "#a3a3a3" }}
+    >
+      {label}
+    </span>
   );
 }
 

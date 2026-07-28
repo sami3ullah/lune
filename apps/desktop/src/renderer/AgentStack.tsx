@@ -35,14 +35,22 @@ export function AgentStack() {
   // A live `succeeded` also plays the soft completion chime - only for events that actually
   // stream in, never the already-finished sessions the seed backfills on mount.
   useEffect(() => {
-    const unsubscribe = window.lune.taskAgent.onTaskAgentEvent((event) => {
+    const unsubscribeEvents = window.lune.taskAgent.onTaskAgentEvent((event) => {
       if (event.type === "succeeded") {
         playCompletionChime();
       }
       applyEvent(event);
     });
+    // Revealed from the Pill: re-seed from the runtime's current snapshots so sessions the user
+    // dismissed from the stack (but that are still tracked) reappear rather than staying hidden.
+    const unsubscribeReseed = window.lune.agentStack.onReseed(() => {
+      void window.lune.taskAgent.list().then(seed);
+    });
     void window.lune.taskAgent.list().then(seed);
-    return unsubscribe;
+    return () => {
+      unsubscribeEvents();
+      unsubscribeReseed();
+    };
   }, [applyEvent, seed]);
 
   // The main process sizes the frameless window to whatever we render and hides it when the

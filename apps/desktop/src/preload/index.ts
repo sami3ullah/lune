@@ -18,6 +18,8 @@ import {
 import {
   AGENT_STACK_CONTENT_SIZE_CHANNEL,
   AGENT_STACK_OPEN_RESULT_CHANNEL,
+  AGENT_STACK_RESEED_CHANNEL,
+  AGENT_STACK_REVEAL_CHANNEL,
   AGENT_STACK_SNAPSHOTS_CHANNEL,
   AgentStackContentSizeSchema,
   OpenAgentResultRequestSchema,
@@ -216,6 +218,19 @@ const luneBridge = {
     /** Opens a finished agent's result (a file, a URL, or the Chat Panel for a summary). */
     openResult(request: OpenAgentResultRequest): void {
       ipcRenderer.send(AGENT_STACK_OPEN_RESULT_CHANNEL, OpenAgentResultRequestSchema.parse(request));
+    },
+    /** Brings the Agent Stack back into view and re-seeds it (used by the Pill's tasks entry). */
+    reveal(): void {
+      ipcRenderer.send(AGENT_STACK_REVEAL_CHANNEL);
+    },
+    /**
+     * Subscribes the Agent Stack surface to re-seed requests (fired when it's revealed from the
+     * Pill), so dismissed-but-live sessions are restored. Returns an unsubscribe function.
+     */
+    onReseed(listener: () => void): () => void {
+      const forward = (): void => listener();
+      ipcRenderer.on(AGENT_STACK_RESEED_CHANNEL, forward);
+      return () => ipcRenderer.removeListener(AGENT_STACK_RESEED_CHANNEL, forward);
     },
   },
   settings: {

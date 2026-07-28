@@ -40,6 +40,21 @@ export const AGENT_STACK_OPEN_RESULT_CHANNEL = "lune:agent-stack:open-result";
  */
 export const AGENT_STACK_SNAPSHOTS_CHANNEL = "lune:agent-stack:snapshots";
 
+/**
+ * renderer -> main (send): bring the Agent Stack back into view - used by the Pill's
+ * "Background tasks" entry so a user who dismissed the cards can still find their background
+ * work. The main process shows the window and asks the surface to re-seed, so every current
+ * session (including ones dismissed from the stack but still tracked by the runtime) reappears.
+ */
+export const AGENT_STACK_REVEAL_CHANNEL = "lune:agent-stack:reveal";
+
+/**
+ * main -> renderer (send): tell the Agent Stack surface to re-seed its cards from the runtime's
+ * current snapshots. Sent when the stack is revealed from the Pill, so dismissed-but-live
+ * sessions are restored to the surface rather than staying hidden.
+ */
+export const AGENT_STACK_RESEED_CHANNEL = "lune:agent-stack:reseed";
+
 /** The Agent Stack's rendered content size plus its live card count. */
 export const AgentStackContentSizeSchema = z.object({
   /** The rendered width in logical pixels. */

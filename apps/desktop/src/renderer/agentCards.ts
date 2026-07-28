@@ -262,12 +262,15 @@ export function deriveCardView(card: AgentCard): AgentCardView {
       return {
         ...base,
         tone: "done",
-        detail: result.trim().length > 0 ? result : "all done",
+        // When there's something to open, keep the card short: a "ready" line naming the thing
+        // (its filename or site), not the agent's whole paragraph. Only a pure answer with
+        // nothing to open falls back to showing the summary itself.
+        detail: canOpen ? readyLine(openable) : result.trim().length > 0 ? result : "all done",
         activityHint: null,
         invitation: canOpen
           ? openable.kind === "file"
-            ? "it's ready - open it whenever you like"
-            : "it's open in your browser - jump over whenever"
+            ? "open it whenever you like"
+            : "it's open in your browser"
           : null,
         isTerminal: true,
         openable,
@@ -294,6 +297,22 @@ export function deriveCardView(card: AgentCard): AgentCardView {
         openable: null,
       };
   }
+}
+
+/**
+ * The short "it's ready" line a finished card leads with, naming the thing it produced: the
+ * file's own name, or the site it opened - so the card is a glanceable "your list is ready",
+ * never the agent's full paragraph.
+ */
+function readyLine(openable: ResultTarget): string {
+  if (openable.kind === "file") {
+    const name = openable.path.split("/").pop();
+    return name !== undefined && name.length > 0 ? `${name} is ready` : "your file is ready";
+  }
+  if (openable.kind === "url") {
+    return `${hostOf(openable.url) ?? "the page"} is ready`;
+  }
+  return "all done";
 }
 
 /** The host of a URL for a compact activity line, or `undefined` if it can't be parsed. */
