@@ -8,6 +8,7 @@ import {
   createAnthropicComputerUseAdapter,
   createConversationManager,
   createGeminiComputerUseAdapter,
+  createMcpServerManager,
   createReasoningCapability,
   createScreenAgentCapability,
   createTaskAgentModelAdapters,
@@ -33,6 +34,7 @@ import {
   type RawSkillFile,
   type ReasoningVendorId,
   type ScreenCaptureInput,
+  type McpServerManager,
   type SpeechCapability,
   type TaskAgentEvent,
   type TaskAgentRuntime,
@@ -191,6 +193,7 @@ import type { ScreenAgentRunResult } from "./agent/screenAgentLoop";
 import { createConfirmGateController } from "./agent/confirmGateController";
 import { createNodeLocalToolPlatform } from "./taskAgent/localToolPlatformNode";
 import { createToolConfirmGateController } from "./taskAgent/toolConfirmGateController";
+import { createNodeMcpConnector } from "./taskAgent/nodeMcpConnector";
 import {
   createTaskAgentToolRegistry,
   runTaskAgentDevTrigger,
@@ -568,6 +571,11 @@ let screenAgentService: ScreenAgentService | null = null;
 // gate needs the voice loop). The Agent Stack surface (M5-03) observes it over IPC; automatic
 // agent routing (M5-04) is a later concern, so for now the env-gated dev trigger starts one.
 let taskAgentRuntime: TaskAgentRuntime | null = null;
+
+// The MCP integrations client (M6-01): connects configured MCP servers and exposes their
+// tools to the Task Agent runtime. Assigned once the app is ready (its Confirm Gate is the
+// Task Agent's), closed on quit so any stdio server child processes are terminated cleanly.
+let mcpServerManager: McpServerManager | null = null;
 
 /** Maps one native Task Agent event to its wire form (the `started` event stamps the IPC version). */
 function toWireTaskAgentEvent(event: TaskAgentEvent): TaskAgentStreamEvent {
@@ -1863,6 +1871,8 @@ ipcMain.on(PILL_CAPTION_CHANNEL, (_event, rawCaption: unknown) => {
 // only synchronous work runs, so it SIGKILLs the child directly.
 app.on("before-quit", () => {
   void transcription?.shutdown();
+  // Close MCP connections so any stdio server child processes are terminated (M6-01).
+  void mcpServerManager?.close();
   // Release the global keyboard hook so the native uiohook thread stops cleanly (ticket 11).
   voiceController?.stop();
 });
@@ -2165,6 +2175,19 @@ void app.whenReady().then(() => {
       };
     },
   });
+  // The MCP integrations client (M6-01): connects configured MCP servers, discovers their
+  // tools, and exposes them - namespaced and gated by the same voice Confirm Gate - as a live
+  // tool set the Task Agent runtime calls alongside the local tools. Its transport is the real
+  // MCP SDK client; a failing server's tools simply vanish from the next step. The configured
+  // server set (presets, OAuth tokens) arrives with the Settings integrations surface (M6-02);
+  // it starts empty here, so a launch with no integrations behaves exactly as before.
+  const mcpManager = createMcpServerManager({
+    connector: createNodeMcpConnector(),
+    confirm: taskAgentConfirmGate,
+  });
+  mcpServerManager = mcpManager;
+  void mcpManager.start();
+
   const taskAgent = createTaskAgentRuntime({
     getRoutingConfig: () => routingConfigStore.getConfig(),
     models: createTaskAgentModelAdapters(),
@@ -2172,6 +2195,7 @@ void app.whenReady().then(() => {
     tools: createTaskAgentToolRegistry({
       platform: taskAgentToolPlatform,
       confirm: taskAgentConfirmGate,
+      externalTools: () => mcpManager.listTools(),
     }),
     upstreamFetch: (url, requestInit) => fetch(url, requestInit),
     generateSessionId: () => randomUUID(),

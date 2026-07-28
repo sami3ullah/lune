@@ -24,6 +24,7 @@
   "devDependencies": {
     "@lune/core": "workspace:*",
     "@lune/shared": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^20.17.9",
     "@types/react": "^18.3.12",

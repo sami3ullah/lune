@@ -1,8 +1,9 @@
 import {
+  createCompositeToolRegistry,
   createLocalToolSet,
-  createToolRegistry,
   type LocalToolPlatform,
   type ToolConfirmGate,
+  type ToolProvider,
   type ToolRegistry,
   type TaskAgentRuntime,
 } from "@lune/core";
@@ -14,7 +15,7 @@ import {
 // the real Node platform + the voice Confirm Gate, and drives one session from an env var
 // until the automatic agent routing (M5-04) and the Agent Stack surface (M5-03) land.
 
-/** The pieces the Task Agent's local tool registry is built from. */
+/** The pieces the Task Agent's tool registry is built from. */
 export interface TaskAgentToolRegistryDependencies {
   /** The Node/Electron OS/network effects boundary (`createNodeLocalToolPlatform`). */
   platform: LocalToolPlatform;
@@ -22,23 +23,34 @@ export interface TaskAgentToolRegistryDependencies {
   confirm: ToolConfirmGate;
   /** Overrides the shell-command allowlist; defaults to the Core's read-only default set. */
   safeShellCommands?: readonly string[];
+  /**
+   * The live external tool set, re-read on every registry access (M6-01: the MCP server
+   * manager's `listTools`). Local tools come first and win any name clash; a failing MCP
+   * server simply stops contributing here, so its tools vanish from the next step.
+   */
+  externalTools?: ToolProvider;
 }
 
 /**
- * Builds the tool registry the Task Agent runtime calls: the whole local tool set, with its
- * effects bound to the Node platform and its dangerous calls gated by the voice Confirm
- * Gate. Handed straight to {@link import("@lune/core").createTaskAgentRuntime}'s `tools`.
+ * Builds the tool registry the Task Agent runtime calls: the local tool set (effects bound to
+ * the Node platform, dangerous calls gated by the voice Confirm Gate) composed with the live
+ * MCP tool set. A composite registry re-reads its providers on every access, so MCP tools
+ * appear when a server connects and vanish when it fails - handed straight to
+ * {@link import("@lune/core").createTaskAgentRuntime}'s `tools`.
  */
 export function createTaskAgentToolRegistry(
   dependencies: TaskAgentToolRegistryDependencies,
 ): ToolRegistry {
-  return createToolRegistry(
-    createLocalToolSet({
-      platform: dependencies.platform,
-      confirm: dependencies.confirm,
-      safeShellCommands: dependencies.safeShellCommands,
-    }),
-  );
+  const localTools = createLocalToolSet({
+    platform: dependencies.platform,
+    confirm: dependencies.confirm,
+    safeShellCommands: dependencies.safeShellCommands,
+  });
+  const providers: ToolProvider[] = [() => localTools];
+  if (dependencies.externalTools !== undefined) {
+    providers.push(dependencies.externalTools);
+  }
+  return createCompositeToolRegistry(providers);
 }
 
 /** The env var whose value (a spoken-style goal) runs the Task Agent dev trigger; absent = no-op. */

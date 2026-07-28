@@ -422,6 +422,49 @@ export type {
   ToolConfirmRequest,
 } from "./taskAgent/toolConfirm.js";
 
+// MCP integrations (M6-01): Task Agents gain external tools via the Model Context Protocol.
+// The Core connects to configured MCP servers, discovers their tools, translates them into
+// ordinary Task Agent tools (namespaced, gated by the *same* Confirm Gate as local tools),
+// and composes them into the runtime's tool registry as a live view - so a configured
+// server's tools appear and are callable, a failing server's tools vanish cleanly, and a
+// consequential third-party call (e.g. overwrite a sheet) trips the gate. The Core owns the
+// client logic (lifecycle, discovery, translation, gating, registry composition); the
+// transport is the injected `McpConnector`'s (the Shell's real MCP SDK client). The Settings
+// integrations surface, presets, and OAuth token storage are the Shell's (M6-02).
+export {
+  createMcpServerManager,
+  type McpServerManager,
+  type McpServerManagerDependencies,
+  type McpServerStatus,
+  type McpServerState,
+  type McpServerStateListener,
+} from "./taskAgent/mcp/mcpServerManager.js";
+export type {
+  McpServerConfig,
+  McpTransportConfig,
+} from "./taskAgent/mcp/mcpServerConfig.js";
+export type {
+  McpConnector,
+  McpServerConnection,
+  McpToolDefinition,
+  McpToolAnnotations,
+  McpToolCallResult,
+  McpContentBlock,
+} from "./taskAgent/mcp/mcpConnection.js";
+export {
+  classifyMcpTool,
+  type McpToolClassificationInput,
+} from "./taskAgent/mcp/mcpToolConsequence.js";
+export {
+  translateMcpTool,
+  mcpPresentedToolName,
+  type McpToolTranslationContext,
+} from "./taskAgent/mcp/mcpToolTranslation.js";
+export {
+  createCompositeToolRegistry,
+  type ToolProvider,
+} from "./taskAgent/mcp/compositeToolRegistry.js";
+
 /**
  * Human-readable identifier for this Core build, stamped with the IPC contract
  * version it was compiled against. The Shell surfaces it so the Shell<->Core
