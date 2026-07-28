@@ -329,6 +329,64 @@ export {
   ACTIVE_SKILLS_PREAMBLE,
 } from "./skills/skillInjection.js";
 
+// Task Agents (M5-01): the ordinary-model tool-calling runtime. A Task Agent works through
+// tools only (never the screen or input devices), runs in the background, and several run
+// in parallel - each a Session with its own lifecycle (start, live status, cancel, terminal
+// result) whose events the Shell's Agent Stack observes. The Core owns the loop, the tool
+// registry, the vendor-independent conversation, and the per-Vendor tool-calling adapters;
+// only the injected tools' `execute` (the real local tool set + Confirm Gate arrive in M5-02)
+// and `upstreamFetch` touch anything outside the Core.
+export {
+  createTaskAgentRuntime,
+  TaskAgentNotReadyError,
+  TaskAgentStartInputError,
+  DEFAULT_TASK_AGENT_MAX_STEPS,
+  type TaskAgentRuntime,
+  type TaskAgentRuntimeDependencies,
+  type StartTaskAgentInput,
+  type TaskAgentHandle,
+  type TaskAgentListener,
+} from "./taskAgent/taskAgentRuntime.js";
+export type {
+  TaskAgentStatus,
+  TaskAgentSnapshot,
+  TaskAgentEvent,
+} from "./taskAgent/taskAgentTypes.js";
+export {
+  createToolRegistry,
+  type ToolRegistry,
+} from "./taskAgent/toolRegistry.js";
+export type {
+  TaskAgentTool,
+  ToolSchema,
+  ToolParameterSchema,
+  ToolExecutionContext,
+  ToolExecutionResult,
+} from "./taskAgent/toolTypes.js";
+export {
+  TaskAgentModelUpstreamError,
+  throwIfModelResponseNotOk,
+  type TaskAgentModel,
+  type TaskAgentModelRequest,
+  type TaskAgentModelTurn,
+  type TaskAgentModelMessage,
+  type TaskAgentToolCall,
+  type TaskAgentToolResult,
+} from "./taskAgent/taskAgentModel.js";
+export { TASK_AGENT_SYSTEM_PROMPT } from "./taskAgent/taskAgentSystemPrompt.js";
+export { createTaskAgentModelAdapters } from "./taskAgent/taskAgentModelVendors.js";
+export {
+  createAnthropicTaskAgentModel,
+  buildAnthropicTaskAgentRequest,
+  parseAnthropicTaskAgentResponse,
+} from "./taskAgent/anthropicTaskAgentModel.js";
+export {
+  createOpenAiTaskAgentModel,
+  buildOpenAiTaskAgentRequest,
+  parseOpenAiTaskAgentResponse,
+  type OpenAiTaskAgentVendorConfig,
+} from "./taskAgent/openAiTaskAgentModel.js";
+
 /**
  * Human-readable identifier for this Core build, stamped with the IPC contract
  * version it was compiled against. The Shell surfaces it so the Shell<->Core
