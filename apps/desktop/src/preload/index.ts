@@ -86,6 +86,26 @@ import {
   type UpdateSkillRequest,
 } from "../ipc/skills";
 import {
+  INTEGRATIONS_ADD_CHANNEL,
+  INTEGRATIONS_EVENT_CHANNEL,
+  INTEGRATIONS_LIST_CHANNEL,
+  INTEGRATIONS_OPEN_DOCS_CHANNEL,
+  INTEGRATIONS_REFRESH_CHANNEL,
+  INTEGRATIONS_REMOVE_CHANNEL,
+  INTEGRATIONS_SET_CREDENTIALS_CHANNEL,
+  INTEGRATIONS_SET_ENABLED_CHANNEL,
+  INTEGRATIONS_START_AUTH_CHANNEL,
+  INTEGRATIONS_TOGGLE_CHANNEL,
+  IntegrationActionResponseSchema,
+  IntegrationsSnapshotSchema,
+  type AddIntegrationRequest,
+  type IntegrationActionResponse,
+  type IntegrationIdRequest,
+  type IntegrationsSnapshot,
+  type SetIntegrationCredentialsRequest,
+  type SetIntegrationEnabledRequest,
+} from "../ipc/integrations";
+import {
   OVERLAY_EVENT_CHANNEL,
   OVERLAY_IDLE_CHANNEL,
   OverlayEventSchema,
@@ -335,6 +355,64 @@ const luneBridge = {
     /** Deletes a user Skill; resolves with the updated snapshot. */
     async delete(request: DeleteSkillRequest): Promise<SkillsSnapshotValue> {
       return SkillsSnapshotSchema.parse(await ipcRenderer.invoke(SKILLS_DELETE_CHANNEL, request));
+    },
+  },
+  integrations: {
+    /** Opens the Integrations window, or hides it if already open. */
+    toggle(): void {
+      ipcRenderer.send(INTEGRATIONS_TOGGLE_CHANNEL);
+    },
+    /** Reads the addable catalog + configured integrations, validated on the way in. */
+    async list(): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(await ipcRenderer.invoke(INTEGRATIONS_LIST_CHANNEL));
+    },
+    /** Adds an integration (preset or custom); resolves with the updated snapshot. */
+    async add(request: AddIntegrationRequest): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(await ipcRenderer.invoke(INTEGRATIONS_ADD_CHANNEL, request));
+    },
+    /** Removes an integration entirely; resolves with the updated snapshot. */
+    async remove(request: IntegrationIdRequest): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(await ipcRenderer.invoke(INTEGRATIONS_REMOVE_CHANNEL, request));
+    },
+    /** Turns one integration on or off; resolves with the updated snapshot. */
+    async setEnabled(request: SetIntegrationEnabledRequest): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(await ipcRenderer.invoke(INTEGRATIONS_SET_ENABLED_CHANNEL, request));
+    },
+    /** Retries one integration's connection; resolves with the updated snapshot. */
+    async refresh(request: IntegrationIdRequest): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(await ipcRenderer.invoke(INTEGRATIONS_REFRESH_CHANNEL, request));
+    },
+    /** Saves (or clears) one integration's guided credential values; resolves with the snapshot. */
+    async setCredentials(request: SetIntegrationCredentialsRequest): Promise<IntegrationsSnapshot> {
+      return IntegrationsSnapshotSchema.parse(
+        await ipcRenderer.invoke(INTEGRATIONS_SET_CREDENTIALS_CHANNEL, request),
+      );
+    },
+    /** Begins an OAuth integration's sign-in; resolves with the verdict + updated snapshot. */
+    async startAuth(request: IntegrationIdRequest): Promise<IntegrationActionResponse> {
+      return IntegrationActionResponseSchema.parse(
+        await ipcRenderer.invoke(INTEGRATIONS_START_AUTH_CHANNEL, request),
+      );
+    },
+    /** Opens one integration's help page (a docs URL) in the system browser. */
+    openDocs(url: string): void {
+      ipcRenderer.send(INTEGRATIONS_OPEN_DOCS_CHANNEL, { url });
+    },
+    /**
+     * Subscribes to live integration snapshots pushed as servers connect, go ready, or drop.
+     * Returns an unsubscribe function.
+     */
+    onChanged(listener: (snapshot: IntegrationsSnapshot) => void): () => void {
+      const forward = (_event: IpcRendererEvent, raw: unknown): void => {
+        const parsed = IntegrationsSnapshotSchema.safeParse(raw);
+        if (parsed.success) {
+          listener(parsed.data);
+        } else {
+          console.error("[lune] dropping malformed integrations snapshot:", parsed.error.message);
+        }
+      };
+      ipcRenderer.on(INTEGRATIONS_EVENT_CHANNEL, forward);
+      return () => ipcRenderer.removeListener(INTEGRATIONS_EVENT_CHANNEL, forward);
     },
   },
   overlay: {

@@ -437,8 +437,10 @@ export {
   type McpServerManagerDependencies,
   type McpServerStatus,
   type McpServerState,
+  type McpServerToolInfo,
   type McpServerStateListener,
 } from "./taskAgent/mcp/mcpServerManager.js";
+export { McpAuthRequiredError } from "./taskAgent/mcp/mcpAuthError.js";
 export type {
   McpServerConfig,
   McpTransportConfig,

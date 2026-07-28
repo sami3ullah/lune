@@ -20,17 +20,34 @@
  */
 import type { ToolConfirmGate } from "../toolConfirm.js";
 import type { TaskAgentTool } from "../toolTypes.js";
-import type { McpConnector, McpServerConnection } from "./mcpConnection.js";
+import { McpAuthRequiredError } from "./mcpAuthError.js";
+import type { McpConnector, McpServerConnection, McpToolDefinition } from "./mcpConnection.js";
 import type { McpServerConfig } from "./mcpServerConfig.js";
-import { translateMcpTool } from "./mcpToolTranslation.js";
+import { mcpPresentedToolName, translateMcpTool } from "./mcpToolTranslation.js";
 
 /**
  * One server's health, as the Settings surface renders it. `disabled` is a configured server
  * the user turned off (no connection attempted); `connecting` is an in-flight attempt;
- * `ready` means its tools are live; `error` means the last attempt failed and `error` carries
- * the readable reason (the tools are absent until a `refresh` succeeds).
+ * `ready` means its tools are live; `auth-expired` means the last attempt was refused for
+ * want of authorization (an OAuth server with no/expired token - the user re-connects to fix
+ * it); `error` means the last attempt failed for some other reason and `error` carries the
+ * readable cause. In every non-`ready` state the server contributes no tools until a
+ * successful `refresh` (or, for `auth-expired`, a completed sign-in then `refresh`).
  */
-export type McpServerStatus = "disabled" | "connecting" | "ready" | "error";
+export type McpServerStatus = "disabled" | "connecting" | "ready" | "auth-expired" | "error";
+
+/**
+ * One tool a ready server contributes, as the Settings surface lists it: the wire-safe,
+ * namespaced `name` the model calls it by, and a friendlier `label` (the server's declared
+ * tool title, else its bare name) for display. Enough for "see each server's tools" without
+ * leaking the whole schema across the boundary.
+ */
+export interface McpServerToolInfo {
+  /** The namespaced, model-facing tool name (e.g. `mcp_spotify_play`). */
+  name: string;
+  /** A human label for the tool (the server's `title` annotation, else its bare name). */
+  label: string;
+}
 
 /** A point-in-time view of one configured server. */
 export interface McpServerState {
@@ -42,7 +59,9 @@ export interface McpServerState {
   status: McpServerStatus;
   /** How many tools it currently contributes (0 unless `ready`). */
   toolCount: number;
-  /** The readable failure reason, present only when `status` is `error`. */
+  /** The tools it currently contributes, for display (empty unless `ready`). */
+  tools: readonly McpServerToolInfo[];
+  /** The readable failure reason, present only when `status` is `error` or `auth-expired`. */
   error?: string;
 }
 
@@ -85,6 +104,8 @@ interface ManagedServer {
   status: McpServerStatus;
   connection: McpServerConnection | null;
   tools: TaskAgentTool[];
+  /** The display infos for `tools`, kept in lockstep so `states()` can list them cheaply. */
+  toolInfos: McpServerToolInfo[];
   error?: string;
   /**
    * Bumped on every lifecycle operation for this server, so a slow in-flight connect whose
@@ -112,6 +133,7 @@ export function createMcpServerManager(
       status: config.enabled ? "connecting" : "disabled",
       connection: null,
       tools: [],
+      toolInfos: [],
       generation: 0,
     };
     servers.set(config.id, server);
@@ -124,7 +146,8 @@ export function createMcpServerManager(
       id: server.config.id,
       displayName: server.config.displayName,
       status: server.status,
-      toolCount: server.tools.length,
+      toolCount: server.toolInfos.length,
+      tools: server.toolInfos,
       error: server.error,
     };
   }
@@ -150,6 +173,7 @@ export function createMcpServerManager(
     server.status = "connecting";
     server.error = undefined;
     server.tools = [];
+    server.toolInfos = [];
     publish(server);
 
     let connection: McpServerConnection;
@@ -170,6 +194,7 @@ export function createMcpServerManager(
           confirm,
         }),
       );
+      server.toolInfos = definitions.map((definition) => toToolInfo(server.config.id, definition));
       server.status = "ready";
       server.error = undefined;
       // Learn of the server dropping *after* it went ready, so its tools vanish promptly
@@ -183,7 +208,10 @@ export function createMcpServerManager(
       }
       server.connection = null;
       server.tools = [];
-      server.status = "error";
+      server.toolInfos = [];
+      // An authorization refusal is a distinct, recoverable state (re-connect / sign in),
+      // not a generic breakage - so the Settings surface can prompt rather than alarm.
+      server.status = error instanceof McpAuthRequiredError ? "auth-expired" : "error";
       server.error = errorMessage(error);
       publish(server);
     }
@@ -201,6 +229,7 @@ export function createMcpServerManager(
     }
     server.connection = null;
     server.tools = [];
+    server.toolInfos = [];
     server.status = "error";
     server.error = reason ?? "The MCP server connection closed unexpectedly";
     publish(server);
@@ -212,6 +241,7 @@ export function createMcpServerManager(
     const connection = server.connection;
     server.connection = null;
     server.tools = [];
+    server.toolInfos = [];
     server.status = "disabled";
     server.error = undefined;
     publish(server);
@@ -320,6 +350,7 @@ export function createMcpServerManager(
         const connection = server.connection;
         server.connection = null;
         server.tools = [];
+        server.toolInfos = [];
         if (connection !== null) {
           await safeClose(connection);
         }
@@ -339,6 +370,19 @@ export function createMcpServerManager(
       return () => listeners.delete(listener);
     },
     close,
+  };
+}
+
+/**
+ * The display info for one discovered tool: the same namespaced name
+ * {@link translateMcpTool} presents to the model, paired with a friendly label (the server's
+ * declared tool title, else its bare name). Computed from the definition so it stays in step
+ * with the translated tool without threading extra state through translation.
+ */
+function toToolInfo(serverId: string, definition: McpToolDefinition): McpServerToolInfo {
+  return {
+    name: mcpPresentedToolName(serverId, definition.name),
+    label: definition.annotations?.title ?? definition.name,
   };
 }
 

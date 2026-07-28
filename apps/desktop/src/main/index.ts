@@ -118,8 +118,32 @@ import {
   SkillsSnapshotSchema,
   UpdateSkillRequestSchema,
 } from "../ipc/skills";
+import {
+  INTEGRATIONS_ADD_CHANNEL,
+  INTEGRATIONS_EVENT_CHANNEL,
+  INTEGRATIONS_LIST_CHANNEL,
+  INTEGRATIONS_OPEN_DOCS_CHANNEL,
+  INTEGRATIONS_REFRESH_CHANNEL,
+  INTEGRATIONS_REMOVE_CHANNEL,
+  INTEGRATIONS_SET_CREDENTIALS_CHANNEL,
+  INTEGRATIONS_SET_ENABLED_CHANNEL,
+  INTEGRATIONS_START_AUTH_CHANNEL,
+  INTEGRATIONS_TOGGLE_CHANNEL,
+  AddIntegrationRequestSchema,
+  IntegrationActionResponseSchema,
+  IntegrationIdRequestSchema,
+  IntegrationsSnapshotSchema,
+  OpenDocsRequestSchema,
+  SetIntegrationCredentialsRequestSchema,
+  SetIntegrationEnabledRequestSchema,
+} from "../ipc/integrations";
 import { SettingsStore } from "./settings/settingsStore";
 import { CredentialStore } from "./settings/credentialStore";
+import { getIntegrationsWebContents, toggleIntegrationsWindow } from "./integrationsWindow";
+import { McpConfigStore } from "./integrations/mcpConfigStore";
+import { McpSecretStore } from "./integrations/mcpSecretStore";
+import { createMcpOAuthCoordinator } from "./integrations/mcpOAuth";
+import { IntegrationsService } from "./integrations/integrationsService";
 import { createSettingsService, type SettingsService } from "./settings/settingsService";
 import {
   ONBOARDING_COMPLETE_CHANNEL,
@@ -287,6 +311,50 @@ const credentialStore = new CredentialStore(
   (path) => readFileSync(path, "utf8"),
   (path, contents) => writeFileSync(path, contents, "utf8"),
 );
+
+// The MCP integrations stores (M6-02): the secret-free list of added integrations, and their
+// credentials + OAuth tokens in OS-encrypted storage - the same config-vs-secret split as the
+// Vendor keys. The OAuth coordinator owns the browser sign-in flow and, via `getAuthProvider`,
+// supplies the connector the per-server provider that uses (and refreshes) stored tokens. All
+// three only touch disk lazily; the IntegrationsService that drives them is assembled once the
+// app is ready (it needs the Core MCP manager).
+const mcpConfigStore = new McpConfigStore(
+  join(app.getPath("userData"), "integrations.json"),
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+);
+const mcpSecretStore = new McpSecretStore(
+  join(app.getPath("userData"), "integration-secrets.json"),
+  safeStorage,
+  (path) => readFileSync(path, "utf8"),
+  (path, contents) => writeFileSync(path, contents, "utf8"),
+);
+const mcpOAuthCoordinator = createMcpOAuthCoordinator({
+  secretStore: mcpSecretStore,
+  openExternal: (url) => {
+    void shell.openExternal(url);
+  },
+});
+
+// The IntegrationsService, assigned once the app is ready (it needs the Core MCP manager). An
+// integrations IPC before then is a programmer error (the window opens only after the UI is up).
+let integrationsService: IntegrationsService | null = null;
+
+/** The IntegrationsService once ready; an integrations IPC before then is a programmer error. */
+function requireIntegrationsService(): IntegrationsService {
+  if (integrationsService === null) {
+    throw new Error("Integrations service is not ready yet");
+  }
+  return integrationsService;
+}
+
+/** Pushes the current integrations snapshot to the Integrations window, if it is open. */
+function pushIntegrationsSnapshot(): void {
+  const webContents = getIntegrationsWebContents();
+  if (webContents !== null && integrationsService !== null) {
+    webContents.send(INTEGRATIONS_EVENT_CHANNEL, IntegrationsSnapshotSchema.parse(integrationsService.snapshot()));
+  }
+}
 
 // Best-effort watch so a hand-edit of the config file reconciles routing without a
 // restart. A save from Settings reloads the Core store explicitly (below), so this only
@@ -1742,6 +1810,48 @@ ipcMain.handle(SKILLS_DELETE_CHANNEL, (_event, rawRequest: unknown) => {
   return SkillsSnapshotSchema.parse(skillsManager.delete(request.id));
 });
 
+// The Integrations surface's IPC (M6-02): open the window, browse/add/remove/enable/refresh
+// integrations, save guided credentials, and run OAuth sign-in - every payload zod-parsed in,
+// every reply parsed out, exactly like Settings and Skills. The mutating calls return the full
+// snapshot so the tab renders from one consistent view; live status changes arrive separately
+// over the push channel.
+ipcMain.on(INTEGRATIONS_TOGGLE_CHANNEL, () => toggleIntegrationsWindow());
+ipcMain.handle(INTEGRATIONS_LIST_CHANNEL, () =>
+  IntegrationsSnapshotSchema.parse(requireIntegrationsService().snapshot()),
+);
+ipcMain.handle(INTEGRATIONS_ADD_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = AddIntegrationRequestSchema.parse(rawRequest);
+  return IntegrationsSnapshotSchema.parse(await requireIntegrationsService().add(request));
+});
+ipcMain.handle(INTEGRATIONS_REMOVE_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = IntegrationIdRequestSchema.parse(rawRequest);
+  return IntegrationsSnapshotSchema.parse(await requireIntegrationsService().remove(request.id));
+});
+ipcMain.handle(INTEGRATIONS_SET_ENABLED_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = SetIntegrationEnabledRequestSchema.parse(rawRequest);
+  return IntegrationsSnapshotSchema.parse(await requireIntegrationsService().setEnabled(request.id, request.enabled));
+});
+ipcMain.handle(INTEGRATIONS_REFRESH_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = IntegrationIdRequestSchema.parse(rawRequest);
+  return IntegrationsSnapshotSchema.parse(await requireIntegrationsService().refresh(request.id));
+});
+ipcMain.handle(INTEGRATIONS_SET_CREDENTIALS_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = SetIntegrationCredentialsRequestSchema.parse(rawRequest);
+  return IntegrationsSnapshotSchema.parse(await requireIntegrationsService().setCredentials(request.id, request.values));
+});
+ipcMain.handle(INTEGRATIONS_START_AUTH_CHANNEL, async (_event, rawRequest: unknown) => {
+  const request = IntegrationIdRequestSchema.parse(rawRequest);
+  return IntegrationActionResponseSchema.parse(await requireIntegrationsService().startAuth(request.id));
+});
+ipcMain.on(INTEGRATIONS_OPEN_DOCS_CHANNEL, (_event, rawRequest: unknown) => {
+  // Only ever open an http(s) help page in the system browser - the schema rejects a file://
+  // or arbitrary scheme, so a malformed payload silently opens nothing.
+  const request = OpenDocsRequestSchema.safeParse(rawRequest);
+  if (request.success) {
+    void shell.openExternal(request.data.url);
+  }
+});
+
 // The onboarding surface's IPC (ticket 14): live-validate + store a Vendor key, start
 // (or resume) the background download, poll its progress, open a "get a key" page, and
 // mark completion. The catalog/keyed-Vendors/readiness the flow also needs are read over
@@ -2182,11 +2292,27 @@ void app.whenReady().then(() => {
   // server set (presets, OAuth tokens) arrives with the Settings integrations surface (M6-02);
   // it starts empty here, so a launch with no integrations behaves exactly as before.
   const mcpManager = createMcpServerManager({
-    connector: createNodeMcpConnector(),
+    connector: createNodeMcpConnector({
+      // An OAuth integration's connection uses (and silently refreshes) its stored token via
+      // the coordinator's provider; a plain server gets no provider (M6-02).
+      resolveAuthProvider: (serverId) => mcpOAuthCoordinator.getAuthProvider(serverId),
+    }),
     confirm: taskAgentConfirmGate,
   });
   mcpServerManager = mcpManager;
   void mcpManager.start();
+
+  // The integrations surface (M6-02): compose the preset catalog, the config + secret stores,
+  // and the OAuth coordinator over the manager. `start` reconnects the servers the user added
+  // in a previous run; live status changes push a fresh snapshot to the Integrations window.
+  integrationsService = new IntegrationsService({
+    manager: mcpManager,
+    configStore: mcpConfigStore,
+    secretStore: mcpSecretStore,
+    oauth: mcpOAuthCoordinator,
+    onChanged: () => pushIntegrationsSnapshot(),
+  });
+  void integrationsService.start();
 
   const taskAgent = createTaskAgentRuntime({
     getRoutingConfig: () => routingConfigStore.getConfig(),

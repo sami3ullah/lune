@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createMcpServerManager } from "../src/taskAgent/mcp/mcpServerManager.js";
+import { McpAuthRequiredError } from "../src/taskAgent/mcp/mcpAuthError.js";
 import type {
   McpConnector,
   McpServerConnection,
@@ -64,7 +65,14 @@ describe("createMcpServerManager", () => {
     await manager.start();
 
     expect(manager.states()).toEqual([
-      { id: "sheets", displayName: "sheets", status: "ready", toolCount: 1, error: undefined },
+      {
+        id: "sheets",
+        displayName: "sheets",
+        status: "ready",
+        toolCount: 1,
+        tools: [{ name: "mcp_sheets_get_sheet", label: "get_sheet" }],
+        error: undefined,
+      },
     ]);
     const tools = manager.listTools();
     expect(tools.map((t) => t.name)).toEqual(["mcp_sheets_get_sheet"]);
@@ -72,6 +80,40 @@ describe("createMcpServerManager", () => {
     const result = await tools[0].execute({}, { sessionId: "s", signal: new AbortController().signal });
     expect(result.output).toBe("ok");
     expect(calls).toEqual(["get_sheet"]);
+  });
+
+  it("lists a ready server's tools with friendly labels for the Settings surface", async () => {
+    const connector: McpConnector = async () =>
+      fakeConnection({
+        tools: [
+          { name: "get_sheet", annotations: { readOnlyHint: true, title: "Read a sheet" } },
+          { name: "append_row" },
+        ],
+      });
+    const manager = createMcpServerManager({ connector, confirm: alwaysApprove, servers: [config("sheets")] });
+
+    await manager.start();
+
+    expect(manager.states()[0].tools).toEqual([
+      { name: "mcp_sheets_get_sheet", label: "Read a sheet" },
+      { name: "mcp_sheets_append_row", label: "append_row" },
+    ]);
+    expect(manager.states()[0].toolCount).toBe(2);
+  });
+
+  it("reports auth-expired (not error) when the connector signals an authorization refusal", async () => {
+    const connector: McpConnector = async () => {
+      throw new McpAuthRequiredError("sign-in required");
+    };
+    const manager = createMcpServerManager({ connector, confirm: alwaysApprove, servers: [config("gsheets")] });
+
+    await manager.start();
+
+    const state = manager.states()[0];
+    expect(state.status).toBe("auth-expired");
+    expect(state.error).toContain("sign-in required");
+    expect(state.tools).toEqual([]);
+    expect(manager.listTools()).toHaveLength(0);
   });
 
   it("degrades gracefully when a server fails to connect: error status, no tools, no throw", async () => {

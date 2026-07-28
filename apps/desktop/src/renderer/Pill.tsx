@@ -177,6 +177,13 @@ export function Pill() {
               }}
             />
             <MenuButton
+              label="Integrations"
+              onClick={() => {
+                setMenuOpen(false);
+                window.lune.integrations.toggle();
+              }}
+            />
+            <MenuButton
               label="Settings"
               onClick={() => {
                 setMenuOpen(false);

@@ -1,13 +1,15 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { UnauthorizedError, type OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type {
-  McpConnector,
-  McpServerConfig,
-  McpServerConnection,
-  McpToolCallResult,
-  McpToolDefinition,
+import {
+  McpAuthRequiredError,
+  type McpConnector,
+  type McpServerConfig,
+  type McpServerConnection,
+  type McpToolCallResult,
+  type McpToolDefinition,
 } from "@lune/core";
 
 // The Shell's real MCP transport (M6-01), filling the Core's transport-agnostic
@@ -22,21 +24,42 @@ import type {
 /** The client identity Lune presents to a server during the MCP handshake. */
 const CLIENT_INFO = { name: "lune", version: "0.0.0" } as const;
 
+/** Options for {@link createNodeMcpConnector}. */
+export interface NodeMcpConnectorOptions {
+  /**
+   * Resolves the OAuth provider for an HTTP server that authenticates via OAuth (M6-02), or
+   * `undefined` for a server that needs none. Wired to the integrations OAuth coordinator, so
+   * a stored token is used (and refreshed) on every connect; a missing/expired token surfaces
+   * as {@link McpAuthRequiredError} -> `auth-expired`, not a generic error.
+   */
+  resolveAuthProvider?: (serverId: string) => OAuthClientProvider | undefined;
+}
+
 /**
  * Builds the Node MCP connector. Each `connect` opens a fresh SDK client over the transport
  * the config describes and resolves once the handshake completes; a spawn/connect/handshake
  * failure rejects, which the manager turns into a clean `error` status (its tools absent)
- * without disturbing any other server.
+ * without disturbing any other server. An authorization refusal rejects with the distinguished
+ * {@link McpAuthRequiredError}, which the manager renders as `auth-expired`.
  */
-export function createNodeMcpConnector(): McpConnector {
+export function createNodeMcpConnector(options: NodeMcpConnectorOptions = {}): McpConnector {
   return async (config: McpServerConfig): Promise<McpServerConnection> => {
     const client = new Client(CLIENT_INFO);
-    const transport = createTransport(config);
+    const transport = createTransport(config, options.resolveAuthProvider?.(config.id));
     // Forward an unexpected transport close to the manager (registered via onClose below), so
     // a server that dies after connecting has its tools dropped rather than lingering.
     let closeListener: ((reason?: string) => void) | undefined;
     client.onclose = () => closeListener?.();
-    await client.connect(transport);
+    try {
+      await client.connect(transport);
+    } catch (error) {
+      // A 401 from an OAuth server (no token yet, or a refresh that failed) is a distinct,
+      // recoverable state: re-map it so the manager prompts sign-in rather than alarming.
+      if (error instanceof UnauthorizedError) {
+        throw new McpAuthRequiredError(error.message);
+      }
+      throw error;
+    }
     return {
       async listTools(signal) {
         const response = await client.listTools({}, { signal });
@@ -59,8 +82,8 @@ export function createNodeMcpConnector(): McpConnector {
   };
 }
 
-/** Creates the SDK transport for a config's `transport` descriptor. */
-function createTransport(config: McpServerConfig): Transport {
+/** Creates the SDK transport for a config's `transport` descriptor, attaching an OAuth provider when one applies. */
+function createTransport(config: McpServerConfig, authProvider?: OAuthClientProvider): Transport {
   const { transport } = config;
   if (transport.kind === "stdio") {
     return new StdioClientTransport({
@@ -72,6 +95,9 @@ function createTransport(config: McpServerConfig): Transport {
     });
   }
   return new StreamableHTTPClientTransport(new URL(transport.url), {
+    // An OAuth provider (M6-02) drives token use/refresh/sign-in; a static header (e.g. a
+    // pre-issued bearer) still works for servers that use one. The two are independent.
+    authProvider,
     requestInit: transport.headers ? { headers: { ...transport.headers } } : undefined,
   });
 }
