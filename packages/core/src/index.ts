@@ -387,6 +387,38 @@ export {
   type OpenAiTaskAgentVendorConfig,
 } from "./taskAgent/openAiTaskAgentModel.js";
 
+// Task Agents (M5-02): the zero-integration local tool set (open URL, AppleScript, shell,
+// file read/write, web search/fetch) plus the tool-safety Confirm Gate. The Core owns the
+// tool schemas, the pure `benign`/`consequential` classification (reusing the Screen
+// Agent's Consequence Level vocabulary), and the Confirm-Gate wiring; every real effect is
+// the injected `LocalToolPlatform`'s (Node/Electron in the Shell), and every user question
+// is the injected `ToolConfirmGate`'s (the Shell's voice gate). AppleScript sits behind the
+// platform seam so the PowerShell equivalent is a later platform (M7), not a tool change.
+export {
+  createLocalToolSet,
+  type LocalToolSetDependencies,
+} from "./taskAgent/localToolSet.js";
+export {
+  DEFAULT_SAFE_SHELL_COMMANDS,
+  classifyShellCommand,
+  classifyFileWrite,
+  classifyAppleScript,
+  type ToolConsequence,
+  type FileWriteTarget,
+  type ClassifyShellCommandOptions,
+} from "./taskAgent/toolConsequence.js";
+export type {
+  LocalToolPlatform,
+  OutputFileFormat,
+  CommandExecutionResult,
+  ResolvedOutputTarget,
+  WriteOutputFileRequest,
+} from "./taskAgent/localToolPlatform.js";
+export type {
+  ToolConfirmGate,
+  ToolConfirmRequest,
+} from "./taskAgent/toolConfirm.js";
+
 /**
  * Human-readable identifier for this Core build, stamped with the IPC contract
  * version it was compiled against. The Shell surfaces it so the Shell<->Core

@@ -10,6 +10,8 @@ import {
   createGeminiComputerUseAdapter,
   createReasoningCapability,
   createScreenAgentCapability,
+  createTaskAgentModelAdapters,
+  createTaskAgentRuntime,
   createVisionDrivenAgentAdapter,
   VISION_DRIVEN_VENDORS,
   ComputerUseUpstreamError,
@@ -31,6 +33,7 @@ import {
   type ReasoningVendorId,
   type ScreenCaptureInput,
   type SpeechCapability,
+  type TaskAgentRuntime,
 } from "@lune/core";
 import {
   CHAT_EVENT_CHANNEL,
@@ -165,6 +168,12 @@ import {
 } from "./agent/screenAgentService";
 import type { ScreenAgentRunResult } from "./agent/screenAgentLoop";
 import { createConfirmGateController } from "./agent/confirmGateController";
+import { createNodeLocalToolPlatform } from "./taskAgent/localToolPlatformNode";
+import { createToolConfirmGateController } from "./taskAgent/toolConfirmGateController";
+import {
+  createTaskAgentToolRegistry,
+  runTaskAgentDevTrigger,
+} from "./taskAgent/taskAgentService";
 import type { AgentCursorOverlay } from "./agent/agentCursorPresenter";
 import {
   resolveWhisperServerBinaryPath,
@@ -531,6 +540,14 @@ let syntheticInputExecutor: SyntheticInputExecutor | null = null;
 // production consumer drives it yet (the advisory->act auto-routing is a later concern);
 // the env-gated dev trigger below runs one bounded session end to end.
 let screenAgentService: ScreenAgentService | null = null;
+
+// The Task Agent runtime (M5-02): the background, tools-only agent engine, wired to the real
+// local tool set (open URL, AppleScript, shell, file read/write, web search/fetch) whose
+// dangerous calls pass the voice Confirm Gate. Assigned once the app is ready (its confirm
+// gate needs the voice loop). No production consumer drives it yet - automatic agent routing
+// (M5-04) and the Agent Stack surface (M5-03) are later concerns; the env-gated dev trigger
+// below runs one Session end to end.
+let taskAgentRuntime: TaskAgentRuntime | null = null;
 
 // The Speech Capability (ticket 09): on-device Kokoro synthesis, gated on the Kokoro
 // weights being provisioned. Assigned once the app is ready (it needs the Provisioning
@@ -2046,6 +2063,43 @@ void app.whenReady().then(() => {
     generateSessionId: () => randomUUID(),
   });
 
+  // The Task Agent runtime (M5-02): a background, tools-only agent. Its tool registry is the
+  // real local tool set bound to the Node platform (files land in ~/Documents/Lune, a
+  // predictable visible location - acceptance #3), and its dangerous calls (non-allowlisted
+  // shell, an overwrite, a shell-escaping AppleScript) pass the *same* voice Confirm Gate the
+  // Screen Agent uses. It reuses Reasoning's Vendor selection + keys, so any keyed ordinary
+  // Vendor can run one - no computer-use model, no input devices.
+  const taskAgentToolPlatform = createNodeLocalToolPlatform({
+    outputDirectory: join(app.getPath("documents"), "Lune"),
+  });
+  const taskAgentConfirmGate = createToolConfirmGateController({
+    speak: (text) => {
+      void speakLine(text);
+    },
+    armAnswerCapture: (deliver) => {
+      // Voice-only, exactly like the Screen Agent gate: push-to-talk answers the gate rather
+      // than barging in the background run, and an ambiguous reply re-prompts, never proceeds.
+      const offVoice =
+        voiceController?.openConfirmGateCapture((transcript) =>
+          deliver({ source: "voice", transcript }),
+        ) ?? (() => {});
+      return () => {
+        offVoice();
+      };
+    },
+  });
+  taskAgentRuntime = createTaskAgentRuntime({
+    getRoutingConfig: () => routingConfigStore.getConfig(),
+    models: createTaskAgentModelAdapters(),
+    getApiKey: (vendorId) => credentialStore.getKey(vendorId) ?? process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
+    tools: createTaskAgentToolRegistry({
+      platform: taskAgentToolPlatform,
+      confirm: taskAgentConfirmGate,
+    }),
+    upstreamFetch: (url, requestInit) => fetch(url, requestInit),
+    generateSessionId: () => randomUUID(),
+  });
+
   // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the
   // hotkey live from the routing config (editable in Settings, ticket 13), records
   // through the Pill, transcribes on release via whisper, and answers the transcript as
@@ -2211,6 +2265,14 @@ void app.whenReady().then(() => {
     // no-op).
     await runScreenAgentDevTrigger(screenAgentService!, {
       routeToAccessibilityPane: openAccessibilitySettings,
+      registerBargeIn: (abort) => voiceController?.noteExternalTurnStarted(abort),
+      unregisterBargeIn: (abort) => voiceController?.noteTurnEnded(abort),
+    });
+    // Run one full Task Agent session end to end (M5-02 acceptance) from the goal in
+    // LUNE_TASK_AGENT_DEV - e.g. "play Bohemian Rhapsody on Spotify", "open example.com",
+    // "write me a note listing three ideas" - exercising the local tools and the voice
+    // Confirm Gate; a no-op on a normal launch. Barge-in cancels the session mid-run.
+    await runTaskAgentDevTrigger(taskAgentRuntime!, {
       registerBargeIn: (abort) => voiceController?.noteExternalTurnStarted(abort),
       unregisterBargeIn: (abort) => voiceController?.noteTurnEnded(abort),
     });
