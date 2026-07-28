@@ -175,18 +175,25 @@ export function createLocalToolSet(dependencies: LocalToolSetDependencies): Task
     description:
       "Write a file for the user - a note, a PDF, or a CSV/spreadsheet - into the user's " +
       "Lune output folder (a predictable, visible location). Creating a new file is " +
-      "immediate; overwriting an existing one asks first. Returns where the file was saved.",
+      "immediate; overwriting an existing one asks first. Returns where the file was saved. " +
+      "For any list or table of data, save a CSV by default (it opens as a spreadsheet) unless " +
+      "the user explicitly asked for another format.",
     parameters: {
       type: "object",
       properties: {
         filename: {
           type: "string",
-          description: "The file name to save under, including extension, e.g. 'shopping-list.md'.",
+          description:
+            "The file name to save under, including an extension that matches the format, e.g. " +
+            "'creators.csv' for a list or 'notes.md' for a note.",
         },
         format: {
           type: "string",
           enum: [...OUTPUT_FILE_FORMATS],
-          description: "How to encode the content. Defaults to 'text'. Use 'csv' for spreadsheets, 'pdf' for documents.",
+          description:
+            "How to encode the content. Defaults to 'text'. For a list or any table of data use " +
+            "'csv' - that is the default for lists unless the user asked for something else; use " +
+            "'pdf' for documents and 'markdown' for a formatted note.",
         },
         content: {
           type: "string",

@@ -107,8 +107,11 @@ function AgentCardView({ view, onDismiss }: { view: AgentCardView; onDismiss: ()
   const handleOpenResult = useCallback(() => {
     if (openable !== null && openable.kind !== "summary") {
       window.lune.agentStack.openResult(openable);
+      // Opening the result means the user is done with this card - clear it (and, if it was the
+      // last, the stack panel closes with it), so the surface gets out of their way.
+      onDismiss();
     }
-  }, [openable]);
+  }, [openable, onDismiss]);
 
   return (
     <motion.div
