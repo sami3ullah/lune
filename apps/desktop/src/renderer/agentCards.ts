@@ -1,4 +1,4 @@
-import type { TaskAgentSnapshot, TaskAgentStatus, TaskAgentStreamEvent } from "@lune/shared";
+import type { TaskAgentArtifact, TaskAgentSnapshot, TaskAgentStatus, TaskAgentStreamEvent } from "@lune/shared";
 
 // The pure state + presentation logic behind the Agent Stack surface (M5-03): the reducer
 // that folds the Task Agent event stream into the cards the surface renders, the classifier
@@ -27,6 +27,11 @@ export interface AgentCard {
   activity?: string;
   /** The final summary, present only when `status` is `succeeded`. */
   result?: string;
+  /**
+   * The concrete artifact the agent produced (a written file, an opened URL), captured from
+   * the tools - the reliable "Open it" target, independent of the prose summary.
+   */
+  artifact?: TaskAgentArtifact;
   /** The readable failure reason, present only when `status` is `failed`. */
   error?: string;
 }
@@ -79,7 +84,7 @@ export function reduceAgentCards(
       // The activity line already reflects the call; a result doesn't change what's shown.
       return upsert(cards, event.sessionId, (card) => card, seed);
     case "succeeded":
-      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "succeeded", result: event.result, narration: undefined, activity: undefined }), seed);
+      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "succeeded", result: event.result, artifact: event.artifact, narration: undefined, activity: undefined }), seed);
     case "failed":
       return upsert(cards, event.sessionId, (card) => ({ ...card, status: "failed", error: event.message, narration: undefined, activity: undefined }), seed);
     case "cancelled":
@@ -95,6 +100,7 @@ export function snapshotToCard(snapshot: TaskAgentSnapshot): AgentCard {
     status: snapshot.status,
     step: snapshot.step,
     result: snapshot.result,
+    artifact: snapshot.artifact,
     error: snapshot.error,
   };
 }
@@ -249,14 +255,20 @@ export function deriveCardView(card: AgentCard): AgentCardView {
     }
     case "succeeded": {
       const result = card.result ?? "";
-      const openable = result.trim().length > 0 ? classifyResult(result) : null;
+      // Prefer the artifact the tools actually produced (a real path/URL) over guessing one
+      // from the prose summary, which the agent is told to keep free of paths and jargon.
+      const openable = card.artifact ?? (result.trim().length > 0 ? classifyResult(result) : null);
       const canOpen = openable !== null && openable.kind !== "summary";
       return {
         ...base,
         tone: "done",
         detail: result.trim().length > 0 ? result : "all done",
         activityHint: null,
-        invitation: canOpen ? "it's ready whenever you want a look" : null,
+        invitation: canOpen
+          ? openable.kind === "file"
+            ? "it's ready - open it whenever you like"
+            : "it's open in your browser - jump over whenever"
+          : null,
         isTerminal: true,
         openable,
       };

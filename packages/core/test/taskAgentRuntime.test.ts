@@ -152,6 +152,39 @@ describe("createTaskAgentRuntime - a multi-step tool plan", () => {
     ]);
   });
 
+  it("carries the latest tool artifact onto the succeeded snapshot and event", async () => {
+    // The write tool produces an openable file; the model's summary carries no path (as it's
+    // told). The runtime must surface the file as the terminal artifact regardless.
+    const writeFile: TaskAgentTool = {
+      name: "write_file",
+      description: "stub write_file",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        return {
+          output: "Saved to /Users/me/Documents/Lune/list.md.",
+          artifact: { kind: "file", path: "/Users/me/Documents/Lune/list.md" },
+        };
+      },
+    };
+    const model = scriptedModel({
+      "make a list": [callsTools(toolCall("c1", "write_file")), finishes("done, made your list")],
+    });
+    const runtime = createTaskAgentRuntime(
+      deps({ models: { anthropic: model }, tools: createToolRegistry([writeFile]) }),
+    );
+    const events = recordEvents(runtime);
+
+    const snapshot = await runtime.start({ goal: "make a list", sessionId: "s1" }).completion;
+    expect(snapshot).toMatchObject({
+      status: "succeeded",
+      result: "done, made your list",
+      artifact: { kind: "file", path: "/Users/me/Documents/Lune/list.md" },
+    });
+    expect(events.find((event) => event.type === "succeeded")).toMatchObject({
+      artifact: { kind: "file", path: "/Users/me/Documents/Lune/list.md" },
+    });
+  });
+
   it("feeds each tool result back into the next model turn's conversation", async () => {
     const search = recordingTool("search", "sunny, 24C");
     const model = scriptedModel({

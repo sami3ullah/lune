@@ -98,7 +98,7 @@ export function createLocalToolSet(dependencies: LocalToolSetDependencies): Task
         return missingArgument("url");
       }
       await platform.openUrl(url);
-      return { output: `Opened ${url} in the browser.` };
+      return { output: `Opened ${url} in the browser.`, artifact: { kind: "url", url } };
     },
   };
 
@@ -215,7 +215,7 @@ export function createLocalToolSet(dependencies: LocalToolSetDependencies): Task
         return declined(`writing ${filename}`);
       }
       const written = await platform.writeOutputFile({ path: target.path, format, content });
-      return { output: `Saved to ${written.path}.` };
+      return { output: `Saved to ${written.path}.`, artifact: { kind: "file", path: written.path } };
     },
   };
 

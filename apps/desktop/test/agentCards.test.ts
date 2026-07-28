@@ -52,6 +52,20 @@ describe("reduceAgentCards", () => {
     expect(cards[0]!.narration).toBeUndefined();
   });
 
+  it("carries a tool-produced artifact onto the succeeded card", () => {
+    let cards = reduceAgentCards([], started("a", "make a sheet"));
+    cards = reduceAgentCards(cards, {
+      type: "succeeded",
+      sessionId: "a",
+      result: "done, I built the spreadsheet with all the details.",
+      artifact: { kind: "file", path: "/Users/me/Documents/Lune/creators.xlsx" },
+    });
+    expect(cards[0]).toMatchObject({
+      status: "succeeded",
+      artifact: { kind: "file", path: "/Users/me/Documents/Lune/creators.xlsx" },
+    });
+  });
+
   it("settles failed and cancelled cards with their reasons", () => {
     let cards = reduceAgentCards([], started("a", "g"));
     cards = reduceAgentCards(cards, { type: "failed", sessionId: "a", message: "rate limited" });
@@ -176,6 +190,21 @@ describe("deriveCardView", () => {
     expect(view.badge).toBe("Done");
     expect(view.isTerminal).toBe(true);
     expect(view.openable).toEqual({ kind: "file", path: "/Users/me/Documents/Lune/note.md" });
+    expect(view.invitation).not.toBeNull();
+  });
+
+  it("prefers the structured artifact over the prose summary for the open target", () => {
+    // The friendly summary carries no path (the agent is told not to), but the artifact does:
+    // the card must still offer to open the real file, and invite it.
+    const view = deriveCardView({
+      sessionId: "a",
+      goal: "make a sheet",
+      status: "succeeded",
+      step: 4,
+      result: "done, I made the spreadsheet with the top 10 accounts and all their details.",
+      artifact: { kind: "file", path: "/Users/me/Documents/Lune/creators.xlsx" },
+    });
+    expect(view.openable).toEqual({ kind: "file", path: "/Users/me/Documents/Lune/creators.xlsx" });
     expect(view.invitation).not.toBeNull();
   });
 

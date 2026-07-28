@@ -129,6 +129,17 @@ export const TaskAgentStatusSchema = z.enum(["running", "succeeded", "failed", "
 export type TaskAgentStatus = z.infer<typeof TaskAgentStatusSchema>;
 
 /**
+ * A concrete thing a finished Task Agent produced that the card can offer to open - a file it
+ * wrote or a URL it opened. Captured structurally from the tools (not parsed from the model's
+ * prose summary, which carries no paths), so the "Open it" affordance is reliable.
+ */
+export const TaskAgentArtifactSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("file"), path: z.string().min(1) }),
+  z.object({ kind: z.literal("url"), url: z.string().min(1) }),
+]);
+export type TaskAgentArtifact = z.infer<typeof TaskAgentArtifactSchema>;
+
+/**
  * The Shell's request to start a Task Agent: the goal to work toward and, optionally, the
  * Shell's own id for the session (the Core mints one when omitted). Mirrors how a chat
  * turn's id is minted by the renderer so it can correlate the events that come back.
@@ -158,6 +169,7 @@ export const TaskAgentSnapshotSchema = z.object({
   status: TaskAgentStatusSchema,
   step: z.number().int().nonnegative(),
   result: z.string().optional(),
+  artifact: TaskAgentArtifactSchema.optional(),
   error: z.string().optional(),
 });
 export type TaskAgentSnapshot = z.infer<typeof TaskAgentSnapshotSchema>;
@@ -209,6 +221,7 @@ export const TaskAgentStreamEventSchema = z.discriminatedUnion("type", [
     type: z.literal("succeeded"),
     sessionId: z.string().min(1),
     result: z.string(),
+    artifact: TaskAgentArtifactSchema.optional(),
   }),
   z.object({
     type: z.literal("failed"),

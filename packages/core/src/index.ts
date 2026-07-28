@@ -364,6 +364,7 @@ export type {
   ToolParameterSchema,
   ToolExecutionContext,
   ToolExecutionResult,
+  ToolArtifact,
 } from "./taskAgent/toolTypes.js";
 export {
   TaskAgentModelUpstreamError,

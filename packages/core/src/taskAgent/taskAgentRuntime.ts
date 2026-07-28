@@ -31,6 +31,7 @@ import type {
   TaskAgentToolResult,
 } from "./taskAgentModel.js";
 import type { ToolRegistry } from "./toolRegistry.js";
+import type { ToolArtifact } from "./toolTypes.js";
 import type { TaskAgentEvent, TaskAgentSnapshot } from "./taskAgentTypes.js";
 
 /**
@@ -245,6 +246,10 @@ export function createTaskAgentRuntime(
     publish({ type: "started", sessionId: snapshot.sessionId, goal: snapshot.goal });
 
     const messages: TaskAgentModelMessage[] = [{ role: "user", text: snapshot.goal }];
+    // The latest concrete artifact any tool produced (a written file, an opened URL). Carried
+    // onto the terminal success so the card can offer a reliable "Open it" - last one wins,
+    // since the final file the agent writes is the natural thing to open.
+    let latestArtifact: ToolArtifact | undefined;
 
     while (true) {
       if (signal.aborted) {
@@ -292,7 +297,7 @@ export function createTaskAgentRuntime(
 
       if (turn.toolCalls.length === 0) {
         // No tool calls: the model is done and its text is the spoken result.
-        return settle(session, { status: "succeeded", result: spokenText });
+        return settle(session, { status: "succeeded", result: spokenText, artifact: latestArtifact });
       }
 
       // Execute the requested tool calls in order, feeding each result back to the model.
@@ -316,6 +321,10 @@ export function createTaskAgentRuntime(
         if (signal.aborted) {
           // Cancelled mid-tool: drop this result and settle rather than feeding it back.
           return settle(session, { status: "cancelled" });
+        }
+        // Remember the newest openable thing a successful call produced (last wins).
+        if (result.artifact !== undefined && result.isError !== true) {
+          latestArtifact = result.artifact;
         }
 
         publish({
@@ -349,14 +358,14 @@ export function createTaskAgentRuntime(
     input: Record<string, unknown>,
     sessionId: string,
     signal: AbortSignal,
-  ): Promise<{ output: string; isError: boolean }> {
+  ): Promise<{ output: string; isError: boolean; artifact?: ToolArtifact }> {
     const tool = tools.get(toolName);
     if (tool === undefined) {
       return { output: `Unknown tool: '${toolName}'`, isError: true };
     }
     try {
       const result = await tool.execute(input, { sessionId, signal });
-      return { output: result.output, isError: result.isError ?? false };
+      return { output: result.output, isError: result.isError ?? false, artifact: result.artifact };
     } catch (toolError) {
       return { output: errorMessage(toolError), isError: true };
     }
@@ -365,7 +374,10 @@ export function createTaskAgentRuntime(
   /** Moves a Session to its one terminal state, emits the matching event, and returns the snapshot. */
   function settle(
     session: RunningSession,
-    outcome: { status: "succeeded"; result?: string } | { status: "failed"; error: string } | { status: "cancelled" },
+    outcome:
+      | { status: "succeeded"; result?: string; artifact?: ToolArtifact }
+      | { status: "failed"; error: string }
+      | { status: "cancelled" },
   ): TaskAgentSnapshot {
     const { snapshot } = session;
     // Guard against a double-settle (e.g. an abort racing the model's natural finish):
@@ -374,7 +386,8 @@ export function createTaskAgentRuntime(
       snapshot.status = outcome.status;
       if (outcome.status === "succeeded") {
         snapshot.result = outcome.result ?? "";
-        publish({ type: "succeeded", sessionId: snapshot.sessionId, result: snapshot.result });
+        snapshot.artifact = outcome.artifact;
+        publish({ type: "succeeded", sessionId: snapshot.sessionId, result: snapshot.result, artifact: outcome.artifact });
       } else if (outcome.status === "failed") {
         snapshot.error = outcome.error;
         publish({ type: "failed", sessionId: snapshot.sessionId, message: snapshot.error });

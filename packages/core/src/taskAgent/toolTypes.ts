@@ -51,6 +51,16 @@ export interface ToolExecutionContext {
 }
 
 /**
+ * A concrete thing a tool produced that the user can open afterwards - a file it wrote or a
+ * URL it opened. The runtime carries the session's latest one onto the terminal result so the
+ * Agent Stack can offer a reliable "Open it" affordance, instead of guessing at a path from
+ * the model's prose summary (which is deliberately free of file paths and jargon).
+ */
+export type ToolArtifact =
+  | { kind: "file"; path: string }
+  | { kind: "url"; url: string };
+
+/**
  * The result of one tool call, fed back to the model as the tool's output on the next
  * turn. `isError` marks a *recoverable* failure (a bad argument, a 404) that the model
  * sees and can react to - the Session keeps running; an unrecoverable failure is thrown,
@@ -61,6 +71,11 @@ export interface ToolExecutionResult {
   output: string;
   /** True when the tool failed recoverably; the model is shown an error result. */
   isError?: boolean;
+  /**
+   * A concrete artifact this call produced (a written file, an opened URL), if any. The
+   * runtime surfaces the session's latest one on its terminal result as the "Open it" target.
+   */
+  artifact?: ToolArtifact;
 }
 
 /** One typed tool a Task Agent can call. */

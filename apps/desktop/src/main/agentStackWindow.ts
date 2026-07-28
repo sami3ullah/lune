@@ -106,12 +106,20 @@ function createAgentStackWindow(): BrowserWindow {
     webPreferences: {
       preload: join(__dirname, "../preload/index.js"),
       sandbox: false,
+      // Waive the autoplay gesture requirement so the soft completion chime can sound without
+      // the user ever clicking into this (never-focused) window - the same waiver the Pill and
+      // Overlay use for their audio.
+      autoplayPolicy: "no-user-gesture-required",
     },
   });
 
-  // Above full-screen apps and on every Space, so background work stays glanceable wherever
-  // the user is working - matching the Pill and Overlay.
-  window.setAlwaysOnTop(true, "screen-saver");
+  // Always-on-top and on every Space (incl. over full-screen apps) so background work stays
+  // glanceable wherever the user is - but at the "floating" level, deliberately *below* macOS
+  // notification banners. The stack pins to the same top-right corner the banners drop into,
+  // and the completion banner must land on top of the card, not behind it; the higher
+  // "screen-saver" level the Pill/Overlay use would cover the banner (they never share that
+  // corner, so it doesn't bite them).
+  window.setAlwaysOnTop(true, "floating");
   window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   if (process.env.ELECTRON_RENDERER_URL) {

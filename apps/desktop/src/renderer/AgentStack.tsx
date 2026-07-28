@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { AnimatePresence, motion } from "framer-motion";
 import { useAgentStackStore } from "./agentStackStore";
 import { deriveCardView, type AgentCardTone, type AgentCardView } from "./agentCards";
+import { playCompletionChime } from "./completionChime";
 
 // The Agent Stack surface (M5-03): the background-work window. Each running Task Agent is a
 // card fixed top-right under the menu bar, stacking downward - a "Running" badge and a live
@@ -31,8 +32,15 @@ export function AgentStack() {
 
   // Subscribe to the live event stream first, then seed from the current snapshots, so an
   // event arriving during startup is never lost (the seed only fills sessions not yet seen).
+  // A live `succeeded` also plays the soft completion chime - only for events that actually
+  // stream in, never the already-finished sessions the seed backfills on mount.
   useEffect(() => {
-    const unsubscribe = window.lune.taskAgent.onTaskAgentEvent(applyEvent);
+    const unsubscribe = window.lune.taskAgent.onTaskAgentEvent((event) => {
+      if (event.type === "succeeded") {
+        playCompletionChime();
+      }
+      applyEvent(event);
+    });
     void window.lune.taskAgent.list().then(seed);
     return unsubscribe;
   }, [applyEvent, seed]);

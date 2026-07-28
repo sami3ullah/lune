@@ -9,6 +9,10 @@
  * exactly as it maps `CoreConversationEvent` onto the conversation IPC events.
  */
 
+import type { ToolArtifact } from "./toolTypes.js";
+
+export type { ToolArtifact };
+
 /**
  * One Task Agent Session's lifecycle status. A Session is `running` until it reaches
  * exactly one terminal state: `succeeded` (the model finished with a result), `failed`
@@ -32,6 +36,12 @@ export interface TaskAgentSnapshot {
   step: number;
   /** The final spoken summary, present only when `status` is `succeeded`. */
   result?: string;
+  /**
+   * The concrete thing the agent produced (a written file, an opened URL) that the card can
+   * offer to open. Present only when `status` is `succeeded` and the run produced one - the
+   * session's latest tool artifact.
+   */
+  artifact?: ToolArtifact;
   /** The readable failure reason, present only when `status` is `failed`. */
   error?: string;
 }
@@ -68,6 +78,6 @@ export type TaskAgentEvent =
       output: string;
       isError: boolean;
     }
-  | { type: "succeeded"; sessionId: string; result: string }
+  | { type: "succeeded"; sessionId: string; result: string; artifact?: ToolArtifact }
   | { type: "failed"; sessionId: string; message: string }
   | { type: "cancelled"; sessionId: string };
