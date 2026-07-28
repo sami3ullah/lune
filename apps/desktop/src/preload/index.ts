@@ -4,9 +4,26 @@ import {
   CHAT_EVENT_CHANNEL,
   CHAT_START_CHANNEL,
   ConversationStreamEventSchema,
+  TASK_AGENT_CANCEL_CHANNEL,
+  TASK_AGENT_EVENT_CHANNEL,
+  TASK_AGENT_START_CHANNEL,
+  TaskAgentSnapshotSchema,
+  TaskAgentStreamEventSchema,
   type ConversationStreamEvent,
   type ChatTurnRequest,
+  type StartTaskAgentRequest,
+  type TaskAgentSnapshot,
+  type TaskAgentStreamEvent,
 } from "@lune/shared";
+import {
+  AGENT_STACK_CONTENT_SIZE_CHANNEL,
+  AGENT_STACK_OPEN_RESULT_CHANNEL,
+  AGENT_STACK_SNAPSHOTS_CHANNEL,
+  AgentStackContentSizeSchema,
+  OpenAgentResultRequestSchema,
+  type AgentStackContentSize,
+  type OpenAgentResultRequest,
+} from "../ipc/agentStack";
 import {
   APP_QUIT_CHANNEL,
   PILL_RESIZE_CHANNEL,
@@ -155,6 +172,50 @@ const luneBridge = {
     /** Opens the Chat Panel window, or hides it if already open. */
     toggle(): void {
       ipcRenderer.send(CHAT_PANEL_TOGGLE_CHANNEL);
+    },
+  },
+  taskAgent: {
+    /**
+     * Starts one background Task Agent, resolving with its initial (running) snapshot so a
+     * card can render immediately; its progress then streams over {@link onTaskAgentEvent}.
+     */
+    async start(request: StartTaskAgentRequest): Promise<TaskAgentSnapshot> {
+      return TaskAgentSnapshotSchema.parse(await ipcRenderer.invoke(TASK_AGENT_START_CHANNEL, request));
+    },
+    /** Cancels a running Task Agent by id; resolves true if it was running. */
+    async cancel(sessionId: string): Promise<boolean> {
+      return z.boolean().parse(await ipcRenderer.invoke(TASK_AGENT_CANCEL_CHANNEL, { sessionId }));
+    },
+    /** Reads the current snapshot of every session, to seed the Agent Stack on mount. */
+    async list(): Promise<TaskAgentSnapshot[]> {
+      return TaskAgentSnapshotSchema.array().parse(await ipcRenderer.invoke(AGENT_STACK_SNAPSHOTS_CHANNEL));
+    },
+    /**
+     * Subscribes to every streamed Task Agent event across all concurrent sessions,
+     * validating each against the shared contract before the surface folds it into cards.
+     * Returns an unsubscribe function.
+     */
+    onTaskAgentEvent(listener: (event: TaskAgentStreamEvent) => void): () => void {
+      const forwardValidatedEvent = (_event: IpcRendererEvent, rawEvent: unknown): void => {
+        const parsedEvent = TaskAgentStreamEventSchema.safeParse(rawEvent);
+        if (parsedEvent.success) {
+          listener(parsedEvent.data);
+        } else {
+          console.error("[lune] dropping malformed task agent event:", parsedEvent.error.message);
+        }
+      };
+      ipcRenderer.on(TASK_AGENT_EVENT_CHANNEL, forwardValidatedEvent);
+      return () => ipcRenderer.removeListener(TASK_AGENT_EVENT_CHANNEL, forwardValidatedEvent);
+    },
+  },
+  agentStack: {
+    /** Reports the surface's rendered size + card count so the main process sizes/hides the window. */
+    reportContentSize(contentSize: AgentStackContentSize): void {
+      ipcRenderer.send(AGENT_STACK_CONTENT_SIZE_CHANNEL, AgentStackContentSizeSchema.parse(contentSize));
+    },
+    /** Opens a finished agent's result (a file, a URL, or the Chat Panel for a summary). */
+    openResult(request: OpenAgentResultRequest): void {
+      ipcRenderer.send(AGENT_STACK_OPEN_RESULT_CHANNEL, OpenAgentResultRequestSchema.parse(request));
     },
   },
   settings: {

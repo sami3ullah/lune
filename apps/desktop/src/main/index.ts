@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch, wr
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { constants as osConstants } from "node:os";
-import { app, BrowserWindow, ipcMain, nativeImage, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, nativeImage, Notification, safeStorage, screen, shell, systemPreferences, type WebContents } from "electron";
 import {
   buildMarkRefinementRequest,
   createAnthropicComputerUseAdapter,
@@ -33,6 +33,7 @@ import {
   type ReasoningVendorId,
   type ScreenCaptureInput,
   type SpeechCapability,
+  type TaskAgentEvent,
   type TaskAgentRuntime,
 } from "@lune/core";
 import {
@@ -40,9 +41,15 @@ import {
   CHAT_START_CHANNEL,
   ChatTurnRequestSchema,
   ConversationStreamEventSchema,
+  CancelTaskAgentRequestSchema,
   LUNE_IPC_VERSION,
+  StartTaskAgentRequestSchema,
+  TASK_AGENT_CANCEL_CHANNEL,
+  TASK_AGENT_EVENT_CHANNEL,
+  TASK_AGENT_START_CHANNEL,
   type ChatInputMethod,
   type ConversationStreamEvent,
+  type TaskAgentStreamEvent,
 } from "@lune/shared";
 import { APP_QUIT_CHANNEL, PILL_CAPTION_CHANNEL, PillCaptionSchema } from "../ipc/pillControl";
 import { CHAT_PANEL_TOGGLE_CHANNEL } from "../ipc/chatPanel";
@@ -58,6 +65,17 @@ import {
 } from "../ipc/conversations";
 import { ConversationHistoryStore } from "./conversationHistoryStore";
 import { getChatPanelWebContents, toggleChatPanelWindow } from "./chatPanelWindow";
+import {
+  ensureAgentStackWindow,
+  getAgentStackWebContents,
+  revealAgentStackWindow,
+} from "./agentStackWindow";
+import {
+  AGENT_STACK_OPEN_RESULT_CHANNEL,
+  AGENT_STACK_SNAPSHOTS_CHANNEL,
+  OpenAgentResultRequestSchema,
+  type OpenAgentResultRequest,
+} from "../ipc/agentStack";
 import { toggleSettingsWindow } from "./settingsWindow";
 import { toggleSkillsWindow } from "./skillsWindow";
 import { SkillsManager, type SkillFileStore } from "./skillsManager";
@@ -544,10 +562,48 @@ let screenAgentService: ScreenAgentService | null = null;
 // The Task Agent runtime (M5-02): the background, tools-only agent engine, wired to the real
 // local tool set (open URL, AppleScript, shell, file read/write, web search/fetch) whose
 // dangerous calls pass the voice Confirm Gate. Assigned once the app is ready (its confirm
-// gate needs the voice loop). No production consumer drives it yet - automatic agent routing
-// (M5-04) and the Agent Stack surface (M5-03) are later concerns; the env-gated dev trigger
-// below runs one Session end to end.
+// gate needs the voice loop). The Agent Stack surface (M5-03) observes it over IPC; automatic
+// agent routing (M5-04) is a later concern, so for now the env-gated dev trigger starts one.
 let taskAgentRuntime: TaskAgentRuntime | null = null;
+
+/** Maps one native Task Agent event to its wire form (the `started` event stamps the IPC version). */
+function toWireTaskAgentEvent(event: TaskAgentEvent): TaskAgentStreamEvent {
+  return event.type === "started" ? { ...event, ipcVersion: LUNE_IPC_VERSION } : event;
+}
+
+/**
+ * Fires the completion notification for a settled Task Agent ("done brewing" on success), so
+ * the user - who has been working elsewhere - learns their background work finished. Clicking
+ * it brings the Agent Stack to the foreground. Best-effort: a no-op where notifications aren't
+ * supported.
+ */
+function notifyTaskAgentComplete(sessionId: string, succeeded: boolean): void {
+  if (!Notification.isSupported()) {
+    return;
+  }
+  const goal = taskAgentRuntime?.get(sessionId)?.goal ?? "your task";
+  const notification = new Notification({
+    title: succeeded ? "done brewing" : "couldn't finish",
+    body: goal,
+  });
+  notification.on("click", () => revealAgentStackWindow());
+  notification.show();
+}
+
+/** Opens a finished agent's produced artifact: reveal a file in its default app, or open a URL. */
+function openAgentResult(request: OpenAgentResultRequest): void {
+  if (request.kind === "file") {
+    // `openPath` resolves to a non-empty string on failure (e.g. the file was moved); surface
+    // it rather than swallowing it, so a dead "Open file" click isn't silent.
+    void shell.openPath(request.path).then((error) => {
+      if (error.length > 0) {
+        console.error(`[lune] could not open agent result file '${request.path}': ${error}`);
+      }
+    });
+  } else {
+    void shell.openExternal(request.url);
+  }
+}
 
 // The Speech Capability (ticket 09): on-device Kokoro synthesis, gated on the Kokoro
 // weights being provisioned. Assigned once the app is ready (it needs the Provisioning
@@ -2088,7 +2144,7 @@ void app.whenReady().then(() => {
       };
     },
   });
-  taskAgentRuntime = createTaskAgentRuntime({
+  const taskAgent = createTaskAgentRuntime({
     getRoutingConfig: () => routingConfigStore.getConfig(),
     models: createTaskAgentModelAdapters(),
     getApiKey: (vendorId) => credentialStore.getKey(vendorId) ?? process.env[API_KEY_ENV_BY_VENDOR[vendorId]],
@@ -2098,6 +2154,38 @@ void app.whenReady().then(() => {
     }),
     upstreamFetch: (url, requestInit) => fetch(url, requestInit),
     generateSessionId: () => randomUUID(),
+  });
+  taskAgentRuntime = taskAgent;
+
+  // Bridge the runtime to the Agent Stack surface (M5-03): forward every session's events to
+  // the stack window (creating it on the first agent so its cards appear), and fire a
+  // completion notification when one settles. The renderer folds the stream into cards; it
+  // seeds from `list()` on mount so a window opened mid-flight still shows running agents.
+  taskAgent.subscribe((event) => {
+    if (event.type === "started") {
+      ensureAgentStackWindow();
+    }
+    getAgentStackWebContents()?.send(TASK_AGENT_EVENT_CHANNEL, toWireTaskAgentEvent(event));
+    if (event.type === "succeeded" || event.type === "failed") {
+      notifyTaskAgentComplete(event.sessionId, event.type === "succeeded");
+    }
+  });
+  ipcMain.handle(TASK_AGENT_START_CHANNEL, (_event, rawRequest) => {
+    const handle = taskAgent.start(StartTaskAgentRequestSchema.parse(rawRequest));
+    ensureAgentStackWindow();
+    return handle.snapshot;
+  });
+  ipcMain.handle(TASK_AGENT_CANCEL_CHANNEL, (_event, rawRequest) => {
+    return taskAgent.cancel(CancelTaskAgentRequestSchema.parse(rawRequest).sessionId);
+  });
+  ipcMain.handle(AGENT_STACK_SNAPSHOTS_CHANNEL, () => taskAgent.list());
+  ipcMain.on(AGENT_STACK_OPEN_RESULT_CHANNEL, (_event, rawRequest) => {
+    const parsed = OpenAgentResultRequestSchema.safeParse(rawRequest);
+    if (!parsed.success) {
+      console.error("[lune] dropping malformed open-result request:", parsed.error.message);
+      return;
+    }
+    openAgentResult(parsed.data);
   });
 
   // Push-to-talk voice loop (ticket 11): the global-hotkey orchestrator. It reads the
