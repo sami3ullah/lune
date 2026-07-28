@@ -55,8 +55,8 @@ import { introVideoUrl } from "./introVideoAsset";
 // itself fades in only while the cursor is on this display or an interaction is running.
 
 /** How far the buddy sits from the true mouse point (its tip hugs the cursor). */
-const BUDDY_OFFSET_X = 12;
-const BUDDY_OFFSET_Y = 20;
+const BUDDY_OFFSET_X = 15;
+const BUDDY_OFFSET_Y = 25;
 /** The cursor's resting tilt (its tip points up at 0deg; a slight tilt reads as a pointer). */
 const REST_ROTATION_DEGREES = -20;
 /**
