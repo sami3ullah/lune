@@ -39,14 +39,17 @@ describe("reduceAgentCards", () => {
     expect(cards.find((card) => card.sessionId === "a")).toMatchObject({ status: "running", step: 0 });
   });
 
-  it("tracks live activity from messages and tool calls, then clears it on completion", () => {
+  it("tracks narration and tool activity separately, then clears both on completion", () => {
     let cards = reduceAgentCards([], started("a", "g"));
+    cards = reduceAgentCards(cards, { type: "message", sessionId: "a", step: 1, text: "pulling your list together now" });
+    expect(cards[0]!.narration).toBe("pulling your list together now");
     cards = reduceAgentCards(cards, { type: "tool-call", sessionId: "a", step: 1, toolCallId: "t1", toolName: "open_url", input: { url: "https://example.com/x" } });
     expect(cards[0]!.activity).toBe("opening example.com");
-    cards = reduceAgentCards(cards, { type: "message", sessionId: "a", step: 1, text: "almost there" });
-    expect(cards[0]!.activity).toBe("almost there");
+    // The friendly narration is not overwritten by a later tool action.
+    expect(cards[0]!.narration).toBe("pulling your list together now");
     cards = reduceAgentCards(cards, { type: "succeeded", sessionId: "a", result: "ok" });
     expect(cards[0]!.activity).toBeUndefined();
+    expect(cards[0]!.narration).toBeUndefined();
   });
 
   it("settles failed and cancelled cards with their reasons", () => {
@@ -136,23 +139,56 @@ describe("classifyResult", () => {
 });
 
 describe("deriveCardView", () => {
-  it("shows a live working headline with the activity detail", () => {
-    const view = deriveCardView({ sessionId: "a", goal: "do it", status: "running", step: 2, activity: "running ls -la" });
-    expect(view).toMatchObject({ tone: "working", headline: "working (step 2)", detail: "running ls -la", isTerminal: false, openable: null });
+  it("leads a running card with the agent's narration and keeps the tool action as a hint", () => {
+    const view = deriveCardView({
+      sessionId: "a",
+      goal: "do it",
+      status: "running",
+      step: 2,
+      narration: "pulling your list together now",
+      activity: "running ls -la",
+    });
+    expect(view).toMatchObject({
+      tone: "working",
+      badge: "Running",
+      detail: "pulling your list together now",
+      activityHint: "running ls -la",
+      isTerminal: false,
+      openable: null,
+    });
   });
 
-  it("shows 'done brewing' and an open target on success", () => {
+  it("falls back to the tool action, then a warm default, before the agent narrates", () => {
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "running", step: 1, activity: "opening example.com" })).toMatchObject({
+      detail: "opening example.com",
+      // The tool action is already the main line, so it isn't repeated as a hint.
+      activityHint: null,
+    });
+    expect(deriveCardView({ sessionId: "a", goal: "g", status: "running", step: 0 })).toMatchObject({
+      detail: "getting things going in the background…",
+      activityHint: null,
+    });
+  });
+
+  it("shows a Done badge, an open target, and an invitation on success", () => {
     const view = deriveCardView({ sessionId: "a", goal: "note", status: "succeeded", step: 3, result: "Saved to /Users/me/Documents/Lune/note.md." });
     expect(view.tone).toBe("done");
-    expect(view.headline).toBe("done brewing");
+    expect(view.badge).toBe("Done");
     expect(view.isTerminal).toBe(true);
     expect(view.openable).toEqual({ kind: "file", path: "/Users/me/Documents/Lune/note.md" });
+    expect(view.invitation).not.toBeNull();
+  });
+
+  it("offers no invitation when a success has nothing openable to show", () => {
+    const view = deriveCardView({ sessionId: "a", goal: "weather", status: "succeeded", step: 1, result: "it's sunny and 24 degrees in berlin." });
+    expect(view.openable).toEqual({ kind: "summary", text: "it's sunny and 24 degrees in berlin." });
+    expect(view.invitation).toBeNull();
   });
 
   it("renders a failure as a readable error with no open target", () => {
     const view = deriveCardView({ sessionId: "a", goal: "x", status: "failed", step: 1, error: "Google Gemini credentials are not configured" });
     expect(view.tone).toBe("error");
-    expect(view.headline).toBe("couldn't finish");
+    expect(view.badge).toBe("Failed");
     expect(view.detail).toContain("credentials");
     expect(view.openable).toBeNull();
   });

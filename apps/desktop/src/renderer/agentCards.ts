@@ -17,7 +17,13 @@ export interface AgentCard {
   status: TaskAgentStatus;
   /** How many model steps have started - a live progress signal while running. */
   step: number;
-  /** The latest human-readable activity line while running (a tool call or a said message). */
+  /**
+   * The latest friendly, first-person line the agent *said* about what it's doing (from a
+   * `message` event) - the warm running headline the card leads with, e.g. "pulling
+   * together your list and setting up the sheet now".
+   */
+  narration?: string;
+  /** The latest concrete tool action while running (a live "what's happening now" hint). */
   activity?: string;
   /** The final summary, present only when `status` is `succeeded`. */
   result?: string;
@@ -43,10 +49,11 @@ function upsert(
 
 /**
  * Folds one streamed Task Agent event into the card list, returning a new list (never
- * mutating). A `started` opens (or re-seeds) the card; `step-started` advances progress;
- * `message` and `tool-call` set the live activity line; the terminal events settle the card
- * with its result / error. An event for an unknown session other than `started` seeds a
- * minimal card defensively rather than dropping the update.
+ * mutating). A `started` opens (or re-seeds) the card; `step-started` advances progress; a
+ * `message` updates the friendly narration line and a `tool-call` the concrete activity
+ * line; the terminal events settle the card with its result / error and clear both live
+ * lines. An event for an unknown session other than `started` seeds a minimal card
+ * defensively rather than dropping the update.
  */
 export function reduceAgentCards(
   cards: readonly AgentCard[],
@@ -64,18 +71,19 @@ export function reduceAgentCards(
     case "step-started":
       return upsert(cards, event.sessionId, (card) => ({ ...card, step: event.step }), seed);
     case "message":
-      return upsert(cards, event.sessionId, (card) => ({ ...card, activity: event.text }), seed);
+      // The agent's own friendly narration - the warm line the card leads with.
+      return upsert(cards, event.sessionId, (card) => ({ ...card, narration: event.text }), seed);
     case "tool-call":
       return upsert(cards, event.sessionId, (card) => ({ ...card, activity: describeToolCall(event.toolName, event.input) }), seed);
     case "tool-result":
       // The activity line already reflects the call; a result doesn't change what's shown.
       return upsert(cards, event.sessionId, (card) => card, seed);
     case "succeeded":
-      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "succeeded", result: event.result, activity: undefined }), seed);
+      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "succeeded", result: event.result, narration: undefined, activity: undefined }), seed);
     case "failed":
-      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "failed", error: event.message, activity: undefined }), seed);
+      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "failed", error: event.message, narration: undefined, activity: undefined }), seed);
     case "cancelled":
-      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "cancelled", activity: undefined }), seed);
+      return upsert(cards, event.sessionId, (card) => ({ ...card, status: "cancelled", narration: undefined, activity: undefined }), seed);
   }
 }
 
@@ -185,40 +193,70 @@ export interface AgentCardView {
   goal: string;
   status: TaskAgentStatus;
   tone: AgentCardTone;
-  /** The status headline - e.g. "done brewing" on success. */
-  headline: string;
-  /** The secondary line - live activity while running, the failure reason, or a result preview. */
+  /** The short status pill the header shows - "Running" / "Done" / "Failed" / "Stopped". */
+  badge: string;
+  /** The friendly main line - the agent's narration while running, the result, or the error. */
   detail: string;
+  /**
+   * The small live "what's happening now" line under a running card (the latest tool
+   * action), or `null` when there's nothing extra to show beyond the main line.
+   */
+  activityHint: string | null;
+  /**
+   * A warm one-line invitation to open the result, shown next to the open button on a
+   * finished card that produced something openable; `null` when there's nothing to open.
+   */
+  invitation: string | null;
   /** Whether the card has settled (no more live updates). */
   isTerminal: boolean;
   /** The open target when the card is a finished success with something to open; else `null`. */
   openable: ResultTarget | null;
 }
 
-/** The playful completion headline (the ticket's "done brewing"). */
-const DONE_HEADLINE = "done brewing";
+/** The short status pill per lifecycle state. */
+const STATUS_BADGE: Record<TaskAgentStatus, string> = {
+  running: "Running",
+  succeeded: "Done",
+  failed: "Failed",
+  cancelled: "Stopped",
+};
 
-/** Derives the view-model for a card: status → tone + headline, and the detail line + open target. */
+/** The warm line a running card leads with before the agent has said anything of its own. */
+const GETTING_STARTED = "getting things going in the background…";
+
+/**
+ * Derives the view-model for a card: status → tone + badge, the friendly detail line, the
+ * live activity hint while running, and the open target + invitation once finished. A
+ * running card leads with the agent's own narration (falling back to the live tool action,
+ * then a warm default) and shows the concrete tool action as a small hint beneath it.
+ */
 export function deriveCardView(card: AgentCard): AgentCardView {
-  const base = { sessionId: card.sessionId, goal: card.goal, status: card.status };
+  const base = {
+    sessionId: card.sessionId,
+    goal: card.goal,
+    status: card.status,
+    badge: STATUS_BADGE[card.status],
+  };
   switch (card.status) {
-    case "running":
-      return {
-        ...base,
-        tone: "working",
-        headline: card.step > 0 ? `working (step ${card.step})` : "working",
-        detail: card.activity ?? "getting started",
-        isTerminal: false,
-        openable: null,
-      };
+    case "running": {
+      // Lead with the agent's friendly narration; before it has said anything, show the live
+      // tool action, and before even that, a warm default. The tool action becomes a small
+      // hint only when it isn't already the main line (no duplication).
+      const detail = card.narration ?? card.activity ?? GETTING_STARTED;
+      const activityHint =
+        card.activity !== undefined && card.activity !== detail ? card.activity : null;
+      return { ...base, tone: "working", detail, activityHint, invitation: null, isTerminal: false, openable: null };
+    }
     case "succeeded": {
       const result = card.result ?? "";
       const openable = result.trim().length > 0 ? classifyResult(result) : null;
+      const canOpen = openable !== null && openable.kind !== "summary";
       return {
         ...base,
         tone: "done",
-        headline: DONE_HEADLINE,
         detail: result.trim().length > 0 ? result : "all done",
+        activityHint: null,
+        invitation: canOpen ? "it's ready whenever you want a look" : null,
         isTerminal: true,
         openable,
       };
@@ -227,8 +265,9 @@ export function deriveCardView(card: AgentCard): AgentCardView {
       return {
         ...base,
         tone: "error",
-        headline: "couldn't finish",
         detail: card.error ?? "something went wrong",
+        activityHint: null,
+        invitation: null,
         isTerminal: true,
         openable: null,
       };
@@ -236,8 +275,9 @@ export function deriveCardView(card: AgentCard): AgentCardView {
       return {
         ...base,
         tone: "dismissed",
-        headline: "stopped",
-        detail: "dismissed",
+        detail: "stopped",
+        activityHint: null,
+        invitation: null,
         isTerminal: true,
         openable: null,
       };

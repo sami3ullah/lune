@@ -4,10 +4,11 @@ import { useAgentStackStore } from "./agentStackStore";
 import { deriveCardView, type AgentCardTone, type AgentCardView } from "./agentCards";
 
 // The Agent Stack surface (M5-03): the background-work window. Each running Task Agent is a
-// card fixed top-right under the menu bar, stacking downward - live status while running, a
-// "done brewing" completion state, click to open the result, × to dismiss. The user keeps
-// working freely; the window (frameless, transparent, content-sized by the main process) only
-// ever covers the cards, so nothing behind it is blocked.
+// card fixed top-right under the menu bar, stacking downward - a "Running" badge and a live
+// progress bar under the agent's own friendly narration while it works, then a settled "Done"
+// state with an Open button for whatever it produced, × to dismiss. The user keeps working
+// freely; the window (frameless, transparent, content-sized by the main process) only ever
+// covers the cards, so nothing behind it is blocked.
 //
 // This surface only renders and wires: it seeds its cards from the runtime's current
 // snapshots on mount, folds the live event stream into them (both via the store, over the
@@ -83,15 +84,14 @@ function AgentCardView({ view, onDismiss }: { view: AgentCardView; onDismiss: ()
   const [expanded, setExpanded] = useState(false);
   const tone = TONE_COLOR[view.tone];
   const openable = view.openable;
-  const clickable = openable !== null || (view.isTerminal && view.detail.length > 60);
+  // The detail can be expanded in place when it's a settled summary or a long line the
+  // clamp would otherwise cut off.
+  const canExpandDetail = view.isTerminal && (openable?.kind === "summary" || view.detail.length > 90);
 
-  const handleOpen = useCallback(() => {
+  const handleOpenResult = useCallback(() => {
     if (openable !== null && openable.kind !== "summary") {
       window.lune.agentStack.openResult(openable);
-      return;
     }
-    // A summary (or a long detail) opens in place: expand the card to read the whole thing.
-    setExpanded((value) => !value);
   }, [openable]);
 
   return (
@@ -101,65 +101,112 @@ function AgentCardView({ view, onDismiss }: { view: AgentCardView; onDismiss: ()
       animate={{ opacity: 1, x: 0, scale: 1 }}
       exit={{ opacity: 0, x: 16, scale: 0.96 }}
       transition={{ type: "spring", stiffness: 520, damping: 30, mass: 0.8 }}
-      className="rounded-2xl border border-white/10 bg-neutral-950/95 px-4 py-3 text-neutral-100"
+      className="rounded-2xl border border-white/10 bg-neutral-950/95 px-4 py-3 text-neutral-100 shadow-lg shadow-black/30"
     >
-      <div className="flex items-start gap-2.5">
-        <StatusDot tone={tone} pulsing={!view.isTerminal} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium" title={view.goal}>
-            {view.goal || "Working…"}
-          </div>
-          <div className="mt-0.5 text-[11px] font-medium tracking-wide" style={{ color: tone }}>
-            {view.headline}
-          </div>
-          <button
-            type="button"
-            onClick={clickable ? handleOpen : undefined}
-            className={`mt-1 block w-full text-left text-xs text-neutral-400 ${
-              expanded ? "" : "line-clamp-2"
-            } ${clickable ? "cursor-pointer hover:text-neutral-200" : "cursor-default"}`}
-          >
-            {view.detail}
-          </button>
-          {openable !== null && openable.kind !== "summary" && (
-            <button
-              type="button"
-              onClick={handleOpen}
-              className="mt-2 rounded-lg bg-white/10 px-2.5 py-1 text-xs font-medium text-neutral-100 transition hover:bg-white/20"
-            >
-              {openable.kind === "file" ? "Open file" : "Open link"}
-            </button>
-          )}
+      {/* Header: the goal, the live status badge, and dismiss. */}
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1 truncate text-sm font-semibold" title={view.goal}>
+          {view.goal || "Working…"}
         </div>
+        <StatusBadge tone={tone} label={view.badge} pulsing={!view.isTerminal} />
         <button
           type="button"
           aria-label="Dismiss"
           onClick={onDismiss}
-          className="-mr-1 -mt-1 rounded-lg px-1.5 py-0.5 text-neutral-500 transition hover:bg-white/10 hover:text-neutral-200"
+          className="rounded-lg px-1.5 py-0.5 text-neutral-500 transition hover:bg-white/10 hover:text-neutral-200"
         >
           ×
         </button>
       </div>
+
+      {/* The friendly message, led by a small chat glyph in the card's tone. */}
+      <div className="mt-2 flex items-start gap-2">
+        <ChatGlyph color={tone} />
+        <button
+          type="button"
+          onClick={canExpandDetail ? () => setExpanded((value) => !value) : undefined}
+          className={`block flex-1 text-left text-xs leading-relaxed text-neutral-300 ${
+            expanded ? "" : "line-clamp-3"
+          } ${canExpandDetail ? "cursor-pointer hover:text-neutral-100" : "cursor-default"}`}
+        >
+          {view.detail}
+        </button>
+      </div>
+
+      {/* Footer: a live progress bar while working, the open affordance once done. */}
+      {!view.isTerminal ? (
+        <div className="mt-3">
+          <ProgressBar tone={tone} />
+          {view.activityHint !== null && (
+            <div className="mt-1.5 truncate text-[11px] text-neutral-500" title={view.activityHint}>
+              {view.activityHint}
+            </div>
+          )}
+        </div>
+      ) : (
+        openable !== null &&
+        openable.kind !== "summary" && (
+          <div className="mt-3 flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={handleOpenResult}
+              className="rounded-lg px-3 py-1 text-xs font-semibold text-neutral-950 transition hover:brightness-110"
+              style={{ backgroundColor: tone }}
+            >
+              {openable.kind === "file" ? "Open it" : "Open link"}
+            </button>
+            {view.invitation !== null && (
+              <span className="truncate text-[11px] text-neutral-500">{view.invitation}</span>
+            )}
+          </div>
+        )
+      )}
     </motion.div>
   );
 }
 
-/** The tone dot: a small glowing core, pulsing while the agent is still working. */
-function StatusDot({ tone, pulsing }: { tone: string; pulsing: boolean }) {
+/** The status pill in the card header, with a soft pulse while the agent is still working. */
+function StatusBadge({ tone, label, pulsing }: { tone: string; label: string; pulsing: boolean }) {
   return (
-    <span className="relative mt-1 flex h-2 w-2 shrink-0">
-      {pulsing && (
-        <motion.span
-          className="absolute inline-flex h-full w-full rounded-full"
-          style={{ backgroundColor: tone }}
-          animate={{ opacity: [0.6, 0, 0.6], scale: [1, 2.2, 1] }}
-          transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
-        />
-      )}
-      <span
-        className="relative inline-flex h-2 w-2 rounded-full"
-        style={{ backgroundColor: tone, boxShadow: `0 0 6px ${tone}` }}
+    <motion.span
+      className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+      style={{ backgroundColor: `${tone}26`, color: tone }}
+      animate={pulsing ? { opacity: [1, 0.55, 1] } : { opacity: 1 }}
+      transition={pulsing ? { duration: 1.8, repeat: Infinity, ease: "easeInOut" } : { duration: 0.2 }}
+    >
+      {label}
+    </motion.span>
+  );
+}
+
+/** A small speech-bubble glyph that fronts the friendly message, tinted to the card's tone. */
+function ChatGlyph({ color }: { color: string }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className="mt-0.5 h-3.5 w-3.5 shrink-0"
+      fill="none"
+      stroke={color}
+      strokeWidth={1.6}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H6l-3 2.5V11.5H2.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z" />
+    </svg>
+  );
+}
+
+/** An indeterminate progress bar: a soft segment sweeping across the track in the card's tone. */
+function ProgressBar({ tone }: { tone: string }) {
+  return (
+    <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+      <motion.div
+        className="absolute inset-y-0 w-1/2 rounded-full"
+        style={{ background: `linear-gradient(90deg, transparent, ${tone}, transparent)` }}
+        animate={{ x: ["-70%", "240%"] }}
+        transition={{ duration: 1.7, repeat: Infinity, ease: "easeInOut" }}
       />
-    </span>
+    </div>
   );
 }
