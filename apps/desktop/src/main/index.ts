@@ -18,7 +18,7 @@ import {
   describeCore,
   findReasoningVendor,
   listReasoningModels,
-  parseAnswerActTag,
+  parseAnswerActionTag,
   parseAnswerPointTag,
   parseAnswerShapeTags,
   parseMarkRefinementReply,
@@ -26,6 +26,7 @@ import {
   RoutingConfigStore,
   SkillStore,
   validateReasoningKey,
+  type AgentRoute,
   type ComputerUseVendorId,
   type ParsedShape,
   type PointDirective,
@@ -909,6 +910,35 @@ async function runActHandoff(goal: string, signal: AbortSignal | undefined): Pro
 }
 
 /**
+ * The advisory->task handoff (M5-04, tools-first): when an ordinary turn's answer carried a
+ * `[TASK: goal]` tag, the user asked for a scriptable errand Lune can do in the background,
+ * so spawn a background Task Agent Session for the goal and return at once - the user keeps
+ * working while the run streams into the Agent Stack (its card shows live progress, notifies
+ * on completion, and renders a failed run as a readable card). Unlike {@link runActHandoff}
+ * this is fire-and-forget: it does not block the turn and is deliberately NOT tied to the
+ * turn's barge-in `signal` - a background task outlives the turn that started it and is
+ * cancelled only from the stack card (or an outright abort before it even starts).
+ */
+function runTaskHandoff(goal: string, signal: AbortSignal | undefined): void {
+  if (taskAgentRuntime === null || signal?.aborted === true) {
+    return;
+  }
+  try {
+    const handle = taskAgentRuntime.start({ goal });
+    console.log(
+      `[lune] task agent: started background session ${handle.sessionId} for goal "${goal}"`,
+    );
+  } catch (error) {
+    // A not-ready Vendor (no key / no adapter) or a bad goal: the acknowledgement already
+    // played, so degrade with a short spoken line rather than leaving the user waiting on a
+    // card that never appears. Queued behind the answer's audio; the Pill's idle bookkeeping
+    // is already owned by the advisory answer that spoke the acknowledgement.
+    console.error("[lune] task agent: could not start background session:", error);
+    void speakLine("sorry, i couldn't get that going in the background.");
+  }
+}
+
+/**
  * Captures the screen(s) for one turn, or returns nothing so the turn falls back to
  * text-only. Capture is attempted only when the turn opted in AND access is granted;
  * a capture failure never fails the turn (the user still gets an answer, just without
@@ -1354,10 +1384,11 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
   // tag-only answer (nothing to speak) reports `spoke: false` and the caller idles the Pill.
   let speechEngaged = false;
   let spoke = false;
-  // The advisory->act goal this turn carried, if any (parsed from the completed answer's
-  // trailing [ACT: goal] tag). When present, the Screen Agent runs it after the advisory
-  // answer, so the ordinary turn escalates to acting (DECISIONS #14).
-  let actGoal: string | null = null;
+  // The agent route this turn carried, if any (parsed from the completed answer's trailing
+  // [TASK: goal] / [ACT: goal] tag). When present, the ordinary turn escalates to acting
+  // after the advisory answer: `task` spawns a background Task Agent, `screen` runs the
+  // Screen Agent (M5-04, tools-first; DECISIONS #14).
+  let route: AgentRoute | null = null;
 
   // The streaming-text toggle (ticket 13): read once at the turn's start so a change
   // takes effect on the next turn. When off, the Overlay cursor still flies and points,
@@ -1472,9 +1503,10 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
           // Stream the answer into the Overlay bubble, but only the clean human text, and
           // only when the streaming-text toggle is on.
           if (overlayManager && cursorDisplayId !== undefined && showStreamingText) {
-            // Strip all trailing tags (Act, then Point, then the Shape Tags before them) so
-            // none ever flashes in the response bubble - only the spoken human text shows.
-            const actStripped = parseAnswerActTag(accumulatedAnswer).displayText;
+            // Strip all trailing tags (the routing tag, then Point, then the Shape Tags
+            // before them) so none ever flashes in the response bubble - only the spoken
+            // human text shows.
+            const actStripped = parseAnswerActionTag(accumulatedAnswer).displayText;
             const pointStripped = parseAnswerPointTag(actStripped).displayText;
             const { displayText } = parseAnswerShapeTags(pointStripped);
             if (displayText.length > sentCleanLength) {
@@ -1493,13 +1525,13 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
             messageId: coreEvent.messageId,
           });
           {
-            // Peel the trailing tags off the completed answer in grammar order: the Act
-            // Tag (the acting goal, if any), then the Point Tag, then the Shape Tags that
-            // sit before them - so each is stripped from the display text, the acting goal
-            // is captured, and the shapes are ready to draw.
-            const { displayText: actStripped, actGoal: parsedActGoal } =
-              parseAnswerActTag(accumulatedAnswer);
-            actGoal = parsedActGoal;
+            // Peel the trailing tags off the completed answer in grammar order: the routing
+            // tag (the agent route, if any), then the Point Tag, then the Shape Tags that
+            // sit before them - so each is stripped from the display text, the route is
+            // captured, and the shapes are ready to draw.
+            const { displayText: actStripped, route: parsedRoute } =
+              parseAnswerActionTag(accumulatedAnswer);
+            route = parsedRoute;
             const { directive, displayText: pointStripped } = parseAnswerPointTag(actStripped);
             const { displayText, shapes } = parseAnswerShapeTags(pointStripped);
             // Dev-only (LUNE_REASONING_DEBUG): show the raw output and what the parsers made
@@ -1512,7 +1544,7 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
                   rawAnswer: accumulatedAnswer,
                   shapes,
                   pointDirective: directive,
-                  actGoal: parsedActGoal,
+                  route: parsedRoute,
                   coordinateSpace: cursorScreen
                     ? { width: cursorScreen.capturedWidth, height: cursorScreen.capturedHeight }
                     : undefined,
@@ -1581,15 +1613,21 @@ async function runConversationTurn(options: RunConversationTurnOptions): Promise
     conversationHistoryStore.save(activeConversationId, conversationManager.getMessages());
     notifyConversationsChanged(webContents);
 
-    // Advisory->act (DECISIONS #14): the answer asked Lune to actually do something on
-    // screen, so hand the distilled goal to the Screen Agent now that the advisory answer
-    // has been spoken. Awaited so the caller's Pill-idle bookkeeping covers the whole run
-    // (the run speaks its own summary), and it shares this turn's barge-in signal.
-    if (actGoal !== null) {
-      // If the run queued speech, the same Kokoro-playback path a spoken turn uses owns the
-      // Pill's return to idle; otherwise leave `spoke` as the advisory answer set it.
-      const handoffSpoke = await runActHandoff(actGoal, signal);
-      spoke = spoke || handoffSpoke;
+    // Advisory->action (M5-04, tools-first; DECISIONS #14): the answer asked Lune to actually
+    // do something, so route the distilled goal to the agent the model chose, now that the
+    // advisory acknowledgement has been spoken. A `task` runs in the background (fire and
+    // forget - the user keeps working while the Agent Stack shows progress); a `screen` run
+    // is foreground and awaited, so the caller's Pill-idle bookkeeping covers the whole run
+    // (the run speaks its own summary) and it shares this turn's barge-in signal.
+    if (route !== null) {
+      if (route.kind === "task") {
+        runTaskHandoff(route.goal, signal);
+      } else {
+        // If the run queued speech, the same Kokoro-playback path a spoken turn uses owns the
+        // Pill's return to idle; otherwise leave `spoke` as the advisory answer set it.
+        const handoffSpoke = await runActHandoff(route.goal, signal);
+        spoke = spoke || handoffSpoke;
+      }
     }
   } catch (error) {
     // Safety net: if the turn threw before the capture completed, following is still

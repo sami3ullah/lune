@@ -52,7 +52,7 @@ describe("formatReasoningCompletion", () => {
       rawAnswer: "click the subscribed button, then choose unsubscribe.",
       shapes: [],
       pointDirective: { kind: "absent" },
-      actGoal: null,
+      route: null,
       coordinateSpace: { width: 640, height: 360 },
     });
 
@@ -60,10 +60,10 @@ describe("formatReasoningCompletion", () => {
     expect(output).toContain("click the subscribed button");
     expect(output).toContain("shapes emitted: 0");
     expect(output).toContain("point tag: absent");
-    expect(output).toContain("act tag: no");
+    expect(output).toContain("routing tag: no");
   });
 
-  it("lists each shape with its coordinates and space, plus point and act tags", () => {
+  it("lists each shape with its coordinates and space, plus point and routing tags", () => {
     const output = formatReasoningCompletion({
       rawAnswer: "here's how.",
       shapes: [
@@ -81,7 +81,7 @@ describe("formatReasoningCompletion", () => {
         },
       ],
       pointDirective: { kind: "point", point: { x: 640, y: 300, label: "here", screenNumber: null } },
-      actGoal: null,
+      route: null,
       coordinateSpace: { width: 640, height: 360 },
     });
 
@@ -96,12 +96,12 @@ describe("formatReasoningCompletion", () => {
       rawAnswer: "",
       shapes: [],
       pointDirective: { kind: "none" },
-      actGoal: "unsubscribe from the channel",
+      route: { kind: "screen", goal: "unsubscribe from the channel" },
     });
 
     expect(output).not.toContain("coordinate space");
     expect(output).toContain("(empty)");
     expect(output).toContain("point tag: none");
-    expect(output).toContain("act tag: yes -> unsubscribe from the channel");
+    expect(output).toContain("routing tag: screen -> unsubscribe from the channel");
   });
 });

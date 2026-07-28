@@ -1,4 +1,4 @@
-import type { ParsedShape, PointDirective } from "@lune/core";
+import type { AgentRoute, ParsedShape, PointDirective } from "@lune/core";
 
 // A dev-only diagnostic (env-gated on LUNE_REASONING_DEBUG, off on a normal launch, in the
 // LUNE_*_DEV spirit of the other dev triggers): print, per completed reasoning turn, the
@@ -52,10 +52,10 @@ export function formatReasoningCompletion(input: {
   rawAnswer: string;
   shapes: readonly ParsedShape[];
   pointDirective: PointDirective;
-  actGoal: string | null;
+  route: AgentRoute | null;
   coordinateSpace?: { width: number; height: number };
 }): string {
-  const { rawAnswer, shapes, pointDirective, actGoal, coordinateSpace } = input;
+  const { rawAnswer, shapes, pointDirective, route, coordinateSpace } = input;
   const lines: string[] = ["[lune:reasoning-debug] turn completed"];
   if (coordinateSpace) {
     lines.push(`coordinate space (captured px): ${coordinateSpace.width}x${coordinateSpace.height}`);
@@ -68,6 +68,8 @@ export function formatReasoningCompletion(input: {
     lines.push(formatShape(shape));
   }
   lines.push(formatPointTag(pointDirective));
-  lines.push(`act tag: ${actGoal === null ? "no" : `yes -> ${actGoal}`}`);
+  lines.push(
+    `routing tag: ${route === null ? "no" : `${route.kind} -> ${route.goal}`}`,
+  );
   return lines.join("\n");
 }

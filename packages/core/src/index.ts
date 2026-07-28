@@ -134,14 +134,16 @@ export {
   type RefinedMarkBox,
 } from "./reasoning/markGrounding.js";
 
-// The answer Act Tag parser: reads the trailing [ACT: goal] the advisory turn appends
-// when the user wants Lune to perform an on-screen task, so the Shell can hand the goal
-// to the Screen Agent (DECISIONS #14, advisory->act). The acting counterpart of the
+// The answer routing parser: reads the trailing [TASK: goal] / [ACT: goal] the advisory
+// turn appends when the user wants Lune to *do* something, and picks the agent kind -
+// tools-first Task Agent (preferred) vs Screen Agent (fallback). The Shell hands the goal
+// to the chosen agent (M5-04, DECISIONS #14, tools-first). The acting counterpart of the
 // Point Tag parser above.
 export {
-  parseAnswerActTag,
-  type ParsedActAnswer,
-} from "./reasoning/actTagParser.js";
+  parseAnswerActionTag,
+  type ParsedActionAnswer,
+  type AgentRoute,
+} from "./reasoning/actionTagParser.js";
 
 export { CANONICAL_SYSTEM_PROMPT } from "./reasoning/canonicalSystemPrompt.js";
 export type { UpstreamFetch } from "./reasoning/upstreamFetch.js";
